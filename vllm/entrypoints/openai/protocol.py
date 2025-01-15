@@ -522,6 +522,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description=("If specified, the output will follow the JSON schema."),
     )
+    do_add_response_format_to_messages: Optional[bool] = Field(
+        default=True,
+        description=(
+            "Only used when `guided_json` or `response_format` fields are provided. "
+            "Whether or not add the specified response format to the last user's message."
+        ),
+    )
     guided_regex: Optional[str] = Field(
         default=None,
         description=(
@@ -734,6 +741,35 @@ class ChatCompletionRequest(OpenAIBaseModel):
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
         )
+
+    def maybe_handle_structured_output(self) -> None:
+        if self.response_format is not None and self.response_format.type == "json_schema":
+            json_schema = self.response_format.json_schema
+            assert json_schema is not None
+            self.guided_json = json_schema.json_schema
+        
+        if self.guided_json is not None and self.do_add_response_format_to_messages:
+            # Additional check that the format has not been provided by the user
+            possible_formats = [str(self.guided_json)] + [
+                json.dumps(self.guided_json, indent=indent)
+                for indent in (None, 2, 4)
+            ]
+            for message in self.messages:
+                if any(possible_format in message["content"] for possible_format in possible_formats):
+                    break
+            else:
+                for i, message in enumerate(self.messages):
+                    if message["role"] == "system":
+                        self.messages[i]["content"] += (
+                            "\n\nGenerate the response in the following JSON format:\n" +
+                            f"{self.guided_json}"
+                        )
+                        break
+                else:
+                    self.messages[-1]["content"] += (
+                        "\n\nGenerate the response in the following JSON format:\n" +
+                        f"{self.guided_json}"
+                    )
 
     def _get_guided_json_from_tool(
             self) -> Optional[Union[str, dict, BaseModel]]:
