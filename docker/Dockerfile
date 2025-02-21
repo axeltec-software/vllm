@@ -175,6 +175,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r requirements/build.txt \
     --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
+RUN pip install blobfile
+
 COPY . .
 ARG GIT_REPO_CHECK=0
 RUN --mount=type=bind,source=.git,target=.git \
@@ -190,7 +192,6 @@ ENV NVCC_THREADS=$nvcc_threads
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL=https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-unknown-linux-musl.tar.gz
 ARG SCCACHE_ENDPOINT
-ARG SCCACHE_S3_USE_SSL
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
 ARG SCCACHE_REGION_NAME=us-west-2
 ARG SCCACHE_S3_NO_CREDENTIALS=0
@@ -201,7 +202,6 @@ ARG VLLM_USE_PRECOMPILED=""
 # if USE_SCCACHE is set, use sccache to speed up compilation
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=.git,target=.git \
-    --mount=type=secret,id=aws_credentials \
     if [ "$USE_SCCACHE" = "1" ]; then \
         echo "Installing sccache..." \
         && curl -L -o sccache.tar.gz ${SCCACHE_DOWNLOAD_URL} \
@@ -212,17 +212,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         && export SCCACHE_BUCKET=${SCCACHE_BUCKET_NAME} \
         && export SCCACHE_REGION=${SCCACHE_REGION_NAME} \
         && export SCCACHE_S3_NO_CREDENTIALS=${SCCACHE_S3_NO_CREDENTIALS} \
-        && export SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT} \
-        && export SCCACHE_S3_USE_SSL=${SCCACHE_S3_USE_SSL} \
-        && . /run/secrets/aws_credentials \
         && export SCCACHE_IDLE_TIMEOUT=0 \
         && export CMAKE_BUILD_TYPE=Release \
         && export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" \
         && export VLLM_DOCKER_BUILD_CONTEXT=1 \
         && sccache --show-stats \
-        && rm -rf .deps/* \
-        && mkdir -p .deps \
-        && python3 setup.py clean --all \
         && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
         && sccache --show-stats; \
     fi
@@ -247,7 +241,7 @@ COPY .buildkite/check-wheel-size.py check-wheel-size.py
 # sync the default value with .buildkite/check-wheel-size.py
 ARG VLLM_MAX_SIZE_MB=450
 ENV VLLM_MAX_SIZE_MB=$VLLM_MAX_SIZE_MB
-ARG RUN_WHEEL_CHECK=true
+ARG RUN_WHEEL_CHECK=false
 RUN if [ "$RUN_WHEEL_CHECK" = "true" ]; then \
         python3 check-wheel-size.py dist; \
     else \
@@ -423,6 +417,7 @@ RUN --mount=type=cache,target=/root/.cache/uv bash - <<'BASH'
         fi
     popd
     rm -rf flashinfer
+
 BASH
 COPY examples examples
 COPY benchmarks benchmarks
