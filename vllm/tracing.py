@@ -124,6 +124,7 @@ class SpanAttributes:
     GEN_AI_LATENCY_TIME_IN_MODEL_DECODE = "gen_ai.latency.time_in_model_decode"
     GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE = \
         "gen_ai.latency.time_in_model_inference"
+    GEN_AI_CACHE_NUM_CACHED_TOKENS = "gen_ai.cache.num_cached_tokens"
 
 
 def contains_trace_headers(headers: Mapping[str, str]) -> bool:

@@ -1707,6 +1707,10 @@ class LLMEngine:
                 seq_span.set_attribute(
                     SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE,
                     metrics.time_in_queue)
+
+            num_cached_tokens = sum([seq.data.get_num_cached_tokens() for seq in seq_group.get_seqs()])
+            seq_span.set_attribute(SpanAttributes.GEN_AI_CACHE_NUM_CACHED_TOKENS, num_cached_tokens)
+
             if ttft is not None:
                 seq_span.set_attribute(
                     SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN, ttft)
