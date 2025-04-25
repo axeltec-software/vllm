@@ -304,6 +304,10 @@ class LLMEngine:
 
         return self.tokenizer
 
+    def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        """Transfer model weights by inifiband to another vLLM instance"""
+        self.engine_core.replicate_model(dst_ip, dst_port)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
         return self.engine_core.add_lora(lora_request)

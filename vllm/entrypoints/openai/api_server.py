@@ -72,6 +72,7 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               ResponsesResponse, ScoreRequest,
                                               ScoreResponse, TokenizeRequest,
                                               TokenizeResponse,
+                                              ModelReplicationRequest,
                                               TranscriptionRequest,
                                               TranscriptionResponse,
                                               TranslationRequest,
@@ -476,6 +477,13 @@ async def get_server_load_metrics(request: Request):
 async def ping(raw_request: Request) -> Response:
     """Ping check. Endpoint required for SageMaker"""
     return await health(raw_request)
+
+
+@router.post("/infiniband_load", dependencies=[Depends(validate_json_request)])
+async def infiniband_load(request: ModelReplicationRequest, raw_request: Request) -> Response:
+    """Health check."""
+    await engine_client(raw_request).replicate_model(request.dst_ip, request.dst_port)
+    return Response(status_code=200)
 
 
 @router.post("/tokenize",

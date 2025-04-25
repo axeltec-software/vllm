@@ -47,6 +47,7 @@ from vllm.model_executor.models.interfaces_base import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (BatchedTensorInputs, MultiModalKwargsItem,
                                     PlaceholderRange)
+from vllm.model_executor.model_loader.infiniband import InfinibandModelLoader
 from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
@@ -2406,7 +2407,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         with DeviceMemoryProfiler() as m:
             time_before_load = time.perf_counter()
-            model_loader = get_model_loader(self.load_config)
+            model_loader = get_model_loader(self.load_config, self.parallel_config.rank)
             logger.info("Loading model from scratch...")
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config)
@@ -2485,6 +2486,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             tensorizer_config=tensorizer_config,
             model_config=self.model_config,
         )
+
+    def replicate_model(self, dst_ip: str, dst_port: int, rank: int) -> None:
+        # assert self._loaded_model, "Attempting infiniband copying of not loaded model"
+        infiniband_loader = InfinibandModelLoader(rank, "", "")
+        infiniband_loader.send_model_weights(dst_ip, dst_port, self.model)
 
     def _get_prompt_logprobs_dict(
         self,

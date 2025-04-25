@@ -31,6 +31,7 @@ from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          RPCProcessRequest,
                                          RPCResetMultiModalCacheRequest,
                                          RPCResetPrefixCacheRequest,
+                                         RPCReplicateModelRequest,
                                          RPCSleepRequest, RPCStartupRequest,
                                          RPCStartupResponse,
                                          RPCUProfileRequest, RPCWakeUpRequest)
@@ -641,3 +642,12 @@ class MQLLMEngineClient(EngineClient):
         if isinstance(request_output, BaseException):
             raise request_output
         return request_output.lora_loaded
+
+    async def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        """Sends model weights over infiniband to different vLLM instance"""
+
+        await self._send_one_way_rpc_request(
+            request=RPCReplicateModelRequest(
+                dst_ip=dst_ip,
+                dst_port=dst_port,
+            ), socket=self.input_socket)

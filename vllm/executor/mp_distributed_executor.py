@@ -202,6 +202,9 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         for result in parallel_worker_tasks:
             result.get()
 
+    def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        self._run_workers("replicate_model", dst_ip=dst_ip, dst_port=dst_port)
+
     async def _driver_execute_model_async(
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None

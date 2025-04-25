@@ -174,6 +174,7 @@ class StatelessProcessGroup:
         """Send an object to a destination rank."""
         self.expire_data()
         key = f"send_to/{dst}/{self.send_dst_counter[dst]}"
+        logger.debug(f"Sending {obj} to {dst} via path: {key}")
         self.store.set(key, pickle.dumps(obj))
         self.send_dst_counter[dst] += 1
         self.entries.append((key, time.time()))
@@ -191,9 +192,9 @@ class StatelessProcessGroup:
 
     def recv_obj(self, src: int) -> Any:
         """Receive an object from a source rank."""
-        obj = pickle.loads(
-            self.store.get(
-                f"send_to/{self.rank}/{self.recv_src_counter[src]}"))
+        key = f"send_to/{self.rank}/{self.recv_src_counter[src]}"
+        logger.debug(f"Receiving obj from {src} via path: {key}")
+        obj = pickle.loads(self.store.get(key))
         self.recv_src_counter[src] += 1
         return obj
 
@@ -372,7 +373,9 @@ class StatelessProcessGroup:
         rank: int,
         world_size: int,
         data_expiration_seconds: int = 3600,
-        store_timeout: int = 300,
+        # TODO : debug timeout, return to 300 for prod
+        store_timeout: int = 10,
+        wait_for_workers: bool = True,
     ) -> "StatelessProcessGroup":
         """A replacement for `torch.distributed.init_process_group` that does not
         pollute the global state.
@@ -401,6 +404,13 @@ class StatelessProcessGroup:
             listen_socket = None
             listen_fd = None
 
+        logger.debug(f"""
+Creating TCPStore with parameters:
+            host_name={host},
+            port={port},
+            world_size={world_size},
+            is_master=({rank} == 0),
+        """)
         store = TCPStore(
             host_name=host,
             port=port,
@@ -409,6 +419,7 @@ class StatelessProcessGroup:
             timeout=timedelta(seconds=store_timeout),
             use_libuv=False,  # for now: github.com/pytorch/pytorch/pull/150215
             master_listen_fd=listen_fd,
+            wait_for_workers=wait_for_workers,
         )
 
         return StatelessProcessGroup(

@@ -393,6 +393,9 @@ class EngineCore:
     def execute_dummy_batch(self):
         self.model_executor.execute_dummy_batch()
 
+    def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        return self.model_executor.replicate_model(dst_ip, dst_port)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_executor.add_lora(lora_request)
 

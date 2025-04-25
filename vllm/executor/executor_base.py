@@ -223,6 +223,11 @@ class ExecutorBase(ABC):
                                         pattern=pattern,
                                         max_size=max_size))
 
+    def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        self.collective_rpc("replicate_model",
+                            kwargs=dict(dst_ip=dst_ip,
+                                        dst_port=dst_port))
+
     @abstractmethod
     def check_health(self) -> None:
         """Checks if the executor is healthy. If not, it should raise an

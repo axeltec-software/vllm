@@ -14,6 +14,7 @@ from vllm.model_executor.model_loader.bitsandbytes_loader import (
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.gguf_loader import GGUFModelLoader
+from vllm.model_executor.model_loader.infiniband_loader import IBModelLoader
 from vllm.model_executor.model_loader.runai_streamer_loader import (
     RunaiModelStreamerLoader)
 from vllm.model_executor.model_loader.sharded_state_loader import (
@@ -40,6 +41,7 @@ LoadFormats = Literal[
     "safetensors",
     "sharded_state",
     "tensorizer",
+    "infiniband",
 ]
 _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "auto": DefaultModelLoader,
@@ -55,6 +57,7 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "safetensors": DefaultModelLoader,
     "sharded_state": ShardedStateLoader,
     "tensorizer": TensorizerLoader,
+    "infiniband": IBModelLoader,
 }
 
 
@@ -102,18 +105,31 @@ def register_model_loader(load_format: str):
     return _wrapper
 
 
-def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
+def get_model_loader(load_config: LoadConfig,
+                     rank: int = 0) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     load_format = load_config.load_format
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
         raise ValueError(f"Load format `{load_format}` is not supported")
+    
+    if load_format == "infiniband":
+        weights_source = IBModelLoader.discover_weights_source(
+            load_config.model_loader_extra_config)
+        if weights_source is None:
+            # Fallback to default model loader if can't find weights source
+            load_config.model_loader_extra_config = None
+            return _LOAD_FORMAT_TO_MODEL_LOADER["auto"](load_config)
+        else:
+            return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config, rank, weights_source)
+
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
 
 
 def get_model(*,
               vllm_config: VllmConfig,
               model_config: Optional[ModelConfig] = None) -> nn.Module:
-    loader = get_model_loader(vllm_config.load_config)
+    loader = get_model_loader(vllm_config.load_config,
+                              vllm_config.parallel_config.rank)
     if model_config is None:
         model_config = vllm_config.model_config
     return loader.load_model(vllm_config=vllm_config,

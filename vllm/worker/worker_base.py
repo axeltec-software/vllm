@@ -124,6 +124,9 @@ class WorkerBase:
     def list_loras(self) -> Set[int]:
         raise NotImplementedError
 
+    def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        raise NotImplementedError
+
     @property
     def vocab_size(self) -> int:
         """Get vocabulary size from model configuration."""

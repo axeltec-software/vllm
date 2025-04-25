@@ -49,7 +49,8 @@ class PyNcclPipe(KVPipeBase):
                  local_rank: int,
                  config: KVTransferConfig,
                  device: Optional[str] = None,
-                 port_offset: int = 0):
+                 port_offset: int = 0,
+                 wait_for_workers: bool = True):
         self.config = config
         self.local_rank = local_rank
         self.kv_rank = self.config.kv_rank
@@ -67,6 +68,7 @@ class PyNcclPipe(KVPipeBase):
             rank=self.kv_rank,
             world_size=self.kv_parallel_size,
             store_timeout=store_timeout,
+            wait_for_workers=wait_for_workers,
         )
         # add a barrier to make sure the connection is initiated properly
         self.group.barrier()
@@ -74,7 +76,7 @@ class PyNcclPipe(KVPipeBase):
         self.device_send_func, self.device_recv_func = impl
         # set target rank
         self.target_rank_for_send = (self.kv_rank + 1) % self.kv_parallel_size
-        self.target_rank_for_recv = (self.kv_rank - 1) % self.kv_parallel_size
+        self.target_rank_for_recv = (self.kv_rank + 1) % self.kv_parallel_size
 
         # transportation-related variables
         self.transport_thread: Optional[ThreadPoolExecutor] = None
@@ -144,9 +146,18 @@ class PyNcclPipe(KVPipeBase):
             buffer: A tensor of the specified type and shape,
                 allocated on `self.device`.
         """
-        return torch.empty(metadata["shape"],
-                           dtype=metadata["dtype"],
-                           device=self.device)
+        if metadata['dtype'].itemsize == 1:
+            # TODO : calc proper size right away instead of reshape ad-hoc
+            return torch.empty(
+                metadata["shape"],
+                # TODO Change to metadata["dtype"] after updating to nccl >= 2.24.3.
+                #  Earlier versions don't support FP8 sending.
+                dtype=torch.uint8,
+                device=self.device).reshape((-1, ))
+        else:
+            return torch.empty(metadata["shape"],
+                               dtype=metadata["dtype"],
+                               device=self.device)
 
     def _send_metadata(self, metadata: Metadata):
         """
@@ -167,7 +178,18 @@ class PyNcclPipe(KVPipeBase):
         """
         return self.group.recv_obj(self.target_rank_for_recv)
 
-    def _send_impl(self, tensor: Optional[torch.Tensor]) -> None:
+    def _send_tensor_metadata(
+            self,
+            tensor: torch.Tensor,
+            extra_metadata: Optional[Metadata] = None) -> None:
+        metadata = self._make_metadata(tensor)
+        if extra_metadata is not None:
+            metadata = {**metadata, **extra_metadata}
+        self._send_metadata(metadata)
+
+    def _send_impl(self,
+                   tensor: Optional[torch.Tensor],
+                   extra_metadata: Optional[Metadata] = None) -> None:
         """
         The actual implementation of sending the tensor and its metadata to the
         target rank.
@@ -176,13 +198,16 @@ class PyNcclPipe(KVPipeBase):
             tensor: The input tensor to be sent, or `None` if no tensor is
                 being sent.
         """
-        metadata = self._make_metadata(tensor)
-        self._send_metadata(metadata)
+        self._send_tensor_metadata(tensor, extra_metadata)
         if tensor is not None:
-            self.device_send_func(tensor.to(self.device),
-                                  self.target_rank_for_send)
+            to_send = tensor.to(self.device)
+            # TODO Remove dtype conversion after updating to nccl >= 2.24.3.
+            #  Earlier versions don't support FP8 sending.
+            if to_send.element_size() == 1:
+                to_send = to_send.reshape((-1, )).view(dtype=torch.uint8)
+            self.device_send_func(to_send, self.target_rank_for_send)
 
-    def _recv_impl(self) -> Optional[torch.Tensor]:
+    def _recv_impl(self) -> tuple[Optional[torch.Tensor], Metadata]:
         """
         The actual implementation of receiving a tensor and its metadata from
         the target rank.
@@ -191,20 +216,55 @@ class PyNcclPipe(KVPipeBase):
             buffer: The received tensor, or `None` if no tensor is received.
         """
         metadata = self._recv_metadata()
-        if metadata["dtype"] is None:
-            return None
+        if "dtype" not in metadata or metadata["dtype"] is None:
+            return None, metadata
+        if "shape" not in metadata or metadata["shape"] is None:
+            return None, metadata
         buffer = self._prepare_recv_buffer(metadata)
         self.device_recv_func(buffer, self.target_rank_for_recv)
+        # TODO Remove after updating to nccl >= 2.24.3.
+        #  Earlier versions don't support FP8 sending.
+        if metadata['dtype'].itemsize == 1:
+            buffer = buffer.view(metadata["dtype"]).reshape(metadata["shape"])
+        del metadata["dtype"]
+        del metadata["shape"]
 
-        return buffer
+        return buffer, metadata
+
+    def send_metadata_only(self, metadata: Metadata) -> None:
+        self._send_metadata(metadata)
 
     def send_tensor_wrapper(self, tensor: Optional[torch.Tensor],
-                            tensor_size: int) -> None:
+                            tensor_size: int,
+                            metadata: Optional[Metadata]) -> None:
         """
         Wrapper for _send_impl to handle exceptions and update buffer size.
         """
         try:
-            self._send_impl(tensor)
+            self._send_impl(tensor, metadata)
+
+            with self.buffer_size_lock:
+                self.buffer_size -= tensor_size
+        except Exception as e:
+            logger.error("[rank%d]: Exception when trying to send %s, msg: %s",
+                         torch.distributed.get_rank(), str(tensor), str(e))
+            import traceback
+            traceback.print_exc()
+
+    def _send_tensor_only(self, tensor: Optional[torch.Tensor],
+                          tensor_size: int) -> None:
+        """
+        Wrapper for _send_impl to handle exceptions and update buffer size.
+        """
+        try:
+            if tensor is not None:
+                to_send = tensor.to(self.device)
+                # TODO Remove dtype conversion after updating to nccl >= 2.24.3.
+                #  Earlier versions don't support FP8 sending.
+                if to_send.element_size() == 1:
+                    to_send = to_send.reshape((-1, )).view(dtype=torch.uint8)
+                torch.cuda.synchronize()
+                self.device_send_func(to_send, self.target_rank_for_send)
 
             with self.buffer_size_lock:
                 self.buffer_size -= tensor_size
@@ -223,7 +283,9 @@ class PyNcclPipe(KVPipeBase):
             logger.debug("KV cache transfer pipe is full. Waiting...")
             time.sleep(0.05)
 
-    def send_tensor(self, tensor: Optional[torch.Tensor]) -> None:
+    def send_tensor(self,
+                    tensor: Optional[torch.Tensor],
+                    metadata: Optional[Metadata] = None) -> None:
         """
         Sends a tensor and its metadata to the destination rank in a
         non-blocking way.
@@ -245,9 +307,38 @@ class PyNcclPipe(KVPipeBase):
             self.buffer_size += tensor_size
 
         self.transport_thread.submit(self.send_tensor_wrapper, tensor,
-                                     tensor_size)
+                                     tensor_size, metadata)
 
-    def recv_tensor(self) -> Optional[torch.Tensor]:
+    def send_tensor_with_response(
+            self,
+            tensor: Optional[torch.Tensor],
+            metadata: Optional[Metadata] = None) -> Metadata:
+        """
+        Sends a tensor and its metadata to the destination rank in a
+        non-blocking way.
+
+        Parameters:
+            - tensor: The tensor to send, or None if no tensor is being sent.
+        """
+        if self.transport_thread is None:
+            self.transport_thread = ThreadPoolExecutor(max_workers=1)
+
+        if tensor is not None:
+            tensor_size = tensor.element_size() * tensor.numel()
+        else:
+            tensor_size = 0
+
+        self.block_if_full()
+
+        with self.buffer_size_lock:
+            self.buffer_size += tensor_size
+
+        self._send_tensor_metadata(tensor, metadata)
+        self.transport_thread.submit(self._send_tensor_only, tensor,
+                                     tensor_size)
+        return self._recv_metadata()
+
+    def recv_tensor(self) -> tuple[Optional[torch.Tensor], Metadata]:
         """
         Receives a tensor and its metadata from the source rank. Blocking call.
 
@@ -260,7 +351,7 @@ class PyNcclPipe(KVPipeBase):
         future = self.transport_thread.submit(self._recv_impl)
 
         try:
-            tensor = future.result()
+            tensor, metadata = future.result()
         except Exception as e:
             logger.error("Encountering exception in KV receiving thread")
             logger.error("%s", e)
@@ -269,7 +360,7 @@ class PyNcclPipe(KVPipeBase):
             traceback.print_exc()
             raise e
 
-        return tensor
+        return tensor, metadata
 
     def close(self):
         """

@@ -108,6 +108,9 @@ class Executor(ExecutorBase):
     def profile(self, is_start: bool = True):
         self.collective_rpc("profile", args=(is_start, ))
 
+    def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        self.collective_rpc("replicate_model", args=(dst_ip, dst_port))
+
 
 class UniProcExecutor(UniProcExecutorV0, Executor):
     pass

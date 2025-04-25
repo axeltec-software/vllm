@@ -657,6 +657,12 @@ class AsyncLLM(EngineClient):
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()
 
+    async def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        """Sends model weights over infiniband to different vLLM instance"""
+        # We make model replication async here to return response to a caller to proceed there as caller awaits
+        # confirmation that we're capable of performing this IB load
+        asyncio.create_task(self.engine_core.replicate_model_async(dst_ip, dst_port))
+
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
         return await self.engine_core.add_lora_async(lora_request)

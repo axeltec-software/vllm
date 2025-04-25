@@ -326,6 +326,10 @@ class EngineClient(ABC):
     @abstractmethod
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
+
+    @abstractmethod
+    async def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        """Sends model weights over infiniband to different vLLM instance"""
         ...
 
     async def scale_elastic_ep(self,

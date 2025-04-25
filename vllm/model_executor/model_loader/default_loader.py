@@ -88,7 +88,8 @@ class DefaultModelLoader(BaseModelLoader):
         if load_format == "auto":
             allow_patterns = ["*.safetensors", "*.bin"]
         elif (load_format == "safetensors"
-              or load_format == "fastsafetensors"):
+              or load_format == "fastsafetensors"
+              or load_format == "infiniband"):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
         elif load_format == "mistral":
@@ -153,8 +154,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-            self, source: "Source"
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        self, source: "Source") -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
@@ -261,6 +261,8 @@ class DefaultModelLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
+        # for name, tensor in model.state_dict().items():Add commentMore actions
+        #     logger.debug(f"Fetching tensor {name} with shape {tensor.shape}")
         weights_to_load = {name for name, _ in model.named_parameters()}
         loaded_weights = model.load_weights(
             self.get_all_weights(model_config, model))

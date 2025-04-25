@@ -40,6 +40,7 @@ from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.layers.sampler import (Sampler, SamplerOutput,
                                                 get_sampler)
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader.infiniband import InfinibandModelLoader
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 from vllm.model_executor.models import supports_lora, supports_multimodal
 from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
@@ -1023,6 +1024,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
 
         # Lazy initialization
         self.model: nn.Module  # Set after load_model
+        self._loaded_model = False
         # Set after load_model.
         self.lora_manager: Optional[LRUCacheWorkerLoRAManager] = None
         self.sampler = get_sampler()
@@ -1078,6 +1080,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 )
                 self.model = self.lora_manager.create_lora_manager(self.model)
             time_after_load = time.perf_counter()
+        # for name, tensor in self.model.state_dict().items():
+        #     logger.debug(f"Have tensor {name} with shape {tensor.shape}")
 
         self.model_memory_usage = m.consumed_memory
         logger.info("Model loading took %.4f GiB and %.6f seconds",
@@ -1094,6 +1098,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 self.model,
                 fullgraph=envs.VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE,
                 backend=backend)
+        self._loaded_model = True
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -1531,6 +1536,11 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     @property
     def vocab_size(self) -> int:
         return self.model_config.get_vocab_size()
+
+    def replicate_model(self, dst_ip: str, dst_port: int, rank: int) -> None:
+        assert self._loaded_model, "Attempting infiniband copying of not loaded model"
+        infiniband_loader = InfinibandModelLoader(rank, "", "")
+        infiniband_loader.send_model_weights(dst_ip, dst_port, self.model)
 
 
 class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):

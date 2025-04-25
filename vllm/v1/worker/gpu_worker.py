@@ -218,6 +218,9 @@ class Worker(WorkerBase):
     def reload_weights(self) -> None:
         self.model_runner.reload_weights()
 
+    def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        return self.model_runner.replicate_model(dst_ip, dst_port, self.rank)
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much

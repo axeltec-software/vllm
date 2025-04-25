@@ -808,6 +808,10 @@ async def collect_from_async_generator(
     return items
 
 
+def get_hostname() -> str:
+    return envs.HOSTNAME
+
+
 def get_ip() -> str:
     host_ip = envs.VLLM_HOST_IP
     if "HOST_IP" in os.environ and "VLLM_HOST_IP" not in os.environ:

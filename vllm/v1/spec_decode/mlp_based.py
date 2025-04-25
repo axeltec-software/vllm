@@ -86,7 +86,7 @@ class MLPProposer:
         return draft_token_ids[:batch_size, :]
 
     def load_model(self, target_model: nn.Module) -> None:
-        loader = get_model_loader(self._load_config)
+        loader = get_model_loader(self._load_config, self.vllm_config.parallel_config.rank)
         weights = loader.get_all_weights(self._model_config, self.speculator)
 
         # Load embedding and unembedding

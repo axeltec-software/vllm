@@ -25,6 +25,7 @@ from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          RPCProcessRequest,
                                          RPCResetMultiModalCacheRequest,
                                          RPCResetPrefixCacheRequest,
+                                         RPCReplicateModelRequest,
                                          RPCSleepRequest, RPCStartupRequest,
                                          RPCStartupResponse,
                                          RPCUProfileRequest, RPCWakeUpRequest)
@@ -278,6 +279,8 @@ class MQLLMEngine:
                     self._handle_process_request(request)
                 elif isinstance(request, RPCAbortRequest):
                     self._handle_abort_request(request)
+                elif isinstance(request, RPCReplicateModelRequest):
+                    self._handle_replicate_model_request(request)
                 elif isinstance(request, RPCUProfileRequest):
                     if request == RPCUProfileRequest.START_PROFILE:
                         self.start_profile()
@@ -419,6 +422,11 @@ class MQLLMEngine:
         """Log and set errored status if this is the first issue."""
         if self._errored_with is None:
             self._errored_with = e
+
+    def _handle_replicate_model_request(self, request: RPCReplicateModelRequest):
+        self.engine.replicate_model(request.dst_ip, request.dst_port)
+        if self.log_requests:
+            logger.info("Performed infiniband load")
 
     def start_profile(self) -> None:
         self.engine.start_profile()

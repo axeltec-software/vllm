@@ -141,6 +141,9 @@ class EngineCoreClient(ABC):
     def abort_requests(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
+    def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        raise NotImplementedError
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
 
@@ -202,6 +205,9 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
+        raise NotImplementedError
+
+    async def replicate_model_async(self, dst_ip: str, dst_port: int) -> None:
         raise NotImplementedError
 
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
@@ -282,6 +288,9 @@ class InprocClient(EngineCoreClient):
 
     def execute_dummy_batch(self) -> None:
         self.engine_core.execute_dummy_batch()
+
+    def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        self.engine_core.replicate_model(dst_ip, dst_port)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.engine_core.add_lora(lora_request)
@@ -717,6 +726,10 @@ class SyncMPClient(MPClient):
     def reset_prefix_cache(self) -> None:
         self.call_utility("reset_prefix_cache")
 
+    def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        # TODO
+        self._call_utility("replicate_model", dst_ip, dst_port)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -928,6 +941,9 @@ class AsyncMPClient(MPClient):
 
     async def execute_dummy_batch_async(self) -> None:
         await self.call_utility_async("execute_dummy_batch")
+
+    async def replicate_model_async(self, dst_ip: str, dst_port: str) -> None:
+        await self.call_utility_async("replicate_model", dst_ip, dst_port)
 
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
         return await self.call_utility_async("add_lora", lora_request)

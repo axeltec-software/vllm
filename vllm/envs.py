@@ -9,6 +9,7 @@ import tempfile
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
+    HOSTNAME: str = ""
     VLLM_HOST_IP: str = ""
     VLLM_PORT: Optional[int] = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
@@ -306,6 +307,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "VLLM_CACHE_ROOT",
             os.path.join(get_default_cache_root(), "vllm"),
         )),
+
+    # used in kubernetes to determine the pod name
+    # of the current instance
+    'HOSTNAME':
+        lambda: os.getenv('HOSTNAME', ""),
 
     # used in distributed environment to determine the ip address
     # of the current node, when the node has multiple network interfaces.

@@ -1835,6 +1835,26 @@ class LLMEngine:
 
         return sampling_params
 
+    def replicate_model(self, dst_ip: str, dst_port: int) -> None:
+        """Transfer model weights by inifiband to another vLLM instance
+
+        Args:
+            dst_ip: str, destination ip address where model weights should be replicated
+            dst_port: int, destination port where model weights should be replicated
+
+        Details:
+            TODO
+            - Refer to the
+              :meth:`~vllm.core.scheduler.Scheduler.abort_seq_group`
+              from class :class:`~vllm.core.scheduler.Scheduler`.
+
+        Example:
+            TODO
+            >>> # initialize engine and add a request with request_id
+            >>> engine.replicate_model("127.0.0.2", "29500")
+        """
+        self.model_executor.replicate_model(dst_ip, dst_port)
+
     def collective_rpc(self,
                        method: Union[str, Callable[..., _R]],
                        timeout: Optional[float] = None,
