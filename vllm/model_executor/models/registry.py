@@ -289,7 +289,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "Qwen3NextMTP": ("qwen3_next_mtp", "Qwen3NextMTP"),
     # Temporarily disabled.
     # # TODO(woosuk): Re-enable this once the MLP Speculator is supported in V1.
-    # "MLPSpeculatorPreTrainedModel": ("mlp_speculator", "MLPSpeculator"),
+    "MLPSpeculatorPreTrainedModel": ("mlp_speculator_nebius", "MLPSpeculatorHeads"),
 }
 
 _TRANSFORMERS_SUPPORTED_MODELS = {

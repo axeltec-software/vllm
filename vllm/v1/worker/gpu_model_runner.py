@@ -82,8 +82,10 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.mlp_based import MLPProposer
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
+from vllm.v1.spec_decode.utils import get_valid_tokens
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin, KVConnectorOutput)
@@ -258,6 +260,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.drafter = MedusaProposer(
                     vllm_config=self.vllm_config,
                     device=self.device)  # type: ignore
+            elif self.speculative_config.method == "mlp_speculator":
+                self.drafter = MLPProposer(self.vllm_config,
+                                           self.device)  # type: ignore
             else:
                 raise ValueError("Unknown speculative decoding method: "
                                  f"{self.speculative_config.method}")
@@ -1864,24 +1869,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._update_states_after_model_execute(output_token_ids)
 
         return sampler_output
-
-    def _bookkeeping_sync(
-        self, scheduler_output: "SchedulerOutput",
-        sampler_output: SamplerOutput, logits: Optional[torch.Tensor],
-        hidden_states: torch.Tensor, num_scheduled_tokens: int
-    ) -> tuple[
-            dict[str, int],
-            Optional[LogprobsLists],
-            list[list[int]],
-            dict[str, Optional[LogprobsTensors]],
-            list[str],
-            dict[str, int],
-            list[int],
-    ]:
-        num_nans_in_logits = {}
-        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
-            num_nans_in_logits = self._get_nans_in_logits(logits)
-
+    
+    def generate_discard_sampled_tokens_req_indices(self, scheduler_output: "SchedulerOutput"):
         # TODO(woosuk): The following loop can be slow since it iterates over
         # the requests one by one. Optimize.
         discard_sampled_tokens_req_indices = []
@@ -1899,6 +1888,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Record the index of the request that should not be sampled,
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
+        return discard_sampled_tokens_req_indices
+    
+
+    def _bookkeeping_sync(
+        self, scheduler_output: "SchedulerOutput",
+        sampler_output: SamplerOutput, logits: Optional[torch.Tensor],
+        hidden_states: torch.Tensor, num_scheduled_tokens: int,
+        discard_sampled_tokens_req_indices: list[list[int]],
+    ) -> tuple[
+            dict[str, int],
+            Optional[LogprobsLists],
+            list[list[int]],
+            dict[str, Optional[LogprobsTensors]],
+            list[str],
+            dict[str, int],
+            list[int],
+    ]:
+        num_nans_in_logits = {}
+        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+            num_nans_in_logits = self._get_nans_in_logits(logits)
 
         # Copy some objects so they don't get modified after returning.
         # This is important when using async scheduling.
@@ -2117,6 +2126,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        discard_sampled_tokens_req_indices= self.generate_discard_sampled_tokens_req_indices(
+            scheduler_output)
+
+        if self.speculative_config:
+            assert spec_decode_common_attn_metadata is not None
+            with record_function_or_nullcontext("Draft"):
+                self._draft_token_ids = self.propose_draft_token_ids(
+                    scheduler_output,
+                    sampler_output.sampled_token_ids,
+                    self.input_batch.sampling_metadata,
+                    hidden_states,
+                    sample_hidden_states,
+                    aux_hidden_states,
+                    discard_sampled_tokens_req_indices,
+                    spec_decode_metadata,
+                    spec_decode_common_attn_metadata,
+                )
+
         with record_function_or_nullcontext("Bookkeep"):
             (
                 num_nans_in_logits,
@@ -2128,24 +2155,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 invalid_req_indices,
             ) = self._bookkeeping_sync(scheduler_output, sampler_output,
                                        logits, hidden_states,
-                                       num_scheduled_tokens)
-
-        if self.speculative_config:
-            assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("Draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
-                    valid_sampled_token_ids,
-                    self.input_batch.sampling_metadata,
-                    hidden_states,
-                    sample_hidden_states,
-                    aux_hidden_states,
-                    spec_decode_metadata,
-                    spec_decode_common_attn_metadata,
-                )
+                                       num_scheduled_tokens,
+                                       discard_sampled_tokens_req_indices)
 
         with record_function_or_nullcontext("EPLB"):
             self.eplb_step()
+
+        if get_tp_group().rank == 0:
+            print([len(v) for v in valid_sampled_token_ids])
 
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
@@ -2182,14 +2199,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
-        sampled_token_ids: list[list[int]],
+        sampled_token_ids: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         hidden_states: torch.Tensor,
         sample_hidden_states: torch.Tensor,
         aux_hidden_states: Optional[torch.Tensor],
+        discard_sampled_tokens_req_indices: list[list[int]],
         spec_decode_metadata: Optional[SpecDecodeMetadata],
         common_attn_metadata: CommonAttentionMetadata,
     ) -> Union[list[list[int]], torch.Tensor]:
+        # Only mlp_speculator is supported now
+        assert isinstance(self.drafter, MLPProposer) or self.speculative_config.use_eagle()
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if self.speculative_config.method == "ngram":
             assert isinstance(self.drafter, NgramProposer)
@@ -2216,27 +2237,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata=sampling_metadata,
             )
         elif self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
-            # TODO(woosuk): Refactor the loop.
-            req_ids = self.input_batch.req_ids
-            next_token_ids: list[int] = []
-            for i, token_ids in enumerate(sampled_token_ids):
-                if token_ids:
-                    # Common case.
-                    next_token_id = token_ids[-1]
-                else:
-                    # Partial prefill (rare case).
-                    # Get the next token id from the request state.
-                    req_id = req_ids[i]
-                    req_state = self.requests[req_id]
-                    seq_len = (req_state.num_computed_tokens +
-                               scheduler_output.num_scheduled_tokens[req_id])
-                    next_token_id = req_state.get_token_id(seq_len)
-                next_token_ids.append(next_token_id)
-            next_token_ids = torch.tensor(next_token_ids,
-                                          dtype=torch.int32,
-                                          device=self.device)
+            assert isinstance(self.drafter, EagleProposer)            
 
+            common_attn_metadata = self.drafter.prepare_inputs_nebius(
+                common_attn_metadata,
+            )
+            last_token_indices = common_attn_metadata.query_start_loc[1:] - 1
             if spec_decode_metadata is None:
                 # input_ids can be None for multimodal models.
                 target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
@@ -2248,40 +2254,74 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         dim=-1)
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
-            else:
-                # TODO(woosuk): Refactor this.
-                num_draft_tokens = spec_decode_metadata.num_draft_tokens
-                num_rejected_tokens = [
-                    n + 1 - len(sampled_token_ids[i]) if n > 0 else 0
-                    for i, n in enumerate(num_draft_tokens)
-                ]
-                num_rejected_tokens_cpu = torch.tensor(num_rejected_tokens,
-                                                       dtype=torch.int32)
-                common_attn_metadata, token_indices =\
-                    self.drafter.prepare_inputs(
-                    common_attn_metadata, num_rejected_tokens_cpu)
 
-                target_token_ids = self.input_ids.gpu[token_indices]
+                next_token_ids = sampled_token_ids.reshape(-1)
+            else:
+                cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens
+                next_token_ids, num_rejected_tokens = get_valid_tokens(
+                    sampled_token_ids,
+                    cu_num_draft_tokens,
+                )
+                last_token_indices -= num_rejected_tokens
+                num_tokens = hidden_states.size()[0]
+                target_token_ids = self.input_ids.gpu[:num_tokens]
+
                 # TODO(woosuk): Support M-RoPE.
-                target_positions = self.positions.gpu[token_indices]
+                target_positions = self.positions.gpu[:num_tokens]
                 if self.use_aux_hidden_state_outputs:
                     target_hidden_states = torch.cat(
-                        [h[token_indices] for h in aux_hidden_states], dim=-1)
+                        [h for h in aux_hidden_states], dim=-1)
                 else:
-                    target_hidden_states = hidden_states[token_indices]
+                    target_hidden_states = hidden_states
+            
             mm_embeds = None
             if self.supports_mm_inputs:
                 mm_embeds = self._gather_mm_embeddings(scheduler_output,
                                                        shift_computed_tokens=1)
+            
+            for i in discard_sampled_tokens_req_indices:
+                req_id = self.input_batch.req_ids[i]
+                req_state = self.requests[req_id]
+                seq_len = (req_state.num_computed_tokens +
+                            scheduler_output.num_scheduled_tokens[req_id])
+                next_token_id = req_state.get_token_id(seq_len)
+
+                next_token_id_gpu = torch.tensor(next_token_id, device="cpu", pin_memory=True).to("cuda", non_blocking=True)
+                next_token_ids[i] = next_token_id_gpu
 
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
                 next_token_ids=next_token_ids,
+                last_token_indices=last_token_indices,
                 sampling_metadata=sampling_metadata,
                 common_attn_metadata=common_attn_metadata,
                 mm_embeds=mm_embeds,
+            )
+        elif self.speculative_config.method == "mlp_speculator":
+            assert isinstance(self.drafter, MLPProposer)
+            if spec_decode_metadata is None:
+                num_of_tokens = len(self.input_batch.req_ids)
+                target_hidden_states = hidden_states[[-1] * num_of_tokens, :]
+                next_token_ids = sampled_token_ids.reshape(-1)
+            else:
+                cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens
+
+                next_token_ids, num_rejected_tokens = get_valid_tokens(
+                    sampled_token_ids,
+                    cu_num_draft_tokens,
+                )
+
+                offsets = common_attn_metadata.query_start_loc
+                token_indices = offsets[1:] - num_rejected_tokens - 1
+
+                target_hidden_states = hidden_states[token_indices, :]
+
+            draft_token_ids = self.drafter.propose(
+                input_ids=next_token_ids,
+                hidden_states=target_hidden_states,
+                sampling_metadata=sampling_metadata,
             )
         return draft_token_ids
 
@@ -2821,6 +2861,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)
+                self.drafter.dummy_run(num_tokens)
+            elif self.speculative_config and \
+                self.speculative_config.method in ('mlp_speculator'):
+                assert isinstance(self.drafter, MLPProposer)
                 self.drafter.dummy_run(num_tokens)
 
         # This is necessary to avoid blocking DP.

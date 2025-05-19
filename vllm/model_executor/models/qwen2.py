@@ -333,6 +333,8 @@ class Qwen2Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+            
+        self.aux_hidden_state_layers: tuple[int] = tuple()
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 

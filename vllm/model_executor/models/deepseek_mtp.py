@@ -17,6 +17,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
+from vllm.compilation.decorators import support_torch_compile
 
 from .deepseek_v2 import (DeepseekV2DecoderLayer,
                           get_spec_layer_idx_from_weight_name)
@@ -80,7 +81,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         hidden_states = residual + hidden_states
         return hidden_states
 
-
+@support_torch_compile
 class DeepSeekMultiTokenPredictor(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

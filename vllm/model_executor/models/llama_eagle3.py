@@ -16,14 +16,19 @@ from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
+
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.llama import (LlamaDecoderLayer,
                                               LlamaForCausalLM)
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.model_executor.models.qwen3 import Qwen3Attention
+from vllm.attention import AttentionType
 
 from .utils import AutoWeightsLoader, maybe_prefix
+from vllm.model_executor.layers.activation import NewGELU
+
 
 logger = init_logger(__name__)
 
@@ -38,16 +43,24 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, quant_config=quant_config, prefix=prefix)
 
-        # override qkv
-        self.self_attn.qkv_proj = QKVParallelLinear(
-            2 * self.hidden_size,
-            self.self_attn.head_dim,
-            self.self_attn.total_num_heads,
-            self.self_attn.total_num_kv_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "qkv_proj"),
-        )
+        self.custom = getattr(config, "use_custom_architecture", True)
+        if self.custom:
+            self.fc = torch.nn.Linear(config.hidden_size * 2,
+                                      config.hidden_size,
+                                      bias=False)
+            self.act = NewGELU()
+            self.embeddings_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            # override qkv
+            self.self_attn.qkv_proj = QKVParallelLinear(
+                2 * self.hidden_size,
+                self.self_attn.head_dim,
+                self.self_attn.total_num_heads,
+                self.self_attn.total_num_kv_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "qkv_proj"),
+            )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -70,6 +83,18 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.hidden_norm(hidden_states)
         return hidden_states, residual
 
+    def custom_forward(
+        self,
+        positions: torch.Tensor,
+        embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        embeds = self.embeddings_norm(embeds)
+        hidden_states = self.hidden_norm(hidden_states)
+        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+        hidden_states = self.act(self.fc(hidden_states))
+        return super().forward(positions, hidden_states, None)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -77,6 +102,9 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        if self.custom:
+            return self.custom_forward(positions, embeds, hidden_states)
 
         embeds = self.input_layernorm(embeds)
 
@@ -216,6 +244,7 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
             prefix="")
         self.logits_processor = LogitsProcessor(self.config.draft_vocab_size,
                                                 scale=logit_scale)
+
         self.draft_id_to_target_id = nn.Parameter(
             torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
             requires_grad=False,

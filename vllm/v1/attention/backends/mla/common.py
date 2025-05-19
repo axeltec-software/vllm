@@ -447,14 +447,20 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         scheduler_config = vllm_config.scheduler_config
         self.model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
+<<<<<<< HEAD
         cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
         self.device = device
 
+=======
+        speculative_config = vllm_config.speculative_config
+        self.chunked_prefill_enabled = scheduler_config.chunked_prefill_enabled
+>>>>>>> 777de7ab2 (Implementation of MLP and Eagle speculators for V1)
         self.num_heads = self.model_config.get_num_attention_heads(
             parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
         self.aot_schedule = current_platform.is_cuda()
+<<<<<<< HEAD
         try:
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
@@ -462,6 +468,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+=======
+        self.num_speculative_tokens = 0 if speculative_config is None else speculative_config.num_speculative_tokens
+>>>>>>> 777de7ab2 (Implementation of MLP and Eagle speculators for V1)
 
         # Don't try to access the runner on AMD
         if self.aot_schedule:
@@ -665,6 +674,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                                    query_seq_lens_cpu)
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = \
+<<<<<<< HEAD
             split_decodes_and_prefills(common_attn_metadata,
                                        decode_threshold=self.reorder_batch_threshold)
 
@@ -673,6 +683,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             seq_lens[:num_decodes] = seq_lens[:num_decodes] \
                 // self.dcp_world_size + (self.dcp_rank <= \
                 (seq_lens[:num_decodes] - 1) % self.dcp_world_size)
+=======
+            split_decodes_and_prefills(common_attn_metadata, self.num_speculative_tokens + 1)
+>>>>>>> 777de7ab2 (Implementation of MLP and Eagle speculators for V1)
 
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
