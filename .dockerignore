@@ -3,6 +3,9 @@
 dist
 vllm/*.so
 
+# sccache credentials
+.aws_credentials
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
