@@ -10,6 +10,9 @@ if [ ! -f .aws_credentials ]; then
     exit 1
 fi
 
+# Clean current directory from all development caches to make build clean
+py3clean .
+
 # Get current git branch and short commit hash
 GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 GIT_COMMIT=$(git rev-parse --short HEAD)
