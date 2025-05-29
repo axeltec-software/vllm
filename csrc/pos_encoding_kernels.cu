@@ -127,7 +127,184 @@ __global__ void batched_rotary_embedding_kernel(
       query, key, cache_ptr, head_size, num_heads, num_kv_heads, rot_dim,
       token_idx, query_stride, key_stride, head_stride);
 }
+__global__ void rotate_gptj_kernel_fused(
+  __nv_bfloat16* __restrict__ x,
+  __nv_bfloat16* __restrict__ out,
+  const __nv_bfloat16* __restrict__ cos_sin_cache, 
+  const int64_t* __restrict__ positions,  
+  int S, int M, int rotary_dim, int head_size)
+{
+  int total_pairs = S * M * (rotary_dim / 2);
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
 
+  for (int i = idx; i < total_pairs; i += stride) {
+      int p = i % (rotary_dim / 2);
+      int tmp = i / (rotary_dim / 2);
+      int m = tmp % M;
+      int s = tmp / M;
+    
+      int row = static_cast<int>(positions[s]);
+    
+      int cs_cos_index = row * rotary_dim + p;
+      int cs_sin_index = row * rotary_dim + (rotary_dim / 2) + p;
+    
+      __nv_bfloat16 cos_val = cos_sin_cache[cs_cos_index];
+      __nv_bfloat16 sin_val = cos_sin_cache[cs_sin_index];
+    
+      int token_base = s * (M * (head_size / 2)) + m * (head_size / 2);
+      int pair_index = token_base + p;
+    
+      __nv_bfloat162* x_vec = reinterpret_cast<__nv_bfloat162*>(x);
+      __nv_bfloat162 in_val = x_vec[pair_index];
+
+      __nv_bfloat162* out_vec = reinterpret_cast<__nv_bfloat162*>(out);
+    
+      __nv_bfloat162 rotated;
+      rotated.x = -in_val.y;
+      rotated.y = in_val.x;
+    
+      __nv_bfloat162 cos_vec;
+      cos_vec.x = cos_val;
+      cos_vec.y = cos_val;
+      __nv_bfloat162 sin_vec;
+      sin_vec.x = sin_val;
+      sin_vec.y = sin_val;
+
+      __nv_bfloat162 out_val = __hfma2(rotated, sin_vec, __hmul2(in_val, cos_vec));
+      out_vec[pair_index] = out_val;
+  }
+}
+
+__global__ void rotate_gptj_kernel_offsets_fused(
+  __nv_bfloat16* __restrict__ x,
+  __nv_bfloat16* __restrict__ out,
+  const __nv_bfloat16* __restrict__ cos_sin_cache, 
+  const int64_t* __restrict__ positions,
+  const int64_t* __restrict__ offsets,
+  int S, int M, int rotary_dim, int head_size)
+{
+  int total_pairs = S * M * (rotary_dim / 2);
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+
+  for (int i = idx; i < total_pairs; i += stride) {
+      int p = i % (rotary_dim / 2);
+      int tmp = i / (rotary_dim / 2);
+      int m = tmp % M;
+      int s = tmp / M;
+    
+      int row = static_cast<int>(positions[s] + offsets[s]);
+    
+      int cs_cos_index = row * rotary_dim + p;
+      int cs_sin_index = row * rotary_dim + (rotary_dim / 2) + p;
+    
+      __nv_bfloat16 cos_val = cos_sin_cache[cs_cos_index];
+      __nv_bfloat16 sin_val = cos_sin_cache[cs_sin_index];
+    
+      int token_base = s * (M * (head_size / 2)) + m * (head_size / 2);
+      int pair_index = token_base + p;
+    
+      __nv_bfloat162* x_vec = reinterpret_cast<__nv_bfloat162*>(x);
+      __nv_bfloat162 in_val = x_vec[pair_index];
+
+      __nv_bfloat162* out_vec = reinterpret_cast<__nv_bfloat162*>(out);
+    
+      __nv_bfloat162 rotated;
+      rotated.x = -in_val.y;
+      rotated.y = in_val.x;
+    
+      __nv_bfloat162 cos_vec;
+      cos_vec.x = cos_val;
+      cos_vec.y = cos_val;
+      __nv_bfloat162 sin_vec;
+      sin_vec.x = sin_val;
+      sin_vec.y = sin_val;
+
+      __nv_bfloat162 out_val = __hfma2(rotated, sin_vec, __hmul2(in_val, cos_vec));
+      out_vec[pair_index] = out_val;
+  }
+}
+
+
+__global__ void rotate_neox_kernel_fused_concat(
+  __nv_bfloat16* __restrict__ x,
+  __nv_bfloat16* __restrict__ out,  
+  const __nv_bfloat16* __restrict__ cos_sin_cache, 
+  const int64_t* __restrict__ positions,  
+  int S, int M, int rotary_dim, int head_size)
+{
+  int total_tokens = S * M;
+  int total_pairs = total_tokens * (rotary_dim / 2);
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+
+  for (int i = idx; i < total_pairs; i += stride) {
+      int j = i % (rotary_dim / 2);
+      int token_index = i / (rotary_dim / 2);
+    
+      int s = token_index / M;
+      int m = token_index % M;
+    
+      int token_base = s * (M * head_size) + m * head_size;
+    
+      __nv_bfloat16 a_bf = x[token_base + j];
+      __nv_bfloat16 b_bf = x[token_base + (rotary_dim / 2) + j];
+    
+      int row = static_cast<int>(positions[s]);
+      int cs_cos_index = row * rotary_dim + j;
+      int cs_sin_index = row * rotary_dim + (rotary_dim / 2) + j;
+    
+      __nv_bfloat16 cf = cos_sin_cache[cs_cos_index];
+      __nv_bfloat16 sf = cos_sin_cache[cs_sin_index];
+    
+      __nv_bfloat16 out0 = __hfma(a_bf, cf, -__hmul(b_bf, sf));
+      __nv_bfloat16 out1 = __hfma(b_bf, cf, __hmul(a_bf, sf));
+    
+      out[token_base + j] = out0;
+      out[token_base + (rotary_dim / 2) + j] = out1;
+  }
+}
+
+__global__ void rotate_neox_kernel_offsets_fused(
+  __nv_bfloat16* __restrict__ x,
+  __nv_bfloat16* __restrict__ out, 
+  const __nv_bfloat16* __restrict__ cos_sin_cache, 
+  const int64_t* __restrict__ positions,
+  const int64_t* __restrict__ offsets, 
+  int S, int M, int rotary_dim, int head_size)
+{
+  int total_tokens = S * M;
+  int total_pairs = total_tokens * (rotary_dim / 2);
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+
+  for (int i = idx; i < total_pairs; i += stride) {
+      int j = i % (rotary_dim / 2);
+      int token_index = i / (rotary_dim / 2);
+    
+      int s = token_index / M;
+      int m = token_index % M;
+    
+      int token_base = s * (M * head_size) + m * head_size;
+    
+      __nv_bfloat16 a_bf = x[token_base + j];
+      __nv_bfloat16 b_bf = x[token_base + (rotary_dim / 2) + j];
+    
+      int row = static_cast<int>(positions[s] + offsets[s]);
+      int cs_cos_index = row * rotary_dim + j;
+      int cs_sin_index = row * rotary_dim + (rotary_dim / 2) + j;
+    
+      __nv_bfloat16 cf = cos_sin_cache[cs_cos_index];
+      __nv_bfloat16 sf = cos_sin_cache[cs_sin_index];
+    
+      __nv_bfloat16 out0 = __hfma(a_bf, cf, -__hmul(b_bf, sf));
+      __nv_bfloat16 out1 = __hfma(b_bf, cf, __hmul(a_bf, sf));
+    
+      out[token_base + j] = out0;
+      out[token_base + (rotary_dim / 2) + j] = out1;
+  }
+}
 }  // namespace vllm
 
 void rotary_embedding(
@@ -303,4 +480,178 @@ void batched_rotary_embedding(
               key_stride, head_stride, num_heads, num_kv_heads, head_size);
     }
   });
+}
+std::tuple<torch::Tensor, torch::Tensor> rotary_embedding_deepseek_fused(
+  torch::Tensor const& query, 
+  torch::Tensor const& key, 
+  torch::Tensor const& cos_sin_cache, 
+  torch::Tensor const& positions,
+  int64_t rotary_dim) 
+{
+  int S = query.size(0);
+  int M = query.size(1);
+  int head_size = query.size(2);
+  int M_key = key.size(1);
+
+  auto out_query = torch::empty_like(query);
+  auto out_key = torch::empty_like(key);
+
+  __nv_bfloat16* out_query_ptr = reinterpret_cast<__nv_bfloat16*>(out_query.data_ptr<c10::BFloat16>());
+  __nv_bfloat16* out_key_ptr = reinterpret_cast<__nv_bfloat16*>(out_key.data_ptr<c10::BFloat16>());
+
+  __nv_bfloat16* query_ptr = reinterpret_cast<__nv_bfloat16*>(query.data_ptr<c10::BFloat16>());
+  __nv_bfloat16* key_ptr   = reinterpret_cast<__nv_bfloat16*>(key.data_ptr<c10::BFloat16>());
+  const __nv_bfloat16* cos_sin_cache_ptr = reinterpret_cast<const __nv_bfloat16*>(cos_sin_cache.data_ptr<c10::BFloat16>());
+  const int64_t* positions_ptr = positions.data_ptr<int64_t>();
+
+  int total_pairs_query = S * M * (rotary_dim / 2);
+  int total_pairs_key   = S * M_key * (rotary_dim / 2);
+
+  int threads = 256;
+  int blocks_query = std::min<int64_t>((total_pairs_query + threads - 1) / threads, 512);
+  int blocks_key   = std::min<int64_t>((total_pairs_key + threads - 1) / threads, 512);
+  
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  VLLM_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding", [&] {
+    vllm::rotate_gptj_kernel_fused<<<blocks_query, threads, 0, stream>>>(
+      query_ptr, out_query_ptr, cos_sin_cache_ptr, positions_ptr, S, M, rotary_dim, head_size);
+    
+    vllm::rotate_gptj_kernel_fused<<<blocks_key, threads, 0, stream>>>(
+      key_ptr, out_key_ptr, cos_sin_cache_ptr, positions_ptr, S, M_key, rotary_dim, head_size);
+  });
+
+  return std::make_tuple(out_query, out_key);
+}
+
+
+std::tuple<torch::Tensor, torch::Tensor> rotary_embedding_deepseek_offsets_fused(
+  torch::Tensor const& query, 
+  torch::Tensor const& key,
+  torch::Tensor const& cos_sin_cache, 
+  torch::Tensor const& positions,
+  torch::Tensor const& offsets,
+  int64_t rotary_dim) 
+{
+  int S = query.size(0);
+  int M = query.size(1);
+  int head_size = query.size(2);
+  int M_key = key.size(1);
+
+  auto out_query = torch::empty_like(query);
+  auto out_key = torch::empty_like(key);
+
+  __nv_bfloat16* out_query_ptr = reinterpret_cast<__nv_bfloat16*>(out_query.data_ptr<c10::BFloat16>());
+  __nv_bfloat16* out_key_ptr = reinterpret_cast<__nv_bfloat16*>(out_key.data_ptr<c10::BFloat16>());
+
+  __nv_bfloat16* query_ptr = reinterpret_cast<__nv_bfloat16*>(query.data_ptr<c10::BFloat16>());
+  __nv_bfloat16* key_ptr   = reinterpret_cast<__nv_bfloat16*>(key.data_ptr<c10::BFloat16>());
+  const __nv_bfloat16* cos_sin_cache_ptr = reinterpret_cast<const __nv_bfloat16*>(cos_sin_cache.data_ptr<c10::BFloat16>());
+  const int64_t* positions_ptr = positions.data_ptr<int64_t>();
+  const int64_t* offsets_ptr = offsets.data_ptr<int64_t>();
+
+  int total_pairs_query = S * M * (rotary_dim / 2);
+  int total_pairs_key   = S * M_key * (rotary_dim / 2);
+
+  int threads = 256;
+  int blocks_query = std::min<int64_t>((total_pairs_query + threads - 1) / threads, 512);
+  int blocks_key   = std::min<int64_t>((total_pairs_key + threads - 1) / threads, 512);
+  
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  VLLM_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding", [&] {
+    vllm::rotate_gptj_kernel_offsets_fused<<<blocks_query, threads, 0, stream>>>(
+      query_ptr, out_query_ptr, cos_sin_cache_ptr, positions_ptr,offsets_ptr, S, M, rotary_dim, head_size);
+    
+    vllm::rotate_gptj_kernel_offsets_fused<<<blocks_key, threads, 0, stream>>>(
+      key_ptr, out_key_ptr, cos_sin_cache_ptr, positions_ptr,offsets_ptr, S, M_key, rotary_dim, head_size);
+  });
+  return std::make_tuple(out_query, out_key);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> rotary_embedding_deepseek_neox_fused(
+  torch::Tensor const& query, 
+  torch::Tensor const& key,
+  torch::Tensor const& cos_sin_cache, 
+  torch::Tensor const& positions,
+  int64_t rotary_dim) 
+{
+  int S = query.size(0);
+  int M = query.size(1);
+  int head_size = query.size(2);
+  int M_key = key.size(1);
+
+  auto out_query = torch::empty_like(query);
+  auto out_key = torch::empty_like(key);
+
+  __nv_bfloat16* out_query_ptr = reinterpret_cast<__nv_bfloat16*>(out_query.data_ptr<c10::BFloat16>());
+  __nv_bfloat16* out_key_ptr = reinterpret_cast<__nv_bfloat16*>(out_key.data_ptr<c10::BFloat16>());
+
+  __nv_bfloat16* query_ptr = reinterpret_cast<__nv_bfloat16*>(query.data_ptr<c10::BFloat16>());
+  __nv_bfloat16* key_ptr   = reinterpret_cast<__nv_bfloat16*>(key.data_ptr<c10::BFloat16>());
+  const __nv_bfloat16* cos_sin_cache_ptr = reinterpret_cast<const __nv_bfloat16*>(cos_sin_cache.data_ptr<c10::BFloat16>());
+  const int64_t* positions_ptr = positions.data_ptr<int64_t>();
+
+  int total_pairs_query = S * M * (rotary_dim / 2);
+  int total_pairs_key   = S * M_key * (rotary_dim / 2);
+
+  int threads = 256;
+  int blocks_query = std::min<int64_t>((total_pairs_query + threads - 1) / threads, 512);
+  int blocks_key   = std::min<int64_t>((total_pairs_key + threads - 1) / threads, 512);
+  
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  VLLM_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding", [&] {
+    vllm::rotate_neox_kernel_fused_concat<<<blocks_query, threads, 0, stream>>>(
+      query_ptr, out_query_ptr, cos_sin_cache_ptr, positions_ptr, S, M, rotary_dim, head_size);
+    
+    vllm::rotate_neox_kernel_fused_concat<<<blocks_key, threads, 0, stream>>>(
+      key_ptr, out_key_ptr, cos_sin_cache_ptr, positions_ptr, S, M_key, rotary_dim, head_size);
+  });
+
+  return std::make_tuple(out_query, out_key);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> rotary_embedding_deepseek_neox_offsets_fused(
+  torch::Tensor const& query, 
+  torch::Tensor const& key, 
+  torch::Tensor const& cos_sin_cache, 
+  torch::Tensor const& positions,
+  torch::Tensor const& offsets,
+  int64_t rotary_dim) 
+{
+  int S = query.size(0);
+  int M = query.size(1);
+  int head_size = query.size(2);
+  int M_key = key.size(1);
+
+  auto out_query = torch::empty_like(query);
+  auto out_key = torch::empty_like(key);
+
+  __nv_bfloat16* out_query_ptr = reinterpret_cast<__nv_bfloat16*>(out_query.data_ptr<c10::BFloat16>());
+  __nv_bfloat16* out_key_ptr = reinterpret_cast<__nv_bfloat16*>(out_key.data_ptr<c10::BFloat16>());
+
+  __nv_bfloat16* query_ptr = reinterpret_cast<__nv_bfloat16*>(query.data_ptr<c10::BFloat16>());
+  __nv_bfloat16* key_ptr   = reinterpret_cast<__nv_bfloat16*>(key.data_ptr<c10::BFloat16>());
+  const __nv_bfloat16* cos_sin_cache_ptr = reinterpret_cast<const __nv_bfloat16*>(cos_sin_cache.data_ptr<c10::BFloat16>());
+  const int64_t* positions_ptr = positions.data_ptr<int64_t>();
+  const int64_t* offsets_ptr = offsets.data_ptr<int64_t>();
+
+  int total_pairs_query = S * M * (rotary_dim / 2);
+  int total_pairs_key   = S * M_key * (rotary_dim / 2);
+
+  int threads = 256;
+  int blocks_query = std::min<int64_t>((total_pairs_query + threads - 1) / threads, 512);
+  int blocks_key   = std::min<int64_t>((total_pairs_key + threads - 1) / threads, 512);
+  
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  VLLM_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding", [&] {
+    vllm::rotate_neox_kernel_offsets_fused<<<blocks_query, threads, 0, stream>>>(
+      query_ptr, out_query_ptr, cos_sin_cache_ptr, positions_ptr,offsets_ptr, S, M, rotary_dim, head_size);
+    
+    vllm::rotate_neox_kernel_offsets_fused<<<blocks_key, threads, 0, stream>>>(
+      key_ptr, out_key_ptr, cos_sin_cache_ptr, positions_ptr, offsets_ptr, S, M_key, rotary_dim, head_size);
+  });
+  return std::make_tuple(out_query, out_key);
 }

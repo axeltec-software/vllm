@@ -213,7 +213,40 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                 Tensor!? key, int head_size,"
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   ops.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
+  
+  ops.def(
+    "rotary_embedding_deepseek_fused(Tensor query,"
+    "                         Tensor key,"
+    "                         Tensor cos_sin_cache,"
+    "                         Tensor positions,"
+    "                         int rotary_dim) -> (Tensor, Tensor)");
+  ops.impl("rotary_embedding_deepseek_fused", torch::kCUDA, &rotary_embedding_deepseek_fused);
 
+  ops.def(
+    "rotary_embedding_deepseek_neox_fused(Tensor! query,"
+    "                         Tensor! key,"
+    "                         Tensor cos_sin_cache,"
+    "                         Tensor positions,"
+    "                         int rotary_dim) -> (Tensor, Tensor)");
+  ops.impl("rotary_embedding_deepseek_neox_fused", torch::kCUDA, &rotary_embedding_deepseek_neox_fused);
+
+  ops.def(
+    "rotary_embedding_deepseek_offsets_fused(Tensor! query,"
+    "                         Tensor! key,"
+    "                         Tensor cos_sin_cache,"
+    "                         Tensor positions,"
+    "                         Tensor offsets,"
+    "                         int rotary_dim) -> (Tensor, Tensor)");
+  ops.impl("rotary_embedding_deepseek_offsets_fused", torch::kCUDA, &rotary_embedding_deepseek_offsets_fused);
+
+  ops.def(
+    "rotary_embedding_deepseek_neox_offsets_fused(Tensor! query,"
+    "                         Tensor! key,"
+    "                         Tensor cos_sin_cache,"
+    "                         Tensor positions,"
+    "                         Tensor offsets,"
+    "                         int rotary_dim) -> (Tensor, Tensor)");
+  ops.impl("rotary_embedding_deepseek_neox_offsets_fused", torch::kCUDA, &rotary_embedding_deepseek_neox_offsets_fused);
   // Apply GPT-NeoX or GPT-J style rotary embedding to query and key
   // (supports multiple loras).
   ops.def(

@@ -128,6 +128,37 @@ void batched_rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                               bool is_neox, int64_t rot_dim,
                               torch::Tensor& cos_sin_cache_offsets);
 
+
+std::tuple<torch::Tensor, torch::Tensor> rotary_embedding_deepseek_fused(
+        torch::Tensor const& query, 
+        torch::Tensor const& key, 
+        torch::Tensor const& cos_sin_cache, 
+        torch::Tensor const& positions,
+        int64_t rotary_dim);
+
+std::tuple<torch::Tensor, torch::Tensor> rotary_embedding_deepseek_neox_fused(
+    torch::Tensor const& query, 
+    torch::Tensor const& key, 
+    torch::Tensor const& cos_sin_cache, 
+    torch::Tensor const& positions,
+    int64_t rotary_dim);
+
+std::tuple<torch::Tensor, torch::Tensor>  rotary_embedding_deepseek_offsets_fused(
+    torch::Tensor const& query, 
+    torch::Tensor const& key, 
+    torch::Tensor const& cos_sin_cache, 
+    torch::Tensor const& positions,
+    torch::Tensor const& offsets,
+    int64_t rotary_dim);
+
+std::tuple<torch::Tensor, torch::Tensor> rotary_embedding_deepseek_neox_offsets_fused(
+    torch::Tensor const& query, 
+    torch::Tensor const& key, 
+    torch::Tensor const& cos_sin_cache, 
+    torch::Tensor const& positions,
+    torch::Tensor const& offsets,
+    int64_t rotary_dim);
+
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
 void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,

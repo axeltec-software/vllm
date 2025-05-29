@@ -255,6 +255,21 @@ def rotary_embedding(
 ) -> None:
     torch.ops._C.rotary_embedding(positions, query, key, head_size,
                                   cos_sin_cache, is_neox)
+def rotary_embedding_deepseek_fused(query: torch.Tensor,
+                              key: torch.Tensor, cos_sin_cache: torch.Tensor, positions: torch.Tensor, rotary_dim):
+    return torch.ops._C.rotary_embedding_deepseek_fused(query, key, cos_sin_cache, positions, rotary_dim)
+
+def rotary_embedding_deepseek_offsets_fused(query: torch.Tensor,
+                              key: torch.Tensor, cos_sin_cache: torch.Tensor, positions: torch.Tensor, offsets: torch.Tensor, rotary_dim):
+    return torch.ops._C.rotary_embedding_deepseek_offsets_fused(query, key, cos_sin_cache, positions, offsets, rotary_dim)
+
+def rotary_embedding_deepseek_neox_offsets_fused(query: torch.Tensor,
+                              key: torch.Tensor, cos_sin_cache: torch.Tensor, positions: torch.Tensor, offsets: torch.Tensor, rotary_dim):
+    return torch.ops._C.rotary_embedding_deepseek_neox_offsets_fused(query, key, cos_sin_cache, positions, offsets, rotary_dim)
+
+def rotary_embedding_deepseek_neox_fused(query: torch.Tensor,
+                              key: torch.Tensor, cos_sin_cache: torch.Tensor, positions: torch.Tensor, rotary_dim):
+    return torch.ops._C.rotary_embedding_deepseek_neox_fused(query, key, cos_sin_cache, positions, rotary_dim)
 
 
 def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
@@ -376,6 +391,22 @@ def gptq_gemm(a: torch.Tensor, b_q_weight: torch.Tensor,
     return torch.ops._C.gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales,
                                   b_g_idx, use_exllama, bit)
 
+@register_fake("_C::rotary_embedding_deepseek_fused")
+def _rotary_deepseek_fused_fake(query, key, cos_sin, positions, rotary_dim):
+    return torch.empty_like(query), torch.empty_like(key)
+
+@register_fake("_C::rotary_embedding_deepseek_offsets_fused")
+def _rotary_deepseek_offsets_fused_fake(query, key, cos_sin, positions, offsets, rotary_dim):
+    return torch.empty_like(query), torch.empty_like(key)
+
+# NeoX, no offsets
+@register_fake("_C::rotary_embedding_deepseek_neox_fused")
+def _rotary_deepseek_neox_fused_fake(query, key, cos_sin, positions, rotary_dim):
+    return torch.empty_like(query), torch.empty_like(key)
+
+@register_fake("_C::rotary_embedding_deepseek_neox_offsets_fused")
+def _rotary_deepseek_neox_offsets_fused_fake(query, key, cos_sin, positions, offsets, rotary_dim):
+    return torch.empty_like(query), torch.empty_like(key)
 
 if hasattr(torch.ops._C, "gptq_gemm"):
 
