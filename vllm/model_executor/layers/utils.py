@@ -75,6 +75,8 @@ def apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
 
     # Apply repetition penalties as a custom op
     from vllm._custom_ops import apply_repetition_penalties
+
+    repetition_penalties = repetition_penalties.to(logits.dtype)
     apply_repetition_penalties(logits, prompt_mask, output_mask,
                                repetition_penalties)
 
