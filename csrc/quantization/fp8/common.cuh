@@ -23,6 +23,62 @@ static bool is_fp8_ocp() {
 #endif
 }
 
+#define CHECK_INPUT(x) \
+  CHECK_CPU(x);        \
+  CHECK_CONTIGUOUS(x)
+#define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
+  CHECK_CPU(x);                            \
+  CHECK_LAST_DIM_CONTIGUOUS(x)
+
+#define CHECK_DIM(d, x) \
+  TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
+
+#define CHECK_EQ(a, b) \
+  TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
+
+#ifndef USE_ROCM
+  // Adapt from FlashInfer
+  #ifdef FLASHINFER_ENABLE_F16
+    #define _DISPATCH_CASE_F16(c_type, ...) \
+      case at::ScalarType::Half: {          \
+        using c_type = nv_half;             \
+        return __VA_ARGS__();               \
+      }
+  #else
+    #define _DISPATCH_CASE_F16(c_type, ...)
+  #endif
+
+  #ifdef FLASHINFER_ENABLE_BF16
+    #define _DISPATCH_CASE_BF16(c_type, ...) \
+      case at::ScalarType::BFloat16: {       \
+        using c_type = nv_bfloat16;          \
+        return __VA_ARGS__();                \
+      }
+  #else
+    #define _DISPATCH_CASE_BF16(c_type, ...)
+  #endif
+
+  #ifndef USE_ROCM
+    #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(pytorch_dtype, c_type, \
+                                                       ...)                   \
+      [&]() -> bool {                                                         \
+        switch (pytorch_dtype) {                                              \
+          case at::ScalarType::Float: {                                       \
+            using c_type = float;                                             \
+            return __VA_ARGS__();                                             \
+          }                                                                   \
+            _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                           \
+            _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                          \
+          default:                                                            \
+            std::ostringstream oss;                                           \
+            oss << __PRETTY_FUNCTION__ << " failed to dispatch data type "    \
+                << pytorch_dtype;                                             \
+            TORCH_CHECK(false, oss.str());                                    \
+            return false;                                                     \
+        }                                                                     \
+      }()
+  #endif
+
 namespace vllm {
 
 __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
@@ -47,12 +103,12 @@ __device__ __forceinline__ fp8_type scaled_fp8_conversion(float const val,
 
   float r =
       fmaxf(-quant_type_max_v<fp8_type>, fminf(x, quant_type_max_v<fp8_type>));
-#ifndef USE_ROCM
+  #ifndef USE_ROCM
   return static_cast<fp8_type>(r);
-#else
+  #else
   // Use hardware cvt instruction for fp8 on rocm
   return fp8::cvt_c10<fp8_type>(r);
-#endif
+  #endif
 }
 
 // Compute the absolute maximum m of the input tensor and store
@@ -109,10 +165,10 @@ __device__ float thread_max_vec(scalar_t const* __restrict__ input,
   int64_t const num_vec_elems = num_elems >> 4;
   float absmax_val = 0.0f;
 
-#pragma unroll
+  #pragma unroll
   for (int64_t i = tid; i < num_vec_elems; i += step) {
     scalarxN_t in_vec = vectorized_in[i];
-#pragma unroll
+  #pragma unroll
     for (int j = 0; j < VEC_SIZE; ++j) {
       absmax_val = fmaxf(absmax_val, fabsf(in_vec.val[j]));
     }
@@ -142,12 +198,12 @@ __device__ void scaled_fp8_conversion_vec(fp8_type* __restrict__ out,
   // num_elems / VEC_SIZE (which is 16)
   int64_t const num_vec_elems = num_elems >> 4;
 
-#pragma unroll
+  #pragma unroll
   for (int64_t i = tid; i < num_vec_elems; i += step) {
     scalarxN_t in_vec = vectorized_in[i];
     float8xN_t out_vec;
 
-#pragma unroll
+  #pragma unroll
     for (int j = 0; j < VEC_SIZE; ++j) {
       out_vec.val[j] = scaled_fp8_conversion<is_scale_inverted, fp8_type>(
           static_cast<float>(in_vec.val[j]), scale);

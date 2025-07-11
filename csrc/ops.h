@@ -360,6 +360,10 @@ std::tuple<int64_t, torch::Tensor> allocate_shared_buffer_and_handle(
     int64_t size);
 int64_t open_mem_handle(torch::Tensor& mem_handle);
 void free_shared_buffer(int64_t buffer);
+void sgl_per_token_group_quant_fp8(at::Tensor input, at::Tensor output_q,
+                                   at::Tensor output_s, int64_t group_size,
+                                   double eps, double fp8_min, double fp8_max,
+                                   bool scale_ue8m0);
 
 #ifdef USE_ROCM
 fptr_t init_custom_qr(int64_t rank, int64_t world_size,

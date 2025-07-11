@@ -10,6 +10,7 @@ import torch
 from tests.kernels.quant_utils import (native_per_token_group_quant_fp8,
                                        native_w8a8_block_matmul,
                                        per_block_cast_to_fp8)
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8, w8a8_block_fp8_matmul)
@@ -63,6 +64,24 @@ def test_per_token_group_quant_fp8(num_tokens, d, dtype, group_size, seed):
 
     ref_out, ref_scale = native_per_token_group_quant_fp8(x, group_size)
     out, scale = per_token_group_quant_fp8(x, group_size)
+
+    assert torch.allclose(out.to(torch.float32),
+                          ref_out.to(torch.float32),
+                          rtol=0.15)
+    assert torch.allclose(scale, ref_scale)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,d,dtype,group_size,seed",
+    itertools.product(NUM_TOKENS, D, DTYPES, GROUP_SIZE, SEEDS))
+@torch.inference_mode()
+def test_sglang_per_token_group_quant_fp8(num_tokens, d, dtype, group_size,
+                                          seed):
+    torch.manual_seed(seed)
+    x = torch.rand(num_tokens, d, dtype=dtype)
+
+    ref_out, ref_scale = native_per_token_group_quant_fp8(x, group_size)
+    out, scale = ops.sglang_per_token_group_quant_fp8(x, group_size)
 
     assert torch.allclose(out.to(torch.float32),
                           ref_out.to(torch.float32),

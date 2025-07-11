@@ -608,6 +608,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int pad_slot_id) -> ()");
   ops.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
 
+  ops.def(
+      "sgl_per_token_group_quant_fp8(Tensor input, Tensor output_q, Tensor "
+      "output_s, int group_size,"
+      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
+  ops.impl("sgl_per_token_group_quant_fp8", torch::kCUDA,
+           &sgl_per_token_group_quant_fp8);
+
 #ifndef USE_ROCM
   // reorder weight for AllSpark Ampere W8A16 Fused Gemm kernel
   ops.def(
