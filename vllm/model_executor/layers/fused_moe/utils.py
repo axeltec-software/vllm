@@ -6,8 +6,6 @@ from typing import Optional, Union
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    per_token_group_quant_fp8)
 from vllm.model_executor.layers.quantization.utils.int8_utils import (
     per_token_group_quant_int8, per_token_quant_int8)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
@@ -122,7 +120,7 @@ def _fp8_quantize(
         if is_blackwell_deep_gemm_used():
             A, A_scale = per_token_group_cast_to_fp8(A, block_k)
         else:
-            A, A_scale = per_token_group_quant_fp8(A, block_k)
+            A, A_scale = ops.sglang_per_token_group_quant_fp8(A, block_k)
         assert cdiv(A.size(-1), block_k) == A_scale.size(-1)
 
     return A, A_scale
