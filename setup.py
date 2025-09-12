@@ -13,12 +13,15 @@ import sys
 from pathlib import Path
 from shutil import which
 
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+from version_generator import generate_version_file
+
 import torch
 from packaging.version import Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
-from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
+
 
 
 def load_module_from_path(module_name, path):
@@ -495,8 +498,23 @@ def get_gaudi_sw_version():
     return "0.0.0"  # when hl-smi is not available
 
 
+def get_version_nebius(write_to: str) -> str:
+    version_file = "version.txt"
+    try:
+        if os.path.exists(version_file):
+            with open(version_file) as f:
+                version = f.read()
+    except OSError as e:
+        raise ValueError(
+            f"Error: Could not read file {version_file}. {e}") from e
+
+    generate_version_file(write_to, version)
+
+    return version
+
+
 def get_vllm_version() -> str:
-    version = get_version(write_to="vllm/_version.py")
+    version = get_version_nebius(write_to="vllm/_version.py")
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
