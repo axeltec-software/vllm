@@ -28,12 +28,17 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from vllm.utils import cdiv
 
+<<<<<<< HEAD
 from .interfaces import SupportsPP
 from .utils import (AutoWeightsLoader, WeightsMapper, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
+=======
+from .utils import extract_layer_index, maybe_prefix
+from .interfaces import SupportsEagle3
+>>>>>>> d0040b478 (Added gpt-oss features)
 
 class OAIAttention(nn.Module):
 
@@ -242,8 +247,21 @@ class GptOssModel(nn.Module):
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], self.config.hidden_size))
 
+        # For optional capturing of intermediate hidden states for EAGLE-3
+        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embedding(input_ids)
+        
+    @property 
+    def embed_tokens(self):
+        """Compatibility property for EAGLE-3 which expects embed_tokens."""
+        return self.embedding
+        
+    @embed_tokens.setter
+    def embed_tokens(self, value):
+        """Compatibility setter for EAGLE-3 which expects embed_tokens."""
+        self.embedding = value
 
     def forward(
         self,
@@ -265,6 +283,8 @@ class GptOssModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         for i in range(self.start_layer, self.end_layer):
+            if i in self.aux_hidden_state_layers:
+                aux_hidden_states.append(x)
             layer = self.layers[i]
             x, residual = layer(x, positions, residual)
         if not get_pp_group().is_last_rank:
@@ -273,6 +293,8 @@ class GptOssModel(nn.Module):
                 "residual": residual
             })
         x, _ = self.norm(x, residual)
+        if len(aux_hidden_states) > 0:
+            return x, aux_hidden_states
         return x
 
     def _load_weights_mxfp4(
@@ -676,6 +698,15 @@ class GptOssForCausalLM(nn.Module, SupportsPP):
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Set which layers should output auxiliary hidden states for EAGLE3."""
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Get the layer indices that should output auxiliary hidden states for EAGLE3."""
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
