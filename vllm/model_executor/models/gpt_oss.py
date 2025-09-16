@@ -28,17 +28,12 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from vllm.utils import cdiv
 
-<<<<<<< HEAD
-from .interfaces import SupportsPP
+from .interfaces import SupportsPP, SupportsEagle3
 from .utils import (AutoWeightsLoader, WeightsMapper, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
-=======
-from .utils import extract_layer_index, maybe_prefix
-from .interfaces import SupportsEagle3
->>>>>>> d0040b478 (Added gpt-oss features)
 
 class OAIAttention(nn.Module):
 
@@ -282,9 +277,10 @@ class GptOssModel(nn.Module):
             x = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.aux_hidden_state_layers:
-                aux_hidden_states.append(x)
+                aux_hidden_states.append(x + residual)
             layer = self.layers[i]
             x, residual = layer(x, positions, residual)
         if not get_pp_group().is_last_rank:
@@ -635,7 +631,7 @@ class GptOssModel(nn.Module):
                                             weights, stacked_params_mapping)
 
 
-class GptOssForCausalLM(nn.Module, SupportsPP):
+class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     packed_modules_mapping = {"qkv": ["q_proj", "k_proj", "v_proj"]}
 
     hf_to_vllm_mapper = WeightsMapper(
