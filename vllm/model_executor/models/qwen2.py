@@ -336,8 +336,6 @@ class Qwen2Model(nn.Module):
             
         self.aux_hidden_state_layers: tuple[int] = tuple()
 
-        self.aux_hidden_state_layers = tuple[int, ...]()
-
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
