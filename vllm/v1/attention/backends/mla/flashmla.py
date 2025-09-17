@@ -191,23 +191,16 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
-<<<<<<< HEAD
         if type(q) is tuple:
             q = torch.cat(q, dim=-1)
 
-        assert isinstance(q, torch.Tensor)
-        o, lse = flash_mla_with_kvcache(
-            q=q.unsqueeze(1),  # Add seqlen dim of 1 (decode)
-=======
-        q = torch.cat([q_nope, q_pe], dim=-1)
-        
         num_requests = attn_metadata.num_decodes
         num_heads, head_size = q.size()[-2:]
         q_reshaped = q.reshape((num_requests, -1, num_heads, head_size))
 
-        o, _ = flash_mla_with_kvcache(
+        assert isinstance(q, torch.Tensor)
+        o, lse = flash_mla_with_kvcache(
             q=q_reshaped,
->>>>>>> 777de7ab2 (Implementation of MLP and Eagle speculators for V1)
             k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # Add head dim of 1
             block_table=attn_metadata.decode.block_table,
             cache_seqlens=attn_metadata.decode.seq_lens,
