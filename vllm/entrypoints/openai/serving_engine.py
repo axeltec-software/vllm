@@ -799,6 +799,11 @@ class OpenAIServing:
                 **_chat_template_kwargs,
             )
 
+
+        #with open('/home/imizus/projects/MoE_analysis/log.txt', mode='a') as f:
+        #    f.write("!!!!!!!!! 3\n")
+        #    f.write(json.dumps(request_prompt, indent=4))
+
         mm_data = await mm_data_future
 
         # tool parsing is done only if a tool_parser has been set and if
@@ -837,6 +842,11 @@ class OpenAIServing:
                 prompt=tokenizer.decode(request_prompt),
                 prompt_token_ids=request_prompt,
             )
+
+        #with open('/home/imizus/projects/MoE_analysis/log.txt', mode='a') as f:
+            #f.write("\n!!!!!!!!! 4\n")
+            #f.write(json.dumps(prompt_inputs, indent=4))
+        #    f.write(f'Request length at the vllm input in tokens: {len(prompt_inputs["prompt_token_ids"])} \n')
 
         engine_prompt = EngineTokensPrompt(
             prompt_token_ids=prompt_inputs["prompt_token_ids"])

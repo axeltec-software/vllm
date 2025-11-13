@@ -695,6 +695,12 @@ async def cancel_responses(response_id: str, raw_request: Request):
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest,
                                  raw_request: Request):
+    #with open('/home/imizus/projects/MoE_analysis/log.txt', mode='a') as f:
+    #    f.write("\n!!!!!!!!! 1")
+    #    f.write(json.dumps(request.messages, indent=4))
+       # f.write(f"Sequence length: {len(request.messages[0])}")
+       # content_length = raw_request.headers.get("content-length")
+       # f.write(f"Request length: {content_length} bytes\n")
     handler = chat(raw_request)
     if handler is None:
         return base(raw_request).create_error_response(
@@ -1978,6 +1984,9 @@ async def run_server_worker(listen_address,
 
         logger.info("Starting vLLM API server %d on %s", server_index,
                     listen_address)
+        #with open('/home/imizus/projects/MoE_analysis/log.txt', mode='a') as f:
+        #    f.write("!!!!!!!!! 0\n")
+        #logger.info("!!!!!!!!!!! 0")
         shutdown_task = await serve_http(
             app,
             sock=sock,

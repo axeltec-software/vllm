@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import traceback
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict, deque
 from collections.abc import Awaitable, Iterable
@@ -1412,6 +1413,7 @@ def parse_chat_messages_futures(
     Awaitable[Optional[MultiModalDataDict]],
     Optional[MultiModalUUIDDict],
 ]:
+    st = repr(traceback.format_stack())
     conversation: list[ConversationMessage] = []
     mm_tracker = AsyncMultiModalItemTracker(model_config, tokenizer)
 
@@ -1430,6 +1432,11 @@ def parse_chat_messages_futures(
         conversation.extend(sub_messages)
 
     _postprocess_messages(conversation)
+
+    #with open('/home/imizus/projects/MoE_analysis/log.txt', mode='a') as f:
+    #    f.write("!!!!!!!!! 2\n")
+    #    f.write(st)
+    #    f.write(json.dumps(conversation, indent=4))
 
     return conversation, mm_tracker.all_mm_data(), mm_tracker.all_mm_uuids()
 
