@@ -13,6 +13,11 @@ class SamplingMetadata:
     temperature: torch.Tensor | None
     all_greedy: bool
     all_random: bool
+    all_enforced: bool
+
+    enforced_token_ids: dict[list[int]]
+    # output_token_ids_tensor: torch.Tensor | None
+    # output_token_ids_len_cpu: torch.Tensor | None
 
     top_p: torch.Tensor | None
     top_k: torch.Tensor | None

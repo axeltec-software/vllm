@@ -6,7 +6,7 @@
 import json
 import time
 from http import HTTPStatus
-from typing import Annotated, Any, ClassVar, Generic, Literal, TypeAlias, TypeVar
+from typing import Annotated, Any, ClassVar, Generic, Literal, TypeAlias, TypeVar, Optional
 
 import regex as re
 import torch
@@ -780,6 +780,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    enforced_str: Optional[str] = Field(default=None)
+
     # --8<-- [end:chat-completion-extra-params]
 
     # Default sampling parameters for chat completion requests
@@ -814,6 +816,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         max_tokens: int,
         logits_processor_pattern: str | None,
         default_sampling_params: dict,
+        tokenizer,
     ) -> SamplingParams:
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
@@ -887,6 +890,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+
+        enforced_token_ids: list[int] | None = None
+        if self.enforced_str:
+            enforced_token_ids = tokenizer.encode(self.enforced_str, add_special_tokens=False) + [tokenizer.eos_token_id]
+
         return SamplingParams.from_optional(
             n=self.n,
             best_of=self.best_of,
@@ -920,6 +928,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             bad_words=self.bad_words,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
+            enforced_token_ids=enforced_token_ids,
         )
 
     @model_validator(mode="before")

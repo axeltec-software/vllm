@@ -151,6 +151,7 @@ class InputBatch:
         self.temperature_cpu = self.temperature_cpu_tensor.numpy()
         self.greedy_reqs: set[str] = set()
         self.random_reqs: set[str] = set()
+        self.enforced_reqs: set[str] = set()
 
         self.top_p = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)
         self.top_p_cpu_tensor = torch.empty(
@@ -198,6 +199,14 @@ class InputBatch:
         )
         self.repetition_penalties_cpu = self.repetition_penalties_cpu_tensor.numpy()
         self.repetition_penalties_reqs: set[str] = set()
+
+        self.enforced_token_ids: dict[int, list[int]] = {}
+        self.enforced_token_ids_cpu_tensor = torch.empty(
+            (max_num_reqs, 1024), dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
+        self.output_token_ids_len_cpu_tensor = torch.empty(
+            (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
 
         # Speculative decoding
         self.num_accepted_tokens_cpu_tensor = torch.ones(
@@ -346,6 +355,10 @@ class InputBatch:
                 # Should avoid division by zero later when apply_temperature.
                 self.temperature_cpu[req_index] = 0.0
                 self.greedy_reqs.add(req_id)
+            elif sampling_params.sampling_type == SamplingType.ENFORCED:
+                print("SMAPLING PARAMS")
+                self.temperature_cpu[req_index] = 0.0
+                self.enforced_reqs.add(req_id)
             else:
                 self.temperature_cpu[req_index] = sampling_params.temperature
                 self.random_reqs.add(req_id)
@@ -416,6 +429,10 @@ class InputBatch:
                 self.bad_words_token_ids[req_index] = (
                     sampling_params.bad_words_token_ids
                 )
+            if sampling_params.enforced_token_ids:
+                self.enforced_token_ids[req_index] = (
+                    sampling_params.enforced_token_ids
+                )
         elif pooling_params := request.pooling_params:
             self.pooling_params[req_id] = pooling_params
             self.logits_processing_needs_token_ids[req_index] = (
@@ -477,6 +494,7 @@ class InputBatch:
 
         self.greedy_reqs.discard(req_id)
         self.random_reqs.discard(req_id)
+        self.enforced_reqs.discard(req_id)
         self.top_p_reqs.discard(req_id)
         self.top_k_reqs.discard(req_id)
         self.spec_decode_unsupported_reqs.discard(req_id)
@@ -493,6 +511,7 @@ class InputBatch:
             # False means we don't fill with -inf.
             self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
         self.bad_words_token_ids.pop(req_index, None)
+        self.enforced_token_ids.pop(req_index, None)
         return req_index
 
     def swap_states(self, i1: int, i2: int) -> None:
@@ -592,6 +611,7 @@ class InputBatch:
 
         swap_dict_values(self.generators, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
+        # swap_dict_values(self.enforced_token_ids, i1, i2)
 
         if self.allowed_token_ids_mask_cpu_tensor is not None:
             (
@@ -720,6 +740,10 @@ class InputBatch:
             if bad_words_token_ids is not None:
                 self.bad_words_token_ids[empty_index] = bad_words_token_ids
 
+            enforced_token_ids = self.enforced_token_ids.pop(last_req_index, None)
+            if enforced_token_ids is not None:
+                self.enforced_token_ids[empty_index] = enforced_token_ids
+
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
 
@@ -800,6 +824,31 @@ class InputBatch:
             else []
         )
 
+        enforced_token_ids: torch.Tensor | None = None
+        output_token_ids_tensor: torch.Tensor | None = None
+        # if self.enforced_reqs:
+            # output_token_ids_cpu_tensor = torch.empty(
+            #     (num_reqs, 1024),
+            #     dtype=torch.long,
+            #     device="cpu",
+            #     pin_memory=self.pin_memory,
+            # )
+            # for i in range(num_reqs):
+            #     if i in self.enforced_token_ids:
+            #         self.enforced_token_ids_cpu_tensor[i, :len(self.enforced_token_ids[i])] = torch.tensor(self.enforced_token_ids[i])
+            #     if self.req_output_token_ids[i]:
+            #         output_token_ids_cpu_tensor[i, :len(self.req_output_token_ids[i])] = torch.tensor(self.req_output_token_ids[i])
+            #         self.output_token_ids_len_cpu_tensor[i] = len(self.req_output_token_ids[i])
+
+            # enforced_token_ids = self.enforced_token_ids_cpu_tensor.to(
+            #     device=self.device, non_blocking=True
+            # )
+            # output_token_ids_tensor = output_token_ids_cpu_tensor.to(
+            #     device=self.device, non_blocking=True
+            # )
+            # enforced_token_ids = 
+
+
         allowed_token_ids_mask: torch.Tensor | None = None
         if not self.no_allowed_token_ids:
             assert self.allowed_token_ids_mask is not None
@@ -814,6 +863,9 @@ class InputBatch:
             temperature=temperature,
             all_greedy=self.all_greedy,
             all_random=self.all_random,
+            all_enforced=self.all_enforced,
+            # enforced_token_ids=None,
+            # output_token_ids_tensor=None,
             top_p=None if self.no_top_p else self.top_p[:num_reqs],
             top_k=None if self.no_top_k else self.top_k[:num_reqs],
             generators=self.generators,
@@ -828,6 +880,9 @@ class InputBatch:
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
+            enforced_token_ids=self.enforced_token_ids,
+            # output_token_ids_tensor=output_token_ids_tensor,
+            # output_token_ids_len_cpu=self.output_token_ids_len_cpu,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:
@@ -937,11 +992,19 @@ class InputBatch:
 
     @property
     def all_greedy(self) -> bool:
-        return len(self.random_reqs) == 0
+        return len(self.random_reqs) == 0 and len(self.enforced_reqs) == 0
 
     @property
     def all_random(self) -> bool:
-        return len(self.greedy_reqs) == 0
+        return len(self.greedy_reqs) == 0 and len(self.enforced_reqs) == 0
+
+    @property
+    def all_enforced(self) -> bool:
+        return len(self.greedy_reqs) == 0 and len(self.random_reqs) == 0
+
+    # @property
+    # def output_token_ids_len_cpu(self) -> np.ndarray:
+    #     return self.output_token_ids_len_cpu_tensor.numpy()
 
     @property
     def no_top_p(self) -> bool:

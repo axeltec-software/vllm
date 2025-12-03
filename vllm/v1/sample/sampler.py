@@ -85,9 +85,10 @@ class Sampler(nn.Module):
 
         # Use float32 for the logits.
         logits = logits.to(torch.float32)
-
+        
         logits = self.apply_logits_processors(
-            logits, sampling_metadata, predict_bonus_token
+            logits, sampling_metadata, predict_bonus_token,
+            # sampling_metadata.output_token_ids_len_cpu
         )
         # Sample the next token.
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
@@ -106,6 +107,8 @@ class Sampler(nn.Module):
             logprobs_tensors = LogprobsTensors(
                 torch.empty(0), raw_logprobs, torch.empty(0)
             )
+        elif sampling_metadata.all_enforced:
+            logprobs_tensors=None
         else:
             # Gather the logprobs and ranks of the topk and sampled token.
             logprobs_tensors = self.gather_logprobs(
@@ -141,6 +144,24 @@ class Sampler(nn.Module):
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
         return logits.argmax(dim=-1).view(-1)
 
+    @staticmethod
+    def enforced_sample(
+        output_token_ids: torch.Tensor,
+        enforced_token_ids: torch.Tensor,
+        output_token_ids_len: torch.Tensor,
+    ) -> torch.Tensor:
+        max_output_len = output_token_ids.shape[1]
+
+        output_reach_enforced_len = (output_token_ids_len + 1 >= max_output_len)
+
+        token_from_enforced_sequence = torch.where(
+            output_reach_enforced_len, enforced_token_ids[:, max_output_len - 1],
+            enforced_token_ids[torch.arange(output_token_ids.shape[0]),
+                               output_token_ids_len.long()])
+        return token_from_enforced_sequence
+
+
+
     def sample(
         self,
         logits: torch.Tensor,
@@ -152,9 +173,19 @@ class Sampler(nn.Module):
         The various logits processing functions called in this method
         may update the logits tensor in-place.
         """
-
+        
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
+        assert not (sampling_metadata.all_greedy and sampling_metadata.all_enforced)
+        assert not (sampling_metadata.all_random and sampling_metadata.all_enforced)
+
+        # print(sampling_metadata.output_token_ids_tensor)
+        # if sampling_metadata.all_enforced:
+        #     return self.enforced_sample(sampling_metadata.output_token_ids_tensor,
+        #                                 sampling_metadata.enforced_token_ids,
+        #                                 sampling_metadata.output_token_ids_len_cpu),
+        #     None
+        print(sampling_metadata)
         if sampling_metadata.all_random:
             greedy_sampled = None
         else:
@@ -189,6 +220,7 @@ class Sampler(nn.Module):
         )
 
         if greedy_sampled is None:
+            print(random_sampled, processed_logprobs)
             return random_sampled, processed_logprobs
 
         sampled = torch.where(
@@ -197,6 +229,11 @@ class Sampler(nn.Module):
             random_sampled,
             out=greedy_sampled,  # Reuse tensor
         )
+        # print(sampled, processed_logprobs)
+        if sampling_metadata.all_enforced:
+            #Draft
+            tmp = torch.tensor(sampling_metadata.enforced_token_ids[0][0], device=logits.device)
+            return tmp, None
         return sampled, processed_logprobs
 
     @staticmethod
@@ -265,13 +302,17 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         predict_bonus_token: bool,
+        # output_token_ids_len: torch.Tensor,
     ) -> torch.Tensor:
         bad_words_token_ids = sampling_metadata.bad_words_token_ids
         any_penalties_or_bad_words = (
             bool(bad_words_token_ids) or not sampling_metadata.no_penalties
         )
 
+        # output_token_ids: list[list[int]] | torch.Tensor = sampling_metadata.output_token_ids
+        # if sampling_metadata.output_token_ids_tensor is not None:
         output_token_ids = sampling_metadata.output_token_ids
+
         if predict_bonus_token and any_penalties_or_bad_words:
             # Combine base outputs with spec tokens when speculative decoding
             # is enabled.
