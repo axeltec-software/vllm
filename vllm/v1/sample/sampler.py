@@ -76,6 +76,7 @@ class Sampler(nn.Module):
         # temperature scaling) for the top-k logprobs.
         # This is different from the V0 sampler, which uses the logits that
         # is used for sampling (after penalties and temperature scaling).
+        print(logits, logits.shape)
         num_logprobs = sampling_metadata.max_num_logprobs
         if num_logprobs is not None:
             if logprobs_mode == "raw_logprobs":
@@ -107,8 +108,6 @@ class Sampler(nn.Module):
             logprobs_tensors = LogprobsTensors(
                 torch.empty(0), raw_logprobs, torch.empty(0)
             )
-        elif sampling_metadata.all_enforced:
-            logprobs_tensors=None
         else:
             # Gather the logprobs and ranks of the topk and sampled token.
             logprobs_tensors = self.gather_logprobs(
@@ -185,6 +184,26 @@ class Sampler(nn.Module):
         #                                 sampling_metadata.enforced_token_ids,
         #                                 sampling_metadata.output_token_ids_len_cpu),
         #     None
+        if sampling_metadata.all_enforced:
+            #Draft
+            enforced_map = sampling_metadata.enforced_token_ids
+
+            sampled = torch.empty((logits.shape[0],), dtype=torch.int64, device=logits.device)
+
+            for req_index in range(len(sampled)):
+                seq = enforced_map[req_index]
+                out = sampling_metadata.output_token_ids[req_index]
+
+                step = len(out)
+
+                if step < len(seq):
+                    next_tok = seq[step]
+                else:
+                    next_tok = seq[-1]
+
+                sampled[req_index] = next_tok
+
+            return sampled, None
         print(sampling_metadata)
         if sampling_metadata.all_random:
             greedy_sampled = None
@@ -220,7 +239,7 @@ class Sampler(nn.Module):
         )
 
         if greedy_sampled is None:
-            print(random_sampled, processed_logprobs)
+            return torch.tensor([11], device=logits.device), None
             return random_sampled, processed_logprobs
 
         sampled = torch.where(
@@ -229,11 +248,9 @@ class Sampler(nn.Module):
             random_sampled,
             out=greedy_sampled,  # Reuse tensor
         )
-        # print(sampled, processed_logprobs)
-        if sampling_metadata.all_enforced:
-            #Draft
-            tmp = torch.tensor(sampling_metadata.enforced_token_ids[0][0], device=logits.device)
-            return tmp, None
+       
+
+
         return sampled, processed_logprobs
 
     @staticmethod

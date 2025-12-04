@@ -1207,7 +1207,6 @@ class OpenAIServingChat(OpenAIServing):
                         )
 
                         finish_reason_sent[i] = True
-
                     chunk = ChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,

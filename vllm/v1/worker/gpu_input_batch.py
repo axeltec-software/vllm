@@ -468,7 +468,6 @@ class InputBatch:
         Returns:
           Removed request index, or `None` if `req_id` not recognized
         """
-
         req_index = self.req_id_to_index.pop(req_id, None)
         if req_index is None:
             return None
@@ -491,7 +490,6 @@ class InputBatch:
         if self.is_pooling_model:
             self.pooling_params.pop(req_id, None)
             return req_index
-
         self.greedy_reqs.discard(req_id)
         self.random_reqs.discard(req_id)
         self.enforced_reqs.discard(req_id)
@@ -512,6 +510,7 @@ class InputBatch:
             self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
         self.bad_words_token_ids.pop(req_index, None)
         self.enforced_token_ids.pop(req_index, None)
+
         return req_index
 
     def swap_states(self, i1: int, i2: int) -> None:
@@ -611,7 +610,7 @@ class InputBatch:
 
         swap_dict_values(self.generators, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
-        # swap_dict_values(self.enforced_token_ids, i1, i2)
+        swap_dict_values(self.enforced_token_ids, i1, i2)
 
         if self.allowed_token_ids_mask_cpu_tensor is not None:
             (
@@ -817,6 +816,7 @@ class InputBatch:
             not self.no_penalties
             or bool(self.bad_words_token_ids)
             or self.logitsprocs_need_output_token_ids
+            or self.enforced_token_ids
         )
         output_token_ids = (
             cast(list[list[int]], self.req_output_token_ids)
