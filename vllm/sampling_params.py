@@ -15,6 +15,7 @@ from pydantic.dataclasses import dataclass
 from vllm.logger import init_logger
 from vllm.logits_process import LogitsProcessor
 from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.validation import EnforcedTokens
 
 logger = init_logger(__name__)
 
@@ -252,7 +253,7 @@ class SamplingParams(
     generated token can complete the sequence."""
     _bad_words_token_ids: list[list[int]] | None = None
     enforced_token_ids: list[int] | None = None
-    enforced_tokens: Any | None = None
+    enforced_tokens: dict[int, list[int]] | None = None
 
     @staticmethod
     def from_optional(
@@ -285,9 +286,9 @@ class SamplingParams(
         guided_decoding: GuidedDecodingParams | None = None,
         logit_bias: dict[int, float] | dict[str, float] | None = None,
         allowed_token_ids: list[int] | None = None,
-        extra_args: dict[str, Any] | None = None,
         enforced_token_ids: list[int] | None = None,
-        enforced_tokens: Any | None = None,
+        enforced_tokens: EnforcedTokens | None = None,
+        extra_args: dict[str, Any] | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -306,7 +307,6 @@ class SamplingParams(
             )
             structured_outputs = guided_decoding
             guided_decoding = None
-
         return SamplingParams(
             n=1 if n is None else n,
             best_of=best_of,

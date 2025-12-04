@@ -289,7 +289,7 @@ class OpenAIServingChat(OpenAIServing):
                     sampling_params = request.to_beam_search_params(
                         max_tokens, self.default_sampling_params
                     )
-                elif request.enforced_str:
+                elif request.enforced_str or request.enforced_tokens:
                     sampling_params = request.to_sampling_params(
                         max_tokens,
                         self.model_config.logits_processor_pattern,

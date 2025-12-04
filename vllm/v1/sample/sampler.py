@@ -111,7 +111,7 @@ class Sampler(nn.Module):
         else:
             # Gather the logprobs and ranks of the topk and sampled token.
             logprobs_tensors = self.gather_logprobs(
-                raw_logprobs, num_logprobs, token_ids=sampled
+                raw_logprobs, num_logprobs, token_ids=sampled, sampling_metadata=sampling_metadata
             )
 
         # Use int32 to reduce the tensor size.
@@ -143,24 +143,6 @@ class Sampler(nn.Module):
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
         return logits.argmax(dim=-1).view(-1)
 
-    @staticmethod
-    def enforced_sample(
-        output_token_ids: torch.Tensor,
-        enforced_token_ids: torch.Tensor,
-        output_token_ids_len: torch.Tensor,
-    ) -> torch.Tensor:
-        max_output_len = output_token_ids.shape[1]
-
-        output_reach_enforced_len = (output_token_ids_len + 1 >= max_output_len)
-
-        token_from_enforced_sequence = torch.where(
-            output_reach_enforced_len, enforced_token_ids[:, max_output_len - 1],
-            enforced_token_ids[torch.arange(output_token_ids.shape[0]),
-                               output_token_ids_len.long()])
-        return token_from_enforced_sequence
-
-
-
     def sample(
         self,
         logits: torch.Tensor,
@@ -178,12 +160,8 @@ class Sampler(nn.Module):
         assert not (sampling_metadata.all_greedy and sampling_metadata.all_enforced)
         assert not (sampling_metadata.all_random and sampling_metadata.all_enforced)
 
-        # print(sampling_metadata.output_token_ids_tensor)
-        # if sampling_metadata.all_enforced:
-        #     return self.enforced_sample(sampling_metadata.output_token_ids_tensor,
-        #                                 sampling_metadata.enforced_token_ids,
-        #                                 sampling_metadata.output_token_ids_len_cpu),
-        #     None
+        print(sampling_metadata)
+        
         if sampling_metadata.all_enforced:
             #Draft
             enforced_map = sampling_metadata.enforced_token_ids
@@ -204,7 +182,6 @@ class Sampler(nn.Module):
                 sampled[req_index] = next_tok
 
             return sampled, None
-        print(sampling_metadata)
         if sampling_metadata.all_random:
             greedy_sampled = None
         else:
@@ -239,7 +216,6 @@ class Sampler(nn.Module):
         )
 
         if greedy_sampled is None:
-            return torch.tensor([11], device=logits.device), None
             return random_sampled, processed_logprobs
 
         sampled = torch.where(
@@ -262,6 +238,7 @@ class Sampler(nn.Module):
         logprobs: torch.Tensor,
         num_logprobs: int,
         token_ids: torch.Tensor,
+        sampling_metadata: SamplingMetadata
     ) -> LogprobsTensors:
         """
         Gather logprobs for topk and sampled/prompt token.
@@ -282,6 +259,45 @@ class Sampler(nn.Module):
           Sampled token rank tensor, (num tokens)
         """
         assert token_ids.dtype == torch.int64
+
+        if sampling_metadata.all_enforced:
+            #Draft
+            enforced_top_map = sampling_metadata.enforced_tokens
+            enforced_map = sampling_metadata.enforced_token_ids
+            
+            indices = torch.empty((logprobs.shape[0], num_logprobs), dtype=torch.int64, device=logprobs.device)
+
+            for req_index in range(indices.shape[0]):
+                seq = enforced_map[req_index]
+                seq_top_tokens = enforced_top_map[req_index]
+                out = sampling_metadata.output_token_ids[req_index]
+
+                step = len(out)
+
+                if step < len(seq):
+                    next_tok = seq[step]
+                    next_top_tok = seq_top_tokens[next_tok]
+
+                else:
+                    next_tok = seq[-1]
+                    next_top_tok = seq_top_tokens[next_tok]
+
+                indices[req_index] = torch.tensor(next_top_tok, device=logprobs.device)
+            
+            # Get with the logprob of the prompt or sampled token.
+            token_ids = token_ids.unsqueeze(-1)
+            token_logprobs = logprobs.gather(-1, token_ids)
+            
+            # Compute the ranks of the actual token.
+            token_ranks = batched_count_greater_than(logprobs, token_logprobs)
+            top_logprobs = torch.gather(logprobs, dim=1, index=indices)
+
+            indices = torch.cat((token_ids, indices), dim=1)
+            logprobs = torch.cat((token_logprobs, top_logprobs), dim=1)
+            
+            indices = indices.to(torch.int32)
+            return LogprobsTensors(indices, logprobs, token_ranks)
+
         # Find the topK values.
         topk_logprobs, topk_indices = torch.topk(logprobs, num_logprobs, dim=-1)
 
@@ -298,7 +314,7 @@ class Sampler(nn.Module):
 
         # Use int32 to reduce the tensor size.
         indices = indices.to(torch.int32)
-
+        print(indices, token_ranks)
         return LogprobsTensors(indices, logprobs, token_ranks)
 
     @staticmethod

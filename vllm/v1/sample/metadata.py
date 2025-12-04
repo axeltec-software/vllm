@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm.v1.sample.logits_processor import LogitsProcessors
-
+from vllm.validation import EnforcedTokens
 
 @dataclass
 class SamplingMetadata:
@@ -16,6 +16,7 @@ class SamplingMetadata:
     all_enforced: bool
 
     enforced_token_ids: dict[list[int]]
+    enforced_tokens: dict[EnforcedTokens]
     # output_token_ids_tensor: torch.Tensor | None
     # output_token_ids_len_cpu: torch.Tensor | None
 
