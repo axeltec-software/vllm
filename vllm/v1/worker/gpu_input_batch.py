@@ -357,7 +357,6 @@ class InputBatch:
                 self.temperature_cpu[req_index] = 0.0
                 self.greedy_reqs.add(req_id)
             elif sampling_params.sampling_type == SamplingType.ENFORCED:
-                print("SMAPLING PARAMS")
                 self.temperature_cpu[req_index] = 0.0
                 self.enforced_reqs.add(req_id)
             else:

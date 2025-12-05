@@ -909,6 +909,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             self.enforced_tokens
             self.enforced_tokens.encode(tokenizer)
             enforced_top_tokens = self.enforced_tokens.get_top_tokens()
+            enforced_token_ids = self.enforced_tokens.get_enforced_token_ids()
+
             if self.enforced_tokens.tokens[-1].token_id != tokenizer.eos_token_id:
                 self.enforced_tokens.tokens.append(EnforcedToken(
                     token=tokenizer.eos_token,
@@ -916,7 +918,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     token_id=tokenizer.eos_token_id,
                     top_token_ids=[tokenizer.eos_token_id]
                 ))
-            enforced_token_ids = self.enforced_tokens.get_enforced_token_ids()
 
 
         return SamplingParams.from_optional(
