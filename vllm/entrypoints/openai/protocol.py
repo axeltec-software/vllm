@@ -906,7 +906,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         
         enforced_top_tokens: dict | None = None
         if self.enforced_tokens:
-            self.enforced_tokens
             self.enforced_tokens.encode(tokenizer)
             enforced_top_tokens = self.enforced_tokens.get_top_tokens()
             enforced_token_ids = self.enforced_tokens.get_enforced_token_ids()

@@ -14,11 +14,11 @@ class SamplingMetadata:
     all_greedy: bool
     all_random: bool
     all_enforced: bool
+    mixed_enforced: bool
 
     enforced_token_ids: dict[list[int]]
     enforced_tokens: dict[EnforcedTokens]
-    # output_token_ids_tensor: torch.Tensor | None
-    # output_token_ids_len_cpu: torch.Tensor | None
+    enforced_req_ids: list[int]
 
     top_p: torch.Tensor | None
     top_k: torch.Tensor | None

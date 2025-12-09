@@ -202,13 +202,7 @@ class InputBatch:
 
         self.enforced_token_ids: dict[int, list[int]] = {}
         self.enforced_tokens: dict[int, dict[int, list[int]]] = {} 
-        self.enforced_token_ids_cpu_tensor = torch.empty(
-            (max_num_reqs, 1024), dtype=torch.int32, device="cpu", pin_memory=pin_memory
-        )
-        self.output_token_ids_len_cpu_tensor = torch.empty(
-            (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
-        )
-
+        self.enforced_req_ids: list[int] = []
         # Speculative decoding
         self.num_accepted_tokens_cpu_tensor = torch.ones(
             (max_num_reqs,), dtype=torch.int64, device="cpu", pin_memory=pin_memory
@@ -310,6 +304,8 @@ class InputBatch:
         self,
         request: "CachedRequestState",
     ) -> int:
+        print(f"Current num_reqs: {self.num_reqs}")
+        print(request)
         req_index = self._register_add_request(request)
 
         req_id = request.req_id
@@ -433,6 +429,7 @@ class InputBatch:
                 self.enforced_token_ids[req_index] = (
                     sampling_params.enforced_token_ids
                 )
+                self.enforced_req_ids.append(req_index) 
             if sampling_params.enforced_tokens:
                 self.enforced_tokens[req_index] = (
                     sampling_params.enforced_tokens
@@ -515,6 +512,8 @@ class InputBatch:
         self.bad_words_token_ids.pop(req_index, None)
         self.enforced_token_ids.pop(req_index, None)
         self.enforced_tokens.pop(req_index, None)
+        if req_index in self.enforced_req_ids:
+            self.enforced_req_ids.remove(req_index)
 
         return req_index
 
@@ -752,6 +751,14 @@ class InputBatch:
             enforced_tokens = self.enforced_tokens.pop(last_req_index, None)
             if enforced_tokens is not None:
                 self.enforced_tokens[empty_index] = enforced_tokens
+            
+            enforced_token_ids = self.enforced_token_ids.pop(last_req_index, None)
+            if enforced_token_ids is not None:
+                self.enforced_token_ids[empty_index] = enforced_token_ids
+
+            if last_req_index in self.enforced_req_ids:
+                self.enforced_req_ids.remove(last_req_index)
+                self.enforced_req_ids.append(empty_index)
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
 
@@ -850,6 +857,7 @@ class InputBatch:
             all_greedy=self.all_greedy,
             all_random=self.all_random,
             all_enforced=self.all_enforced,
+            mixed_enforced=self.mixed_enforced,
             top_p=None if self.no_top_p else self.top_p[:num_reqs],
             top_k=None if self.no_top_k else self.top_k[:num_reqs],
             generators=self.generators,
@@ -865,7 +873,8 @@ class InputBatch:
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
             enforced_token_ids=self.enforced_token_ids,
-            enforced_tokens=self.enforced_tokens
+            enforced_tokens=self.enforced_tokens,
+            enforced_req_ids=self.enforced_req_ids
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:
@@ -985,9 +994,9 @@ class InputBatch:
     def all_enforced(self) -> bool:
         return len(self.greedy_reqs) == 0 and len(self.random_reqs) == 0
 
-    # @property
-    # def output_token_ids_len_cpu(self) -> np.ndarray:
-    #     return self.output_token_ids_len_cpu_tensor.numpy()
+    @property
+    def mixed_enforced(self) -> bool:
+        return len(self.enforced_reqs) != 0 and (len(self.random_reqs) != 0 or len(self.greedy_reqs) != 0)
 
     @property
     def no_top_p(self) -> bool:

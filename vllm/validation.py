@@ -46,11 +46,10 @@ class EnforcedTokens(BaseModel):
             raise ValueError("Enforced tokens are not encoded")
         return [token.token_id for token in self.tokens]
     
-    def get_top_tokens(self) -> Dict[int, List[int]]:
-        if not self.tokens or any(token.token_id is None for token in self.tokens):
-            raise ValueError("Enforced tokens are not encoded")
-        return {
-            token.token_id: token.top_token_ids
+    def get_top_tokens(self) -> List[Dict[int, List[int]]]:
+        return [
+            {
+                token.token_id : token.top_token_ids
+            }
             for token in self.tokens
-            if token.token_id is not None
-        }
+        ]

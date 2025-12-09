@@ -253,7 +253,7 @@ class SamplingParams(
     generated token can complete the sequence."""
     _bad_words_token_ids: list[list[int]] | None = None
     enforced_token_ids: list[int] | None = None
-    enforced_tokens: dict[int, list[int]] | None = None
+    enforced_tokens: list[dict[int, list[int]]] | None = None
 
     @staticmethod
     def from_optional(
@@ -287,7 +287,7 @@ class SamplingParams(
         logit_bias: dict[int, float] | dict[str, float] | None = None,
         allowed_token_ids: list[int] | None = None,
         enforced_token_ids: list[int] | None = None,
-        enforced_tokens: EnforcedTokens | None = None,
+        enforced_tokens: list[dict[int, list[int]]] | None = None,
         extra_args: dict[str, Any] | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
