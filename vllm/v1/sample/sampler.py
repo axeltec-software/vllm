@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that samples the next tokens from the model's outputs."""
 
+import json
+import os
+import random
 import torch
 import torch.nn as nn
 
@@ -77,6 +80,15 @@ class Sampler(nn.Module):
         # This is different from the V0 sampler, which uses the logits that
         # is used for sampling (after penalties and temperature scaling).
         num_logprobs = sampling_metadata.max_num_logprobs
+        sampling_metadata.all_random = True
+        sampling_metadata.all_greedy = False
+        device = logits.device
+        sampling_metadata.temperature = (torch.full(([len(logits)]), 0.99)).to(device)
+        #sampling_metadata.top_k = (torch.full(([len(logits)]), 4)).to(device)
+        sampling_metadata.top_p = (torch.full(([len(logits)]), 1.0)).to(device)
+        #sampling_metadata.top_p = torch.rand(logits.shape[0], dtype=torch.float32, device=device)
+
+
         if num_logprobs is not None:
             if logprobs_mode == "raw_logprobs":
                 raw_logprobs = self.compute_logprobs(logits)
@@ -94,6 +106,7 @@ class Sampler(nn.Module):
         )
         # Sample the next token.
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
+            
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
         # Convert sampled token ids to int64 (long) type to ensure compatibility
@@ -115,6 +128,21 @@ class Sampler(nn.Module):
                 raw_logprobs, num_logprobs, token_ids=sampled
             )
 
+            # filename = "/home/imizus/projects/vllm/vllm_sampling_ranks.txt"
+            # if os.path.exists(filename):
+            #     append_write = 'a' # append if already exists
+            # else:
+            #     append_write = 'w' # make a new file if not
+
+            # try:
+            #     with open(file=filename, mode=append_write) as f:
+            #         #f.write(str(logprobs_tensors.tolists().logprob_token_ids[0][0]) + "\n")
+            #         #f.write(str(logprobs_tensors.tolists().logprobs[0][0]) + "\n")
+            #         f.write(str(logprobs_tensors.tolists().sampled_token_ranks[0]) + "\n")
+            # except Exception as e:
+            #     print(f"Failed to write to file: {e}")
+
+            #print(logprobs_tensors.tolists().logprob_token_ids[0][0], logprobs_tensors.tolists().logprobs[0][0], logprobs_tensors.tolists().sampled_token_ranks[0])
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)
 
@@ -184,6 +212,7 @@ class Sampler(nn.Module):
             logits = processor.apply(logits)
 
         # Apply top_k and/or top_p.
+        #logits = torch.ones(len(logits)) * float(-0.1)
         random_sampled, processed_logprobs = self.topk_topp_sampler(
             logits,
             sampling_metadata.generators,

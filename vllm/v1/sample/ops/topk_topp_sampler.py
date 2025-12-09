@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 import torch
 import torch.nn as nn
 from packaging import version
@@ -273,6 +274,89 @@ def apply_top_k_top_p(
         # at least one
         top_p_mask[:, -1] = False
         logits_sort.masked_fill_(top_p_mask, -float("inf"))
+
+    device = logits.device
+    p_rand = torch.rand(logits.shape[0], dtype=torch.float32, device=device)
+    if p_rand is not None:
+        logits_sort_padded = logits_sort.clone()
+        # probs_sum_padded = probs_sum.clone()
+        # padding_column_zeroes = torch.zeros((probs_sum_padded.shape[0], 1), device=probs_sum.device)
+        # probs_sum_padded = torch.cat((probs_sum_padded, padding_column_zeroes), dim=1)
+        padding_column_zeroes = torch.zeros((logits_sort_padded.shape[0], 1), device=logits_sort_padded.device)
+        logits_sort_padded = torch.cat((padding_column_zeroes, logits_sort_padded), dim=1)
+        
+        probs_sort_padded = logits_sort_padded.softmax(dim=-1)
+        probs_sum_padded = torch.cumsum(probs_sort_padded, dim=-1, out=probs_sort_padded)
+
+        probs_sum_mask = probs_sum_padded.clone()
+        p_mask = probs_sum_mask <= p_rand.unsqueeze(dim=1)
+        probs_sum_mask.masked_fill_(p_mask, -1.0).to(torch.float32)
+
+
+        first_positive_indices = torch.argmax((probs_sum_mask >= 0).int(), dim=1)
+        valid_rows_mask = first_positive_indices > -1 #first_positive_indices > 0
+        valid_row_numbers = torch.where(valid_rows_mask)[0]
+        valid_ip_values = first_positive_indices[valid_rows_mask]
+        prev_values = probs_sum_padded[valid_row_numbers, valid_ip_values - 1]
+        current_values = probs_sum_padded[valid_row_numbers, valid_ip_values]
+        p_list = torch.stack((prev_values, current_values), dim=1)
+
+        # probs_sum_copy = probs_sum_copy.cpu().detach().tolist()
+        # probs_sum = probs_sum.cpu().detach().tolist()
+        # p_list = []
+        # for t in range(len(probs_sum_copy)):
+        #     ip = -1
+        #     for i in range(len(probs_sum_copy[t])):
+        #         if probs_sum_copy[t][i] >=0:
+        #             ip = i
+        #             break
+        #     if ip > 0 and ip < len(probs_sum_copy[t]):
+        #         p_list.append([probs_sum[t][ip - 1], probs_sum[t][ip]])
+
+
+        p_list = p_list.cpu().detach().tolist()
+
+        filename = "/home/imizus/projects/vllm/vllm_top_p_dist.txt"
+        if os.path.exists(filename):
+            append_write = 'a' # append if already exists
+        else:
+            append_write = 'w' # make a new file if not
+
+        try:
+            with open(file=filename, mode=append_write) as f:
+                for pi in p_rand.cpu().detach().tolist():
+                    f.write(f"{pi:.5f}\n")
+        except Exception as e:
+            print(f"Failed to write to file: {e}")
+            
+
+        filename = "/home/imizus/projects/vllm/vllm_top_p_probs_mean.txt"
+        if os.path.exists(filename):
+            append_write = 'a' # append if already exists
+        else:
+            append_write = 'w' # make a new file if not
+
+        try:
+            with open(file=filename, mode=append_write) as f:
+                for ps in p_list:
+                    f.write(f"{((ps[0] + ps[1]) / 2.0):.5f}\n")
+        except Exception as e:
+            print(f"Failed to write to file: {e}")
+    
+
+        filename = "/home/imizus/projects/vllm/vllm_top_p_probs_max.txt"
+        if os.path.exists(filename):
+            append_write = 'a' # append if already exists
+        else:
+            append_write = 'w' # make a new file if not
+
+        try:
+            with open(file=filename, mode=append_write) as f:
+                for ps in p_list:
+                    f.write(f"{ps[1]:.5f}\n")
+        except Exception as e:
+            print(f"Failed to write to file: {e}")
+
 
     # Re-sort the probabilities.
     logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
