@@ -202,7 +202,7 @@ class InputBatch:
 
         self.enforced_token_ids: dict[int, list[int]] = {}
         self.enforced_tokens: dict[int, dict[int, list[int]]] = {} 
-        self.enforced_req_ids: list[int] = []
+        self.enforced_req_ids: dict[int, int] = {}
         # Speculative decoding
         self.num_accepted_tokens_cpu_tensor = torch.ones(
             (max_num_reqs,), dtype=torch.int64, device="cpu", pin_memory=pin_memory
@@ -427,7 +427,7 @@ class InputBatch:
                 self.enforced_token_ids[req_index] = (
                     sampling_params.enforced_token_ids
                 )
-                self.enforced_req_ids.append(req_index) 
+                self.enforced_req_ids[req_index] = req_index 
             if sampling_params.enforced_tokens:
                 self.enforced_tokens[req_index] = (
                     sampling_params.enforced_tokens
@@ -510,9 +510,7 @@ class InputBatch:
         self.bad_words_token_ids.pop(req_index, None)
         self.enforced_token_ids.pop(req_index, None)
         self.enforced_tokens.pop(req_index, None)
-        if req_index in self.enforced_req_ids:
-            self.enforced_req_ids.remove(req_index)
-
+        self.enforced_req_ids.pop(req_index, None)
         return req_index
 
     def swap_states(self, i1: int, i2: int) -> None:
@@ -614,6 +612,7 @@ class InputBatch:
         swap_dict_values(self.bad_words_token_ids, i1, i2)
         swap_dict_values(self.enforced_token_ids, i1, i2)
         swap_dict_values(self.enforced_tokens, i1, i2)
+        swap_dict_values(self.enforced_req_ids, i1, i2)
 
         if self.allowed_token_ids_mask_cpu_tensor is not None:
             (
@@ -742,21 +741,17 @@ class InputBatch:
             if bad_words_token_ids is not None:
                 self.bad_words_token_ids[empty_index] = bad_words_token_ids
 
-            enforced_token_ids = self.enforced_token_ids.pop(last_req_index, None)
-            if enforced_token_ids is not None:
-                self.enforced_token_ids[empty_index] = enforced_token_ids
-
             enforced_tokens = self.enforced_tokens.pop(last_req_index, None)
             if enforced_tokens is not None:
                 self.enforced_tokens[empty_index] = enforced_tokens
             
-            enforced_token_ids = self.enforced_token_ids.pop(last_req_index, None)
-            if enforced_token_ids is not None:
-                self.enforced_token_ids[empty_index] = enforced_token_ids
+            enforced_token_id = self.enforced_token_ids.pop(last_req_index, None)
+            if enforced_token_id is not None:
+                self.enforced_token_ids[empty_index] = enforced_token_id
 
-            if last_req_index in self.enforced_req_ids:
-                self.enforced_req_ids.remove(last_req_index)
-                self.enforced_req_ids.append(empty_index)
+            enforced_req_id = self.enforced_req_ids.pop(last_req_index, None)
+            if enforced_req_id is not None:
+                self.enforced_req_ids[empty_index] = empty_index
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
 
