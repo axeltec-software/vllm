@@ -175,7 +175,7 @@ class Sampler(nn.Module):
 
                 enforced_sampled[i] = next_tok
             if sampling_metadata.all_enforced:
-                return enforced_sampled, None                       
+                return enforced_sampled, None                   
         if sampling_metadata.all_random or sampling_metadata.mixed_enforced:
             greedy_sampled = None
         else:
