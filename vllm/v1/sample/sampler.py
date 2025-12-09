@@ -161,8 +161,6 @@ class Sampler(nn.Module):
 
         if sampling_metadata.enforced_token_ids:
             enforced_sampled = torch.empty((len(sampling_metadata.enforced_req_ids),), dtype=torch.int64, device=logits.device)
-            print(sampling_metadata.enforced_req_ids)
-            print(sampling_metadata.enforced_token_ids)
             enforced_map = sampling_metadata.enforced_token_ids
             for i, req_index in enumerate(sampling_metadata.enforced_req_ids):
                 seq = enforced_map[req_index]
@@ -261,8 +259,6 @@ class Sampler(nn.Module):
           Sampled token rank tensor, (num tokens)
         """
         assert token_ids.dtype == torch.int64
-       
-
         if sampling_metadata.enforced_tokens:
             enforced_top_map = sampling_metadata.enforced_tokens
             enforced_map = sampling_metadata.enforced_token_ids

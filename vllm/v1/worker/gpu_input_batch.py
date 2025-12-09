@@ -304,8 +304,6 @@ class InputBatch:
         self,
         request: "CachedRequestState",
     ) -> int:
-        print(f"Current num_reqs: {self.num_reqs}")
-        print(request)
         req_index = self._register_add_request(request)
 
         req_id = request.req_id
