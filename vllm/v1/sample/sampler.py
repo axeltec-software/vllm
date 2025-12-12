@@ -79,15 +79,13 @@ class Sampler(nn.Module):
         # temperature scaling) for the top-k logprobs.
         # This is different from the V0 sampler, which uses the logits that
         # is used for sampling (after penalties and temperature scaling).
-        num_logprobs = sampling_metadata.max_num_logprobs
+        num_logprobs = logits.shape[1]#sampling_metadata.max_num_logprobs
         sampling_metadata.all_random = True
         sampling_metadata.all_greedy = False
         device = logits.device
-        sampling_metadata.temperature = (torch.full(([len(logits)]), 0.99)).to(device)
+        #sampling_metadata.temperature = (torch.full(([len(logits)]), 0.99)).to(device)
+        #sampling_metadata.top_p = (torch.full(([len(logits)]), 1.0)).to(device)
         #sampling_metadata.top_k = (torch.full(([len(logits)]), 4)).to(device)
-        sampling_metadata.top_p = (torch.full(([len(logits)]), 1.0)).to(device)
-        #sampling_metadata.top_p = torch.rand(logits.shape[0], dtype=torch.float32, device=device)
-
 
         if num_logprobs is not None:
             if logprobs_mode == "raw_logprobs":
@@ -136,8 +134,8 @@ class Sampler(nn.Module):
 
             # try:
             #     with open(file=filename, mode=append_write) as f:
-            #         #f.write(str(logprobs_tensors.tolists().logprob_token_ids[0][0]) + "\n")
-            #         #f.write(str(logprobs_tensors.tolists().logprobs[0][0]) + "\n")
+            #         f.write(str(logprobs_tensors.tolists().logprob_token_ids[0][0]) + "\n")
+            #         f.write(str(logprobs_tensors.tolists().logprobs[0][0]) + "\n")
             #         f.write(str(logprobs_tensors.tolists().sampled_token_ranks[0]) + "\n")
             # except Exception as e:
             #     print(f"Failed to write to file: {e}")
@@ -154,6 +152,7 @@ class Sampler(nn.Module):
             sampled_token_ids=sampled.unsqueeze(-1),
             logprobs_tensors=logprobs_tensors,
         )
+
         return sampler_output
 
     @staticmethod

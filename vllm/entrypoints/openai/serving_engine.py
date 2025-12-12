@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import json
+import os
 import sys
 import time
 import traceback
@@ -1183,6 +1184,38 @@ class OpenAIServing:
         engine_prompt = EngineTokensPrompt(
             prompt_token_ids=prompt_inputs["prompt_token_ids"]
         )
+
+        filename = "/home/imizus/projects/vllm/prompt_length.txt"
+        if os.path.exists(filename):
+            append_write = 'a' # append if already exists
+        else:
+            append_write = 'w' # make a new file if not
+
+        try:
+            with open(file=filename, mode=append_write) as f:
+                # for token_id in engine_prompt['prompt_token_ids']:
+                #     f.write(f"{token_id}\n")
+                # f.write("\n\n")
+                f.write(len(engine_prompt['prompt_token_ids']).__str__())
+        except Exception as e:
+            print(f"Failed to write to file: {e}")
+
+        filepath = '/home/imizus/projects/vllm/output_tokens_with_ids.jsonl'
+        data = []
+        decoded_tokens = []
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    data.append(json.loads(line.strip()))
+                except json.JSONDecodeError as e:
+                    print(f"Skipping malformed line: {line.strip()} - Error: {e}")
+
+        if data:
+            for tok in data:
+                decoded_tokens.append(tok['token_id'])
+
+        engine_prompt['prompt_token_ids'].extend(decoded_tokens)
+
         if mm_data is not None:
             engine_prompt["multi_modal_data"] = mm_data
 

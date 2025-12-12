@@ -3,6 +3,7 @@
 
 import gc
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -832,8 +833,8 @@ class GPUModelRunner(
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
                     self.input_batch.vocab_size
-                    if sampling_params.prompt_logprobs == -1
-                    else sampling_params.prompt_logprobs
+                    #if sampling_params.prompt_logprobs == -1
+                    #else sampling_params.prompt_logprobs
                 )
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -3738,6 +3739,96 @@ class GPUModelRunner(
             token_ids, logprobs, ranks = self.sampler.gather_logprobs(
                 logprobs, num_prompt_logprobs, tgt_token_ids
             )
+
+
+            filepath = '/home/imizus/projects/vllm/prompt_length.txt'
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+            
+                assert len(lines) == 1
+            except AssertionError as e:
+                print(f"Expected 1 line in prompt_length.txt but got {len(lines)} lines.")
+            except Exception as e:
+                pass
+
+            try:
+                prompt_offset = int(lines[0].strip()) - 1
+            except ValueError as e:
+                print(f"Invalid integer in prompt_length.txt: {lines[0].strip()} - Error: {e}")
+                prompt_offset = 0
+            except Exception as e:
+                print(f"Error reading prompt length: {e}")
+                prompt_offset = 0
+
+            logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+            logits_sort_decode = logits_sort[prompt_offset:, :]  # adjust for prompt tokens
+            device = logits.device
+            p_rand = torch.rand(logits_sort_decode.shape[0], dtype=torch.float32, device=device)
+            if p_rand is not None:
+                logits_sort_padded = logits_sort_decode.clone()
+                padding_column_zeroes = torch.zeros((logits_sort_padded.shape[0], 1), device=logits_sort_padded.device)
+                logits_sort_padded = torch.cat((padding_column_zeroes, logits_sort_padded), dim=1)
+                
+                probs_sort_padded = logits_sort_padded.softmax(dim=-1)
+                probs_sum_padded = torch.cumsum(probs_sort_padded, dim=-1, out=probs_sort_padded)
+
+                probs_sum_mask = probs_sum_padded.clone()
+                p_mask = probs_sum_mask <= p_rand.unsqueeze(dim=1)
+                probs_sum_mask.masked_fill_(p_mask, -1.0).to(torch.float32)
+
+
+                first_positive_indices = torch.argmax((probs_sum_mask >= 0).int(), dim=1)
+                valid_rows_mask = first_positive_indices > -1 #first_positive_indices > 0
+                valid_row_numbers = torch.where(valid_rows_mask)[0]
+                valid_ip_values = first_positive_indices[valid_rows_mask]
+                prev_values = probs_sum_padded[valid_row_numbers, valid_ip_values - 1]
+                current_values = probs_sum_padded[valid_row_numbers, valid_ip_values]
+                p_list = torch.stack((prev_values, current_values), dim=1)
+
+                p_list = p_list.cpu().detach().tolist()
+
+                filename = "/home/imizus/projects/vllm/vllm_validator_top_p_dist.txt"
+                if os.path.exists(filename):
+                    append_write = 'a' # append if already exists
+                else:
+                    append_write = 'w' # make a new file if not
+
+                try:
+                    with open(file=filename, mode=append_write) as f:
+                        for pi in p_rand.cpu().detach().tolist():
+                            f.write(f"{pi:.5f}\n")
+                except Exception as e:
+                    print(f"Failed to write to file: {e}")
+                    
+
+                filename = "/home/imizus/projects/vllm/vllm_validator_top_p_probs_mean.txt"
+                if os.path.exists(filename):
+                    append_write = 'a' # append if already exists
+                else:
+                    append_write = 'w' # make a new file if not
+
+                try:
+                    with open(file=filename, mode=append_write) as f:
+                        for ps in p_list:
+                            f.write(f"{((ps[0] + ps[1]) / 2.0):.5f}\n")
+                except Exception as e:
+                    print(f"Failed to write to file: {e}")
+            
+
+                filename = "/home/imizus/projects/vllm/vllm_validator_top_p_probs_max.txt"
+                if os.path.exists(filename):
+                    append_write = 'a' # append if already exists
+                else:
+                    append_write = 'w' # make a new file if not
+
+                try:
+                    with open(file=filename, mode=append_write) as f:
+                        for ps in p_list:
+                            f.write(f"{ps[1]:.5f}\n")
+                except Exception as e:
+                    print(f"Failed to write to file: {e}")
+
 
             # Transfer GPU->CPU async.
             chunk_slice = slice(start_idx, start_idx + num_logits)
