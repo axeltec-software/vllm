@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
+import json
+import os
 
 import tokenizers
 from packaging import version
@@ -252,6 +254,19 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
             )
             self.stream = DecodeStream(skip_special_tokens=self.skip_special_tokens)
             token = self.stream.step(self.tokenizer, next_token_id)
+            
+        filename = "/home/imizus/projects/vllm/output_tokens_with_ids.jsonl"
+        if os.path.exists(filename):
+            append_write = 'a' # append if already exists
+        else:
+            append_write = 'w' # make a new file if not
+
+        try:
+            with open(file=filename, mode=append_write) as f:
+                json.dump({"token_id": next_token_id, "token": token}, f)
+                f.write("\n")
+        except Exception as e:
+            print(f"Failed to write to file: {e}")
         return token
 
 
