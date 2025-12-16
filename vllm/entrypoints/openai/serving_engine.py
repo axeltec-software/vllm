@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import datetime
 import json
+import os
+from pathlib import Path
 import sys
 import time
 import traceback
@@ -1089,6 +1092,26 @@ class OpenAIServing:
         Sequence[RequestPrompt],
         list[EngineTokensPrompt],
     ]:
+        
+        # timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        # directory_name = f"../../../artifacts/executor_output_{timestamp}"
+        # Path(directory_name).mkdir(parents=True, exist_ok=True)
+        
+        # filename = os.path.join(directory_name, "prompt.json")
+
+        filename = "prompt.json"
+        if os.path.exists(filename):
+            append_write = 'a' # append if already exists
+        else:
+            append_write = 'w' # make a new file if not
+
+        try:
+            with open(file=filename, mode=append_write) as f:
+                f.write(json.dumps(request.messages))
+        except Exception as e:
+            print(f"Failed to write to file: {e}")
+
+
         if tokenizer is None:
             raise ValueError(
                 "Unable to get tokenizer because `skip_tokenizer_init=True`"
