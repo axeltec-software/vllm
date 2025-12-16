@@ -255,19 +255,19 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
             self.stream = DecodeStream(skip_special_tokens=self.skip_special_tokens)
             token = self.stream.step(self.tokenizer, next_token_id)
 
-        filename = "/home/imizus/projects/vllm/output_tokens_with_ids_val.jsonl"
-        if os.path.exists(filename):
-            append_write = 'a' # append if already exists
-        else:
-            append_write = 'w' # make a new file if not
+        # filename = "output_tokens_with_ids_val.jsonl"
+        # if os.path.exists(filename):
+        #     append_write = 'a' # append if already exists
+        # else:
+        #     append_write = 'w' # make a new file if not
 
-        try:
-            with open(file=filename, mode=append_write) as f:
-                #f.write(f"{next_token_id}: {token}\n")
-                json.dump({"token_id": next_token_id, "token": token}, f)
-                f.write("\n")
-        except Exception as e:
-            print(f"Failed to write to file: {e}")
+        # try:
+        #     with open(file=filename, mode=append_write) as f:
+        #         #f.write(f"{next_token_id}: {token}\n")
+        #         json.dump({"token_id": next_token_id, "token": token}, f)
+        #         f.write("\n")
+        # except Exception as e:
+        #     print(f"Failed to write to file: {e}")
         return token
 
 

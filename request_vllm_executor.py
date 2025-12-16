@@ -4,7 +4,7 @@ import os
 
 url = "http://localhost:9112/v1/chat/completions"  # Replace with your actual API endpoint
 payload = {
-            "model": "RedHatAI/Qwen2.5-7B-Instruct-quantized.w8a16",
+            "model": "Qwen/Qwen2.5-7B-Instruct",
             "messages": [
               {"role": "system", "content": "You are a helpful guide."},
               {"role": "user", "content": "Describe in details what species live in Africa, describe each of them, make a long essay."}
@@ -16,7 +16,7 @@ payload = {
 #{"role": "user", "content": "What is the capital of France?"}
 
 try:
-    file_to_delete = '/home/imizus/projects/vllm/output_tokens_with_ids.jsonl'
+    file_to_delete = '/home/imizus/projects/vllm_gonka_tests/vllm_validator/vllm/output_tokens_with_ids.jsonl'
     
     if os.path.exists(file_to_delete):
         try:

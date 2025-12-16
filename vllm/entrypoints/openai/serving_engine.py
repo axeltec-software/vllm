@@ -1185,7 +1185,7 @@ class OpenAIServing:
             prompt_token_ids=prompt_inputs["prompt_token_ids"]
         )
 
-        filename = "/home/imizus/projects/vllm/prompt_length.txt"
+        filename = "prompt_length.txt"
         if os.path.exists(filename):
             append_write = 'a' # append if already exists
         else:
@@ -1200,7 +1200,7 @@ class OpenAIServing:
         except Exception as e:
             print(f"Failed to write to file: {e}")
 
-        filepath = '/home/imizus/projects/vllm/output_tokens_with_ids.jsonl'
+        filepath = 'output_tokens_with_ids.jsonl'
         data = []
         decoded_tokens = []
         with open(filepath, 'r', encoding='utf-8') as f:

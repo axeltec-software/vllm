@@ -4,7 +4,7 @@ import os
 
 url = "http://localhost:9111/v1/chat/completions"  # Replace with your actual API endpoint
 payload = {
-            "model": "Qwen/Qwen2.5-7B-Instruct",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "messages": [
               {"role": "system", "content": "You are a helpful guide."},
               {"role": "user", "content": "Describe in details what species live in Africa, describe each of them, make a long essay."}
@@ -16,10 +16,8 @@ payload = {
           }
 
 try:
-    files_to_delete = ['/home/imizus/projects/vllm/prompt_length.txt', 
-                       '/home/imizus/projects/vllm/vllm_validator_top_p_dist.txt', 
-                       '/home/imizus/projects/vllm/vllm_validator_top_p_probs_max.txt', 
-                       '/home/imizus/projects/vllm/vllm_validator_top_p_probs_mean.txt']
+    files_to_delete = ['/home/imizus/projects/vllm_gonka_tests/vllm_validator/vllm/prompt_length.txt',  
+                       '/home/imizus/projects/vllm_gonka_tests/vllm_validator/vllm/vllm_validator_top_p_probs_mean.txt']
     
     for file_to_delete in files_to_delete:
         if os.path.exists(file_to_delete):
