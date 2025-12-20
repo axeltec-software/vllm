@@ -175,7 +175,12 @@ class Sampler(nn.Module):
 
                 enforced_sampled[i] = next_tok
             if sampling_metadata.all_enforced:
-                return enforced_sampled, None                   
+                # Reorder so result[pos] = token for batch position pos
+                # (enforced_req_ids may be out of order after condense)
+                result = torch.empty((logits.size(0),), dtype=torch.int64, device=logits.device)
+                for i, req_index in enumerate(sampling_metadata.enforced_req_ids):
+                    result[req_index] = enforced_sampled[i]
+                return result, None                   
         if sampling_metadata.all_random or sampling_metadata.mixed_enforced:
             greedy_sampled = None
         else:
@@ -283,11 +288,22 @@ class Sampler(nn.Module):
 
                 topk_indices_enforced[i] = torch.tensor(next_top_tok, device=logprobs.device)
             
-            topk_logprobs_enforced = torch.gather(logprobs[sampling_metadata.enforced_req_ids], dim=1, index=topk_indices_enforced)
+            # Gather logprobs for enforced tokens
+            # Using list indexing creates compressed tensor, which is correct
+            topk_logprobs_enforced = torch.gather(
+                logprobs[sampling_metadata.enforced_req_ids],
+                dim=1,
+                index=topk_indices_enforced
+            )
 
             if sampling_metadata.all_enforced:
-                topk_indices = topk_indices_enforced
-                topk_logprobs = topk_logprobs_enforced
+                # Reorder so row[pos] corresponds to batch position pos
+                # (enforced_req_ids may be out of order after condense)
+                topk_indices = torch.empty((logprobs.size(0), num_logprobs), dtype=torch.int64, device=logprobs.device)
+                topk_logprobs = torch.empty((logprobs.size(0), num_logprobs), device=logprobs.device)
+                for i, req_index in enumerate(sampling_metadata.enforced_req_ids):
+                    topk_indices[req_index] = topk_indices_enforced[i]
+                    topk_logprobs[req_index] = topk_logprobs_enforced[i]
             elif sampling_metadata.mixed_enforced:
                 all_ids = torch.arange(logprobs.size(0), device=logprobs.device)
                 mask_normal = torch.ones_like(all_ids, dtype=torch.bool)

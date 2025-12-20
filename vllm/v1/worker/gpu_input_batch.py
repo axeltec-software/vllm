@@ -427,11 +427,14 @@ class InputBatch:
                 self.enforced_token_ids[req_index] = (
                     sampling_params.enforced_token_ids
                 )
-                self.enforced_req_ids.append(req_index) 
+                if req_index not in self.enforced_req_ids:
+                    self.enforced_req_ids.append(req_index)
             if sampling_params.enforced_tokens:
                 self.enforced_tokens[req_index] = (
                     sampling_params.enforced_tokens
                 )
+                # Note: enforced_req_ids is only updated by enforced_token_ids block
+                # since enforced_token_ids is required for sampling
         elif pooling_params := request.pooling_params:
             self.pooling_params[req_id] = pooling_params
             self.logits_processing_needs_token_ids[req_index] = (
@@ -615,6 +618,17 @@ class InputBatch:
         swap_dict_values(self.enforced_token_ids, i1, i2)
         swap_dict_values(self.enforced_tokens, i1, i2)
 
+        # Swap positions in enforced_req_ids list
+        has_i1 = i1 in self.enforced_req_ids
+        has_i2 = i2 in self.enforced_req_ids
+        if has_i1 and not has_i2:
+            self.enforced_req_ids.remove(i1)
+            self.enforced_req_ids.append(i2)
+        elif has_i2 and not has_i1:
+            self.enforced_req_ids.remove(i2)
+            self.enforced_req_ids.append(i1)
+        # If both or neither have enforced sampling, no change needed
+
         if self.allowed_token_ids_mask_cpu_tensor is not None:
             (
                 self.allowed_token_ids_mask_cpu_tensor[i1],
@@ -749,10 +763,6 @@ class InputBatch:
             enforced_tokens = self.enforced_tokens.pop(last_req_index, None)
             if enforced_tokens is not None:
                 self.enforced_tokens[empty_index] = enforced_tokens
-            
-            enforced_token_ids = self.enforced_token_ids.pop(last_req_index, None)
-            if enforced_token_ids is not None:
-                self.enforced_token_ids[empty_index] = enforced_token_ids
 
             if last_req_index in self.enforced_req_ids:
                 self.enforced_req_ids.remove(last_req_index)
@@ -990,7 +1000,7 @@ class InputBatch:
 
     @property
     def all_enforced(self) -> bool:
-        return len(self.greedy_reqs) == 0 and len(self.random_reqs) == 0
+        return len(self.enforced_reqs) > 0 and len(self.greedy_reqs) == 0 and len(self.random_reqs) == 0
 
     @property
     def mixed_enforced(self) -> bool:
