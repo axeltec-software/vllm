@@ -3788,20 +3788,6 @@ class GPUModelRunner(
 
                 p_list = p_list.cpu().detach().tolist()
 
-                # filename = "/home/imizus/projects/vllm_gonka_tests/vllm_validator/vllm/vllm_validator_top_p_dist.txt"
-                # if os.path.exists(filename):
-                #     append_write = 'a' # append if already exists
-                # else:
-                #     append_write = 'w' # make a new file if not
-
-                # try:
-                #     with open(file=filename, mode=append_write) as f:
-                #         for pi in p_rand.cpu().detach().tolist():
-                #             f.write(f"{pi:.5f}\n")
-                # except Exception as e:
-                #     print(f"Failed to write to file: {e}")
-                    
-
                 filename = "vllm_validator_top_p_probs_mean.txt"
                 if os.path.exists(filename):
                     append_write = 'a' # append if already exists
@@ -3816,18 +3802,18 @@ class GPUModelRunner(
                     print(f"Failed to write to file: {e}")
             
 
-                # filename = "/home/imizus/projects/vllm_gonka_tests/vllm_validator/vllm/vllm_validator_top_p_probs_max.txt"
-                # if os.path.exists(filename):
-                #     append_write = 'a' # append if already exists
-                # else:
-                #     append_write = 'w' # make a new file if not
+                filename = "vllm_validator_top_p_probs_edges.txt"
+                if os.path.exists(filename):
+                    append_write = 'a' # append if already exists
+                else:
+                    append_write = 'w' # make a new file if not
 
-                # try:
-                #     with open(file=filename, mode=append_write) as f:
-                #         for ps in p_list:
-                #             f.write(f"{ps[1]:.5f}\n")
-                # except Exception as e:
-                #     print(f"Failed to write to file: {e}")
+                try:
+                    with open(file=filename, mode=append_write) as f:
+                        for ps in p_list:
+                            f.write(f"{ps[0]:.5f}\t{ps[1]:.5f}\n")
+                except Exception as e:
+                    print(f"Failed to write to file: {e}")
 
 
             # Transfer GPU->CPU async.
