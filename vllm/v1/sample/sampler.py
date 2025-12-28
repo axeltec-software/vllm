@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that samples the next tokens from the model's outputs."""
 
+import json
+import os
 import torch
 import torch.nn as nn
 
@@ -72,11 +74,26 @@ class Sampler(nn.Module):
         logprobs_mode_override: LogprobsMode | None = None,
     ) -> SamplerOutput:
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
+        num_logprobs = sampling_metadata.max_num_logprobs
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
         # This is different from the V0 sampler, which uses the logits that
         # is used for sampling (after penalties and temperature scaling).
-        num_logprobs = sampling_metadata.max_num_logprobs
+        logprobs_mode = "raw_logprobs"
+        device = logits.device
+        p = (torch.full(([logits.shape[0]]), 0.99)).to(device)
+        
+        logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+        # Apply top-p.
+        probs_sort = logits_sort.softmax(dim=-1)
+        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+        # at least one
+        top_p_mask[:, -1] = False
+        
+        num_logprobs_list = (~top_p_mask).sum(dim=1)
+        num_logprobs = num_logprobs_list[0].item()
+
         if num_logprobs is not None:
             if logprobs_mode == "raw_logprobs":
                 raw_logprobs = self.compute_logprobs(logits)
@@ -114,6 +131,28 @@ class Sampler(nn.Module):
             logprobs_tensors = self.gather_logprobs(
                 raw_logprobs, num_logprobs, token_ids=sampled
             )
+
+        filename = "output_logprobs.jsonl"
+        first_batch_el_top_p_logprobs = logprobs_tensors.logprobs[0].cpu().detach().tolist()
+        first_batch_el_top_p_indices = logprobs_tensors.logprob_token_ids[0].cpu().detach().tolist()
+        sampled_token = first_batch_el_top_p_indices[0]
+
+        indx_logprob_dict = {}
+        for indx, logprob in zip(first_batch_el_top_p_indices[1:], first_batch_el_top_p_logprobs[1:]):
+            indx_logprob_dict[indx] = logprob
+
+        if os.path.exists(filename):
+            append_write = 'a' # append if already exists
+        else:
+            append_write = 'w' # make a new file if not
+
+        try:
+            with open(file=filename, mode=append_write) as f:
+                val = {"token": sampled_token, "logprobs": indx_logprob_dict }
+                json.dump(val, f, indent=2)
+                f.write("\n")
+        except Exception as e:
+            print(f"Failed to write to file: {e}")
 
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)

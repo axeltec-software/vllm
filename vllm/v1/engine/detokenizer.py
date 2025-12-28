@@ -255,7 +255,6 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
             self.stream = DecodeStream(skip_special_tokens=self.skip_special_tokens)
             token = self.stream.step(self.tokenizer, next_token_id)
             
-        #filename = "/home/imizus/projects/vllm_gonka_tests/vllm_validator/vllm/output_tokens_with_ids.jsonl"
         filename = "output_tokens_with_ids.jsonl"
         if os.path.exists(filename):
             append_write = 'a' # append if already exists
