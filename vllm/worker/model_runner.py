@@ -2030,8 +2030,14 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         Returns:
             Dict mapping request_id -> {"nonce": int, "distance": float}
         """
+        from vllm.distributed import get_pp_group
         from vllm.poc.gpu_random import (generate_haar_orthogonal_matrices,
                                          generate_target, random_pick_indices)
+
+        # Only compute distances on last PP rank (has final hidden states).
+        # Other ranks have intermediate tensors, not final hidden states.
+        if not get_pp_group().is_last_rank:
+            return {}
 
         POC_PICK_K_DIMS = 64  # Same as in poc_model_runner.py
 
@@ -2039,10 +2045,17 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if not poc_params_map:
             return {}
 
-        # Build mapping of request_id to position in batch.
-        # seq_lens tells us how many tokens each sequence has.
+        # Build mapping of request_id to ACTUAL position in batch.
+        # The batch may contain both chat and PoC requests interleaved.
+        # We need to find the correct position for each PoC request.
         request_ids_to_seq_ids = model_input.request_ids_to_seq_ids or {}
         seq_lens = model_input.seq_lens or []
+
+        # Build request_id -> batch_position mapping
+        # request_ids_to_seq_ids preserves batch order
+        request_id_to_batch_pos: dict[str, int] = {}
+        for batch_pos, req_id in enumerate(request_ids_to_seq_ids.keys()):
+            request_id_to_batch_pos[req_id] = batch_pos
 
         # Calculate start positions for each sequence in the flattened hidden states.
         # hidden_states shape: [total_tokens, hidden_size]
@@ -2053,14 +2066,16 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         poc_outputs: dict[str, dict] = {}
         hidden_size = hidden_states.shape[-1]
 
-        # Process each PoC request.
-        for idx, (request_id, poc_params) in enumerate(poc_params_map.items()):
-            if idx >= len(seq_lens):
+        # Process each PoC request using its ACTUAL batch position.
+        for request_id, poc_params in poc_params_map.items():
+            # Find the actual position of this request in the batch
+            batch_pos = request_id_to_batch_pos.get(request_id)
+            if batch_pos is None or batch_pos >= len(seq_lens):
                 continue
 
             # Get the last token's hidden state for this sequence.
-            start_pos = seq_start_positions[idx]
-            seq_len = seq_lens[idx]
+            start_pos = seq_start_positions[batch_pos]
+            seq_len = seq_lens[batch_pos]
             # hidden_states is flattened: [total_tokens, hidden_size]
             last_hidden = hidden_states[start_pos + seq_len - 1:start_pos + seq_len].float()  # [1, hidden_size]
 

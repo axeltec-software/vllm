@@ -2035,10 +2035,13 @@ class Scheduler:
             num_uncached_new_tokens = 1
             num_cached_new_tokens -= 1
 
-        if enable_chunking and len(seqs) == 1:
+        if enable_chunking and len(seqs) == 1 and seq_group.poc_params is None:
             # Chunk if a running request cannot fit in the given budget.
             # If number of seq > 1, it means it is doing beam search
             # in a decode phase. Do not chunk.
+            # PoC sequences are exempt from chunking - they need full prefill
+            # for correct distance computation (chunking produces intermediate
+            # hidden states, not final hidden states).
             num_uncached_new_tokens = self._chunk_new_tokens_to_schedule(
                 self.scheduler_config,
                 self.cache_config,

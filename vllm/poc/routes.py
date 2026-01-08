@@ -462,7 +462,7 @@ async def generate_nonces(request: Request, body: PoCGenerateRequest) -> dict:
         async for output in engine_client.poc_compute(
             poc_params=poc_params,
             request_id=request_id,
-            priority=0,  # Default priority (priority scheduling not always enabled)
+            priority=1,  # Lower than chat (0) - PoC yields to inference
         ):
             if output.finished:
                 result = {
@@ -537,7 +537,7 @@ async def compute_nonce(request: Request, body: PoCComputeRequest) -> dict:
     async for output in engine_client.poc_compute(
         poc_params=poc_params,
         request_id=request_id,
-        priority=0,  # Default priority
+        priority=1,  # Lower than chat (0) - PoC yields to inference
     ):
         if output.finished:
             final_output = output
