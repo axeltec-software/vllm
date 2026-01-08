@@ -2039,7 +2039,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if not get_pp_group().is_last_rank:
             return {}
 
-        POC_PICK_K_DIMS = 64  # Same as in poc_model_runner.py
+        POC_PICK_K_DIMS = 12  # Must match poc_model_runner.py for validator compatibility
 
         poc_params_map = model_input.poc_params_map
         if not poc_params_map:
