@@ -13,6 +13,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.poc.poc_params import PoCParams
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
@@ -51,6 +52,7 @@ class EngineCoreRequest(
     mm_features: Optional[list[MultiModalFeatureSpec]]
     sampling_params: Optional[SamplingParams]
     pooling_params: Optional[PoolingParams]
+    poc_params: Optional[PoCParams]
     eos_token_id: Optional[int]
     arrival_time: float
     lora_request: Optional[LoRARequest]
@@ -118,6 +120,9 @@ class EngineCoreOutput(
     trace_headers: Optional[Mapping[str, str]] = None
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
+    
+    # PoC: Output for PoC requests (nonce, distance, optional vector)
+    poc_output: Optional[dict[str, Any]] = None
 
     @property
     def finished(self) -> bool:

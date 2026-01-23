@@ -12,6 +12,7 @@ import torch
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.poc.poc_params import PoCParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import (EngineCoreEvent, EngineCoreEventType,
                             EngineCoreRequest, FinishReason)
@@ -31,6 +32,7 @@ class Request:
         prompt_token_ids: Optional[list[int]],
         sampling_params: Optional[SamplingParams],
         pooling_params: Optional[PoolingParams],
+        poc_params: Optional[PoCParams],
         eos_token_id: Optional[int],
         client_index: int = 0,
         arrival_time: Optional[float] = None,
@@ -49,6 +51,7 @@ class Request:
         self.priority = priority
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
+        self.poc_params = poc_params
         # Because of LoRA, the eos token id can be different for each request.
         self.eos_token_id = eos_token_id
         self.lora_request = lora_request
@@ -64,7 +67,11 @@ class Request:
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: Optional[dict[str, Any]] = None
 
-        if pooling_params is not None:
+        if poc_params is not None:
+            assert sampling_params is None and pooling_params is None
+            # PoC is always single-step (prefill-only)
+            self.max_tokens = 1
+        elif pooling_params is not None:
             # Pooling models.
             self.max_tokens = 1
         elif sampling_params is not None:

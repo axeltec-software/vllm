@@ -164,3 +164,9 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
+    poc_req_ids: set[str] = None
+    
+    def __post_init__(self):
+        if self.poc_req_ids is None:
+            self.poc_req_ids = set()

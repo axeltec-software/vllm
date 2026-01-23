@@ -2238,6 +2238,33 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
 
+                # Check if we have PoC requests to execute
+                if scheduler_output.poc_req_ids:
+                    # Extract PoC requests from the input batch
+                    poc_requests = [
+                        req for req in self.input_batch.reqs
+                        if req.request_id in scheduler_output.poc_req_ids
+                    ]
+                    
+                    if poc_requests:
+                        # Execute PoC batch separately
+                        from vllm.poc.poc_model_runner import execute_poc_batch
+                        poc_outputs = execute_poc_batch(self, poc_requests)
+                        
+                        # Return ModelRunnerOutput with PoC results
+                        return ModelRunnerOutput(
+                            req_ids=list(scheduler_output.poc_req_ids),
+                            req_id_to_index={req_id: i for i, req_id in enumerate(scheduler_output.poc_req_ids)},
+                            outputs=[],  # No sampler outputs for PoC
+                            sampled_token_ids=None,
+                            logprobs=None,
+                            prompt_logprobs=None,
+                            spec_decode_worker_metrics=None,
+                            model_runner_stats=None,
+                            kv_connector_output=None,
+                            poc_outputs=poc_outputs,
+                        )
+
                 if not scheduler_output.total_num_scheduled_tokens:
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
