@@ -281,26 +281,24 @@ class AsyncLLM(EngineClient):
             raise EngineDeadError()
 
         if poc_params is not None:
-            from vllm.outputs import OutputKind
-            queue = RequestOutputCollector(output_kind=OutputKind.FINAL_ONLY)
+            from vllm.sampling_params import RequestOutputKind
+            queue = RequestOutputCollector(output_kind=RequestOutputKind.FINAL_ONLY)
 
             if arrival_time is None:
                 arrival_time = time.time()
             
             request = EngineCoreRequest(
                 request_id=request_id,
-                prompt=None,
                 prompt_token_ids=[],  # Empty for PoC
-                multi_modal_data=None,
-                multi_modal_placeholders=None,
-                multi_modal_hashes=None,
+                mm_features=None,
                 sampling_params=None,
+                pooling_params=None,
                 eos_token_id=None,
                 arrival_time=arrival_time,
                 lora_request=lora_request,
-                trace_headers=trace_headers,
-                priority=priority,
+                cache_salt=None,
                 data_parallel_rank=data_parallel_rank,
+                priority=priority,
                 poc_params=poc_params,
             )
             

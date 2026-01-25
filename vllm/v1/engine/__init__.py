@@ -47,18 +47,21 @@ class EngineCoreRequest(
         omit_defaults=True,  # type: ignore[call-arg]
         gc=False):  # type: ignore[call-arg]
 
+    # Required fields (no defaults)
     request_id: str
     prompt_token_ids: Optional[list[int]]
     mm_features: Optional[list[MultiModalFeatureSpec]]
     sampling_params: Optional[SamplingParams]
     pooling_params: Optional[PoolingParams]
-    poc_params: Optional[PoCParams]
     eos_token_id: Optional[int]
     arrival_time: float
     lora_request: Optional[LoRARequest]
     cache_salt: Optional[str]
     data_parallel_rank: Optional[int]
+
+    # Optional fields (with defaults)
     prompt_embeds: Optional[torch.Tensor] = None
+    poc_params: Optional[PoCParams] = None  # PoC-specific params, None for chat
 
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.

@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorStats)
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.v1.engine import FinishReason
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
@@ -350,16 +351,20 @@ class Scheduler(SchedulerInterface):
 
                 request = self.waiting.peek_request()
                 
-                # PoC: Handle PoC requests
+                # PoC: Handle PoC requests - no KV cache needed
                 if request.poc_params is not None:
                     num_new_tokens = request.poc_params.seq_len
                     if num_new_tokens <= token_budget:
                         self.waiting.pop_request()
                         self.running.append(request)
                         request.status = RequestStatus.RUNNING
-                        
+
                         scheduled_new_reqs.append(request)
                         num_scheduled_tokens[request.request_id] = num_new_tokens
+                        # PoC doesn't use KV cache - use empty blocks
+                        req_to_new_blocks[request.request_id] = KVCacheBlocks(
+                            blocks=tuple([] for _ in range(self.kv_cache_manager.num_kv_cache_groups))
+                        )
                         token_budget -= num_new_tokens
 
                         if self.log_stats:

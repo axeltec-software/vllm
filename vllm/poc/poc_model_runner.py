@@ -4,12 +4,15 @@ Executes PoC forward passes for requests identified by the scheduler.
 Adapted from v0.9.1 integration to work with V1's unified scheduler.
 """
 import time
+from contextlib import contextmanager
 from typing import List, Optional, Dict, Any
 
 import torch
+import torch.compiler
 import torch.distributed as dist
 
 from vllm.attention.backends.utils import PAD_SLOT_ID
+from vllm.config import CUDAGraphMode
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed.communication_op import broadcast_tensor_dict
 from vllm.forward_context import set_forward_context
@@ -30,79 +33,95 @@ logger = init_logger(__name__)
 POC_PICK_K_DIMS = 12
 
 
-def _create_prefill_attn_metadata(
+@contextmanager
+def bypass_torch_compile():
+    """Temporarily set the compiling flag to bypass torch.compile wrappers.
+
+    The @support_torch_compile decorator checks torch.compiler.is_compiling()
+    and bypasses compilation if True. By setting this flag, we force all
+    compiled models to use their raw forward() method.
+
+    This is needed for PoC because:
+    1. PoC uses input_ids=None with inputs_embeds
+    2. torch.dynamo traced the model expecting input_ids to be a tensor
+    3. Calling with input_ids=None causes 'NoneType has no attribute size'
+    """
+    old_flag = torch.compiler._is_compiling_flag
+    torch.compiler._is_compiling_flag = True
+    try:
+        yield
+    finally:
+        torch.compiler._is_compiling_flag = old_flag
+
+
+def _create_v1_attn_metadata(
+    model_runner,
     batch_size: int,
     seq_len: int,
     device: torch.device,
-    attn_backend,
-):
-    """Create prefill attention metadata for the given backend.
-    
-    Uses PAD_SLOT_ID for all slots to skip KV cache writes.
+) -> Dict[str, Any]:
+    """Create V1 attention metadata for PoC prefill.
+
+    Uses the model runner's metadata builders to create proper backend-specific
+    metadata for each attention layer. Uses PAD_SLOT_ID to skip KV cache writes.
+
+    Returns:
+        Dict mapping layer names to their backend-specific AttentionMetadata
     """
+    from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+
     num_tokens = batch_size * seq_len
-    seq_lens = [seq_len] * batch_size
-    
-    seq_start_loc = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    seq_start_loc[1:] = torch.cumsum(
-        torch.tensor(seq_lens, dtype=torch.int32, device=device), dim=0
+
+    # Query start locations
+    query_start_loc = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    query_start_loc[1:] = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device) * seq_len
+    query_start_loc_cpu = query_start_loc.cpu()
+
+    # Sequence lengths (all same for PoC)
+    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+    seq_lens_cpu = seq_lens.cpu()
+
+    # No computed tokens for fresh prefill
+    num_computed_tokens_cpu = torch.zeros(batch_size, dtype=torch.int32, device="cpu")
+
+    # Empty block table (no KV cache)
+    block_table_tensor = torch.empty((batch_size, 0), dtype=torch.int32, device=device)
+
+    # Use PAD_SLOT_ID to skip KV cache writes
+    slot_mapping = torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.int64, device=device)
+
+    common_attn_metadata = CommonAttentionMetadata(
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc_cpu,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        num_computed_tokens_cpu=num_computed_tokens_cpu,
+        num_reqs=batch_size,
+        num_actual_tokens=num_tokens,
+        max_query_len=seq_len,
+        max_seq_len=seq_len,
+        block_table_tensor=block_table_tensor,
+        slot_mapping=slot_mapping,
+        causal=True,
     )
-    
-    backend_name = attn_backend.get_name()
-    
-    if backend_name == "XFORMERS":
-        from vllm.attention.backends.xformers import XFormersMetadata
-        return XFormersMetadata(
-            num_prefills=batch_size,
-            num_prefill_tokens=num_tokens,
-            num_decode_tokens=0,
-            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
-            seq_lens=seq_lens,
-            seq_lens_tensor=torch.tensor(seq_lens, dtype=torch.int, device=device),
-            max_prefill_seq_len=seq_len,
-            max_decode_seq_len=0,
-            query_start_loc=seq_start_loc.clone(),
-            seq_start_loc=seq_start_loc,
-            context_lens_tensor=torch.zeros(batch_size, dtype=torch.int, device=device),
-            block_tables=torch.empty((batch_size, 0), dtype=torch.int, device=device),
-            use_cuda_graph=False,
-            multi_modal_placeholder_index_maps=None,
-            enable_kv_scales_calculation=False,
-        )
-    elif backend_name == "FLASHINFER":
-        from vllm.attention.backends.flashinfer import FlashInferMetadata
-        return FlashInferMetadata(
-            num_prefills=batch_size,
-            num_prefill_tokens=num_tokens,
-            num_decode_tokens=0,
-            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
-            max_prefill_seq_len=seq_len,
-            seq_start_loc=seq_start_loc,
-            multi_modal_placeholder_index_maps=None,
-            enable_kv_scales_calculation=False,
-            use_cuda_graph=False,
-            is_profile_run=True,
-        )
-    else:
-        # Default to FlashAttention
-        from vllm.attention.backends.flash_attn import FlashAttentionMetadata
-        return FlashAttentionMetadata(
-            num_prefills=batch_size,
-            num_prefill_tokens=num_tokens,
-            num_decode_tokens=0,
-            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
-            seq_lens=seq_lens,
-            seq_lens_tensor=torch.tensor(seq_lens, dtype=torch.int, device=device),
-            max_prefill_seq_len=seq_len,
-            max_decode_seq_len=0,
-            query_start_loc=seq_start_loc.clone(),
-            seq_start_loc=seq_start_loc,
-            context_lens_tensor=torch.zeros(batch_size, dtype=torch.int, device=device),
-            block_tables=torch.empty((batch_size, 0), dtype=torch.int, device=device),
-            use_cuda_graph=False,
-            multi_modal_placeholder_index_maps=None,
-            enable_kv_scales_calculation=False,
-        )
+
+    # Build backend-specific metadata for each attention layer
+    # V1 expects attn_metadata to be a dict mapping layer names to their metadata
+    attn_metadata_dict: Dict[str, Any] = {}
+
+    for attn_groups in model_runner.attn_groups:
+        for attn_group in attn_groups:
+            builder = attn_group.get_metadata_builder()
+            # common_prefix_len=0 means no cascade attention
+            layer_metadata = builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                fast_build=True,  # Skip AOT scheduling for PoC
+            )
+            for layer_name in attn_group.layer_names:
+                attn_metadata_dict[layer_name] = layer_metadata
+
+    return attn_metadata_dict
 
 
 @torch.inference_mode()
@@ -142,8 +161,29 @@ def execute_poc_batch(
     
     nonces = [req.poc_params.nonce for req in poc_requests]
     batch_size = len(nonces)
-    hidden_size = model_runner.model_config.hidden_size
-    
+    # NOTE: Must use get_hidden_size() method, NOT .hidden_size attribute!
+    # ModelConfig doesn't have hidden_size as a direct field - it's retrieved
+    # from hf_text_config via the get_hidden_size() method.
+    # See vllm/config/model.py:1072-1073
+    hidden_size = model_runner.model_config.get_hidden_size()
+
+    # =========================================================================
+    # SETUP: Register Householder layer hooks for structure breaking
+    # Hooks are cached on model_runner and reused for same block_hash
+    # =========================================================================
+    from vllm.poc.layer_hooks import LayerHouseholderHook
+
+    # Cache hooks on model_runner to avoid re-registering for same block_hash
+    cached_hooks = getattr(model_runner, '_poc_layer_hooks', None)
+    if cached_hooks is None or cached_hooks.block_hash != block_hash:
+        # Different block_hash or first time - create new hooks
+        if cached_hooks is not None:
+            cached_hooks.detach()  # Clean up old hooks
+        cached_hooks = LayerHouseholderHook(model, block_hash, device, hidden_size)
+        model_runner._poc_layer_hooks = cached_hooks
+        logger.debug(f"PoC: Registered {cached_hooks.num_layers} layer hooks for block_hash={block_hash[:16]}...")
+    # else: reuse existing hooks for same block_hash
+
     # =========================================================================
     # TP SYNC: Rendezvous + CPU-only gate (no NCCL)
     # =========================================================================
@@ -188,6 +228,11 @@ def execute_poc_batch(
             dim=hidden_size, seq_len=seq_len,
             device=device, dtype=dtype,
         )
+        # Verify embeddings were generated
+        if inputs_embeds is None:
+            raise RuntimeError(f"generate_inputs returned None for batch_size={batch_size}, "
+                             f"seq_len={seq_len}, hidden_size={hidden_size}")
+        logger.debug(f"PoC inputs_embeds shape: {inputs_embeds.shape}")
     else:
         # Receive from previous PP rank
         intermediate_tensors = IntermediateTensors(
@@ -196,8 +241,7 @@ def execute_poc_batch(
     
     # Create attention metadata and positions
     positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    attn_backend = model_runner.attn_backend
-    attn_metadata = _create_prefill_attn_metadata(batch_size, seq_len, device, attn_backend)
+    attn_metadata = _create_v1_attn_metadata(model_runner, batch_size, seq_len, device)
     
     torch.cuda.synchronize()
     t_input_end = time.perf_counter()
@@ -217,15 +261,19 @@ def execute_poc_batch(
     
     # Forward pass with PoC context (activates layer hooks)
     from vllm.poc.layer_hooks import poc_forward_context
-    
-    with set_forward_context(attn_metadata, vllm_config):
-        with poc_forward_context(block_hash, public_key, nonces, hidden_size, device):
-            hidden_states = model(
-                input_ids=None,
-                positions=positions.flatten(),
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
-            )
+
+    # Explicitly disable CUDA graphs and torch.compile for PoC forward pass
+    # PoC uses variable batch sizes, custom attention metadata, and input_ids=None
+    with set_forward_context(attn_metadata, vllm_config,
+                             cudagraph_runtime_mode=CUDAGraphMode.NONE):
+        with poc_forward_context():
+            with bypass_torch_compile():
+                hidden_states = model(
+                    input_ids=None,
+                    positions=positions.flatten(),
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
+                )
     
     torch.cuda.synchronize()
     t_fwd_end = time.perf_counter()
@@ -289,5 +337,9 @@ def execute_poc_batch(
             distance=distance,
             vector=vector
         ))
-    
+
+    # NOTE: Hooks are cached on model_runner, NOT detached here.
+    # They will be reused for subsequent requests with same block_hash.
+    # Only detached when block_hash changes (see hook setup above).
+
     return results

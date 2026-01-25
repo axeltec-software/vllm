@@ -445,7 +445,6 @@ class Processor:
         return prompt_str, EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
-            prompt_embeds=prompt_embeds,
             mm_features=mm_features,
             sampling_params=sampling_params,
             pooling_params=pooling_params,
@@ -453,8 +452,10 @@ class Processor:
             arrival_time=arrival_time,
             lora_request=lora_request,
             cache_salt=decoder_inputs.get("cache_salt"),
-            priority=priority,
             data_parallel_rank=data_parallel_rank,
+            prompt_embeds=prompt_embeds,
+            # poc_params defaults to None for chat requests
+            priority=priority,
             trace_headers=trace_headers,
         )
 
