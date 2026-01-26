@@ -1541,6 +1541,11 @@ def build_app(args: Namespace) -> FastAPI:
     app.include_router(router)
     app.root_path = args.root_path
 
+    from vllm.poc.routes import router as poc_router
+    app.include_router(poc_router)
+    app.state.poc_enabled = True
+    logger.info("PoC (Proof of Compute) API enabled")
+
     mount_metrics(app)
 
     app.add_middleware(

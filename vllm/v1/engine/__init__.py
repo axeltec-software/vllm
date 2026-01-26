@@ -13,6 +13,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.poc.poc_params import PoCParams
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
@@ -48,11 +49,12 @@ class EngineCoreRequest(
     gc=False,
 ):  # type: ignore[call-arg]
     request_id: str
-    prompt_token_ids: list[int] | None
-    mm_features: list[MultiModalFeatureSpec] | None
-    sampling_params: SamplingParams | None
-    pooling_params: PoolingParams | None
-    eos_token_id: int | None
+    prompt_token_ids: Optional[list[int]]
+    mm_features: Optional[list[MultiModalFeatureSpec]]
+    sampling_params: Optional[SamplingParams]
+    pooling_params: Optional[PoolingParams]
+    poc_params: Optional[PoCParams]
+    eos_token_id: Optional[int]
     arrival_time: float
     lora_request: LoRARequest | None
     cache_salt: str | None
@@ -121,6 +123,9 @@ class EngineCoreOutput(
     trace_headers: Mapping[str, str] | None = None
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
+    
+    # PoC: Output for PoC requests (nonce, distance, optional vector)
+    poc_output: Optional[dict[str, Any]] = None
 
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.

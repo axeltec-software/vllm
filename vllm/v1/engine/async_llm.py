@@ -48,6 +48,10 @@ from vllm.v1.metrics.loggers import (
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from vllm.poc.poc_params import PoCParams
+
 logger = init_logger(__name__)
 
 
@@ -259,20 +263,50 @@ class AsyncLLM(EngineClient):
     async def add_request(
         self,
         request_id: str,
-        prompt: EngineCoreRequest | PromptType,
-        params: SamplingParams | PoolingParams,
-        arrival_time: float | None = None,
-        lora_request: LoRARequest | None = None,
-        tokenization_kwargs: dict[str, Any] | None = None,
-        trace_headers: Mapping[str, str] | None = None,
+        prompt: Optional[PromptType],
+        params: Optional[Union[SamplingParams, PoolingParams]],
+        arrival_time: Optional[float] = None,
+        lora_request: Optional[LoRARequest] = None,
+        tokenization_kwargs: Optional[dict[str, Any]] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
-        data_parallel_rank: int | None = None,
-        prompt_text: str | None = None,
+        data_parallel_rank: Optional[int] = None,
+        poc_params: Optional["PoCParams"] = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
         if self.errored:
             raise EngineDeadError()
+
+        if poc_params is not None:
+            from vllm.outputs import OutputKind
+            queue = RequestOutputCollector(output_kind=OutputKind.FINAL_ONLY)
+
+            if arrival_time is None:
+                arrival_time = time.time()
+            
+            request = EngineCoreRequest(
+                request_id=request_id,
+                prompt=None,
+                prompt_token_ids=[],  # Empty for PoC
+                multi_modal_data=None,
+                multi_modal_placeholders=None,
+                multi_modal_hashes=None,
+                sampling_params=None,
+                eos_token_id=None,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+                poc_params=poc_params,
+            )
+            
+            await self._add_request(request, None, None, 0, queue)
+            return queue
+
+        if params is None or prompt is None:
+            raise ValueError("params and prompt are required for non-PoC requests")
 
         is_pooling = isinstance(params, PoolingParams)
 
@@ -349,9 +383,9 @@ class AsyncLLM(EngineClient):
     # re-multiplexed in the API server anyhow.
     async def generate(
         self,
-        prompt: EngineCoreRequest | PromptType,
-        sampling_params: SamplingParams,
-        request_id: str,
+        prompt: EngineCoreRequest | PromptType | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
         *,
         prompt_text: str | None = None,
         lora_request: LoRARequest | None = None,
@@ -359,6 +393,7 @@ class AsyncLLM(EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        poc_params: Optional["PoCParams"] = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -375,10 +410,30 @@ class AsyncLLM(EngineClient):
         returning the RequestOutput back to the caller.
         """
 
+<<<<<<< HEAD
         if (
             self.vllm_config.cache_config.kv_sharing_fast_prefill
             and sampling_params.prompt_logprobs
         ):
+=======
+        if poc_params is not None:
+            if sampling_params is not None or prompt is not None:
+                raise ValueError(
+                    "poc_params cannot be used with sampling_params or prompt")
+            # For PoC requests, we don't need sampling params or prompt
+            # The request will be handled specially by the scheduler
+            if request_id is None:
+                import uuid
+                request_id = f"poc-{uuid.uuid4()}"
+        else:
+            if sampling_params is None or prompt is None:
+                raise ValueError(
+                    "sampling_params and prompt are required for non-PoC requests")
+
+        if (sampling_params is not None and
+                self.vllm_config.cache_config.kv_sharing_fast_prefill
+                and sampling_params.prompt_logprobs):
+>>>>>>> 4af5da30e (draft)
             raise ValueError(
                 "--kv-sharing-fast-prefill produces incorrect logprobs for "
                 "prompt tokens, please disable it when the requests need "
@@ -391,8 +446,13 @@ class AsyncLLM(EngineClient):
             # to handle startup failure gracefully in the OpenAI server.
             self._run_output_handler()
 
+<<<<<<< HEAD
             if tokenization_kwargs is None:
                 tokenization_kwargs = {}
+=======
+            tokenization_kwargs: dict[str, Any] = {}
+            if sampling_params is not None:
+>>>>>>> 4af5da30e (draft)
                 truncate_prompt_tokens = sampling_params.truncate_prompt_tokens
 
                 _validate_truncation_size(
@@ -404,13 +464,17 @@ class AsyncLLM(EngineClient):
             q = await self.add_request(
                 request_id,
                 prompt,
-                sampling_params,
+                sampling_params if sampling_params is not None else None,
                 lora_request=lora_request,
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers,
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
+<<<<<<< HEAD
                 prompt_text=prompt_text,
+=======
+                poc_params=poc_params,
+>>>>>>> 4af5da30e (draft)
             )
 
             # The output_handler task pushes items into the queue.
