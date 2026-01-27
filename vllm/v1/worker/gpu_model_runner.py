@@ -781,28 +781,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         hidden_states: torch.Tensor,
         poc_metadata: list[dict],
     ) -> dict[str, "PoCOutput"]:
-        """Process hidden states to compute PoC distances.
-
-        Args:
-            hidden_states: Full hidden states tensor [total_tokens, hidden_size]
-            poc_metadata: List of metadata dicts for PoC requests
-
-        Returns:
-            Dict mapping request_id to PoCOutput
-        """
         from vllm.poc.gpu_random import (
-            generate_target,
             random_pick_indices,
             generate_haar_orthogonal_matrices,
         )
+        from vllm.poc.data import encode_vector
 
-        POC_PICK_K_DIMS = 12
         poc_outputs = {}
 
         for meta in poc_metadata:
             start = meta['start_idx']
             end = start + meta['length']
             poc_params = meta['poc_params']
+            k_dim = poc_params.k_dim
 
             last_hidden = hidden_states[end - 1].float()
             last_hidden = last_hidden / (last_hidden.norm() + 1e-8)
@@ -813,7 +804,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 poc_params.public_key,
                 [poc_params.nonce],
                 hidden_size,
-                POC_PICK_K_DIMS,
+                k_dim,
                 self.device,
             )
             xk = last_hidden[indices[0]]
@@ -822,28 +813,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 poc_params.block_hash,
                 poc_params.public_key,
                 [poc_params.nonce],
-                POC_PICK_K_DIMS,
+                k_dim,
                 self.device,
                 dtype=xk.dtype,
             )
             yk = torch.mv(Q[0], xk)
-
-            target = generate_target(
-                poc_params.block_hash,
-                poc_params.public_key,
-                POC_PICK_K_DIMS,
-                self.device,
-            )
-
             yk = yk / (yk.norm() + 1e-8)
-            target = target / (target.norm() + 1e-8)
-            distance = float((yk - target).norm().item())
 
-            vector = yk.cpu().tolist() if poc_params.return_vectors else None
+            vector_b64 = encode_vector(yk.half().cpu().numpy())
             poc_outputs[meta['req_id']] = PoCOutput(
                 nonce=poc_params.nonce,
-                distance=distance,
-                vector=vector,
+                vector_b64=vector_b64,
             )
 
         return poc_outputs

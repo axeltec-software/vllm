@@ -998,7 +998,12 @@ class Scheduler(SchedulerInterface):
                 # and will be handled by the output processor
                 poc_output = None
                 if hasattr(model_runner_output, 'poc_outputs') and model_runner_output.poc_outputs:
-                    poc_output = model_runner_output.poc_outputs.get(req_id)
+                    poc_obj = model_runner_output.poc_outputs.get(req_id)
+                    if poc_obj is not None:
+                        poc_output = {
+                            "nonce": poc_obj.nonce,
+                            "vector_b64": poc_obj.vector_b64,
+                        }
 
                 outputs[request.client_index].append(
                     EngineCoreOutput(

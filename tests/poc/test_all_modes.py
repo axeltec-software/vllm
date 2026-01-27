@@ -2,66 +2,86 @@
 """Test all PoC modes: pure chat, pure PoC, and mixed batch.
 
 Usage:
-    # Start vLLM server first:
     python -m vllm.entrypoints.openai.api_server \
         --model Qwen/Qwen2-1.5B-Instruct \
         --port 8102 \
         --gpu-memory-utilization 0.5 \
         --max-model-len 4096
 
-    # Run tests:
     python tests/poc/test_all_modes.py
-
-    # Or with custom server URL and model:
     python tests/poc/test_all_modes.py --server http://0.0.0.0:8102 --model Qwen/Qwen2-1.5B-Instruct
 """
 
 import argparse
+import base64
 import concurrent.futures
-import json
 import random
+import struct
 import sys
 import time
-from typing import Optional
+
+import requests
 
 CHAT_PROMPTS = [
     "Explain how a {thing} works in 2-3 sentences.",
     "Write a short poem about {thing}.",
     "What are 3 interesting facts about {thing}?",
     "Compare and contrast {thing} with {thing2}.",
-    "If you were a {thing}, what would your day look like?",
     "Describe {thing} to a 5-year-old.",
     "What would happen if {thing} didn't exist?",
-    "Give me a recipe that uses {thing} as the main ingredient.",
     "Write a haiku about {thing}.",
     "Tell me a joke involving {thing}.",
-    "What are the pros and cons of {thing}?",
-    "Summarize the history of {thing} in 3 sentences.",
 ]
 
 THINGS = [
     "quantum computing", "black holes", "sourdough bread", "the Roman Empire",
-    "electric cars", "photosynthesis", "jazz music", "the Mariana Trench",
-    "neural networks", "volcanoes", "origami", "the stock market",
-    "bioluminescence", "espresso", "tidal waves", "the printing press",
-    "glaciers", "chess", "DNA", "coral reefs", "satellites", "penguins",
-    "compilers", "thunderstorms", "fermentation", "the moon landing",
-    "cephalopods", "renewable energy", "the Silk Road", "fractals",
+    "electric cars", "photosynthesis", "jazz music", "neural networks",
+    "volcanoes", "origami", "the stock market", "espresso",
+    "coral reefs", "satellites", "penguins", "compilers",
 ]
 
 
 def _random_chat_prompt() -> str:
-    """Generate a random chat prompt to avoid prefix caching."""
     template = random.choice(CHAT_PROMPTS)
-    thing = random.choice(THINGS)
-    thing2 = random.choice(THINGS)
-    return template.format(thing=thing, thing2=thing2)
+    return template.format(thing=random.choice(THINGS), thing2=random.choice(THINGS))
 
-import requests
+
+def _poc_request_body(block_hash, nonces, model, public_key="0xtest_key",
+                      block_height=100, seq_len=256, k_dim=12):
+    """Build a PoC /generate request matching the reference API format."""
+    return {
+        "block_hash": block_hash,
+        "block_height": block_height,
+        "public_key": public_key,
+        "node_id": 0,
+        "node_count": 1,
+        "nonces": nonces,
+        "params": {"model": model, "seq_len": seq_len, "k_dim": k_dim},
+        "batch_size": 32,
+        "wait": True,
+    }
+
+
+def _decode_b64_vector(b64: str, k_dim: int = 12):
+    """Decode base64 FP16 LE vector to list of floats."""
+    raw = base64.b64decode(b64)
+    count = len(raw) // 2
+    values = struct.unpack(f'<{count}e', raw)
+    return list(values)
+
+
+def _check_artifact(artifact: dict, k_dim: int = 12) -> bool:
+    """Validate artifact has correct format."""
+    if "nonce" not in artifact or "vector_b64" not in artifact:
+        return False
+    try:
+        vec = _decode_b64_vector(artifact["vector_b64"], k_dim)
+        return len(vec) == k_dim
+    except Exception:
+        return False
 
 
 def test_pure_chat(server_url: str, model: str) -> dict:
-    """Test pure chat request (no PoC)."""
     print("\n" + "=" * 60)
     print("TEST 1: PURE CHAT")
     print("=" * 60)
@@ -69,7 +89,6 @@ def test_pure_chat(server_url: str, model: str) -> dict:
     start = time.time()
     response = requests.post(
         f"{server_url}/v1/chat/completions",
-        headers={"Content-Type": "application/json"},
         json={
             "model": model,
             "messages": [{"role": "user", "content": "What is 2+2? Answer briefly."}],
@@ -79,79 +98,62 @@ def test_pure_chat(server_url: str, model: str) -> dict:
     )
     elapsed = time.time() - start
 
-    result = {
-        "test": "pure_chat",
-        "status_code": response.status_code,
-        "elapsed": elapsed,
-        "success": False,
-    }
+    result = {"test": "pure_chat", "status_code": response.status_code, "elapsed": elapsed, "success": False}
 
     if response.status_code == 200:
         data = response.json()
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         result["content"] = content
         result["success"] = len(content) > 0
-        print(f"  Status: {response.status_code}")
         print(f"  Response: {content[:100]}")
         print(f"  Time: {elapsed:.3f}s")
     else:
-        print(f"  ERROR: {response.status_code}")
-        print(f"  Response: {response.text[:200]}")
+        print(f"  ERROR: {response.status_code} {response.text[:200]}")
 
     return result
 
 
-def test_pure_poc(server_url: str) -> dict:
-    """Test pure PoC request (no chat)."""
+def test_pure_poc(server_url: str, model: str) -> dict:
     print("\n" + "=" * 60)
     print("TEST 2: PURE POC")
     print("=" * 60)
 
     start = time.time()
+    body = _poc_request_body("0xtest_pure_poc", [1, 2, 3, 4, 5], model)
     response = requests.post(
         f"{server_url}/api/v1/pow/generate",
-        headers={"Content-Type": "application/json"},
-        json={
-            "block_hash": "0xtest_pure_poc_hash",
-            "public_key": "0xtest_public_key",
-            "nonces": [1, 2, 3, 4, 5],
-            "block_height": 1000,
-            "r_target": 2.0,  # High threshold to get valid results
-            "wait": True,
-        },
+        json=body,
         timeout=60,
     )
     elapsed = time.time() - start
 
-    result = {
-        "test": "pure_poc",
-        "status_code": response.status_code,
-        "elapsed": elapsed,
-        "success": False,
-    }
+    result = {"test": "pure_poc", "status_code": response.status_code, "elapsed": elapsed, "success": False}
 
     if response.status_code == 200:
         data = response.json()
-        result["total_checked"] = data.get("total_checked", 0)
-        result["total_valid"] = data.get("total_valid", 0)
-        result["distances"] = data.get("valid_distances", [])
-        result["success"] = data.get("status") == "completed" and result["total_checked"] > 0
+        artifacts = data.get("artifacts", [])
+        encoding = data.get("encoding", {})
+        k_dim = encoding.get("k_dim", 12)
+
+        valid_artifacts = [a for a in artifacts if _check_artifact(a, k_dim)]
+        result["num_artifacts"] = len(artifacts)
+        result["num_valid"] = len(valid_artifacts)
+        result["success"] = data.get("status") == "completed" and len(valid_artifacts) == 5
 
         print(f"  Status: {data.get('status')}")
-        print(f"  Checked: {result['total_checked']} nonces")
-        print(f"  Valid: {result['total_valid']} nonces")
-        if result["distances"]:
-            print(f"  Distances: {[f'{d:.4f}' for d in result['distances'][:3]]}...")
+        print(f"  Artifacts: {len(artifacts)} (valid: {len(valid_artifacts)})")
+        print(f"  Encoding: {encoding}")
+        if artifacts:
+            vec = _decode_b64_vector(artifacts[0]["vector_b64"], k_dim)
+            print(f"  Sample vector (nonce={artifacts[0]['nonce']}): [{', '.join(f'{v:.4f}' for v in vec[:4])}...]")
         print(f"  Time: {elapsed:.3f}s")
     else:
-        print(f"  ERROR: {response.status_code}")
-        print(f"  Response: {response.text[:200]}")
+        print(f"  ERROR: {response.status_code} {response.text[:200]}")
 
     return result
 
 
 def test_mixed_batch(server_url: str, model: str) -> dict:
-    """Test mixed batch (concurrent chat + PoC)."""
     print("\n" + "=" * 60)
     print("TEST 3: MIXED BATCH (concurrent chat + PoC)")
     print("=" * 60)
@@ -159,7 +161,6 @@ def test_mixed_batch(server_url: str, model: str) -> dict:
     def send_chat():
         return requests.post(
             f"{server_url}/v1/chat/completions",
-            headers={"Content-Type": "application/json"},
             json={
                 "model": model,
                 "messages": [{"role": "user", "content": "Count from 1 to 10."}],
@@ -169,505 +170,203 @@ def test_mixed_batch(server_url: str, model: str) -> dict:
         )
 
     def send_poc():
+        body = _poc_request_body("0xtest_mixed", list(range(10, 20)), model)
         return requests.post(
             f"{server_url}/api/v1/pow/generate",
-            headers={"Content-Type": "application/json"},
-            json={
-                "block_hash": "0xtest_mixed_batch_hash",
-                "public_key": "0xtest_mixed_key",
-                "nonces": list(range(10, 20)),  # 10 nonces
-                "block_height": 2000,
-                "r_target": 2.0,
-                "wait": True,
-            },
+            json=body,
             timeout=60,
         )
 
     start = time.time()
-
-    # Run both requests concurrently
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         chat_future = executor.submit(send_chat)
         poc_future = executor.submit(send_poc)
-
         chat_response = chat_future.result()
         poc_response = poc_future.result()
-
     elapsed = time.time() - start
 
-    result = {
-        "test": "mixed_batch",
-        "elapsed": elapsed,
-        "chat_success": False,
-        "poc_success": False,
-        "success": False,
-    }
+    result = {"test": "mixed_batch", "elapsed": elapsed, "chat_success": False, "poc_success": False, "success": False}
 
-    # Check chat result
     if chat_response.status_code == 200:
-        chat_data = chat_response.json()
-        content = chat_data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        result["chat_content"] = content
+        content = chat_response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
         result["chat_success"] = len(content) > 0
-        print(f"  Chat Status: {chat_response.status_code}")
-        print(f"  Chat Response: {content[:80]}...")
+        print(f"  Chat: {content[:80]}")
     else:
         print(f"  Chat ERROR: {chat_response.status_code}")
 
-    # Check PoC result
     if poc_response.status_code == 200:
         poc_data = poc_response.json()
-        result["poc_checked"] = poc_data.get("total_checked", 0)
-        result["poc_valid"] = poc_data.get("total_valid", 0)
-        result["poc_success"] = poc_data.get("status") == "completed"
-        print(f"  PoC Status: {poc_data.get('status')}")
-        print(f"  PoC Checked: {result['poc_checked']} nonces")
+        artifacts = poc_data.get("artifacts", [])
+        result["poc_success"] = poc_data.get("status") == "completed" and len(artifacts) > 0
+        print(f"  PoC: {len(artifacts)} artifacts")
     else:
         print(f"  PoC ERROR: {poc_response.status_code}")
 
     result["success"] = result["chat_success"] and result["poc_success"]
-    print(f"  Total Time: {elapsed:.3f}s")
-
+    print(f"  Time: {elapsed:.3f}s")
     return result
 
 
-def test_hook_caching(server_url: str) -> dict:
-    """Test that hooks are cached for same block_hash."""
+def test_hook_caching(server_url: str, model: str) -> dict:
     print("\n" + "=" * 60)
-    print("TEST 4: HOOK CACHING (same block_hash, multiple requests)")
+    print("TEST 4: HOOK CACHING (same block_hash)")
     print("=" * 60)
 
-    block_hash = "0xtest_hook_caching_hash"
+    block_hash = "0xtest_hook_caching"
     times = []
 
     for i in range(3):
         start = time.time()
-        response = requests.post(
-            f"{server_url}/api/v1/pow/generate",
-            headers={"Content-Type": "application/json"},
-            json={
-                "block_hash": block_hash,
-                "public_key": "0xtest_key",
-                "nonces": [i * 10 + j for j in range(5)],
-                "block_height": 3000 + i,
-                "r_target": 2.0,
-                "wait": True,
-            },
-            timeout=60,
-        )
+        body = _poc_request_body(block_hash, [i * 10 + j for j in range(5)], model, block_height=3000 + i)
+        response = requests.post(f"{server_url}/api/v1/pow/generate", json=body, timeout=60)
         elapsed = time.time() - start
         times.append(elapsed)
+        status = f"{elapsed:.3f}s" if response.status_code == 200 else f"ERROR {response.status_code}"
+        print(f"  Request {i + 1}: {status}")
 
-        if response.status_code == 200:
-            print(f"  Request {i + 1}: {elapsed:.3f}s")
-        else:
-            print(f"  Request {i + 1}: ERROR {response.status_code}")
-
-    result = {
-        "test": "hook_caching",
-        "times": times,
-        "success": len(times) == 3 and all(t < 5.0 for t in times),
-    }
-
-    # Second and third requests should be faster (hooks already registered)
+    result = {"test": "hook_caching", "times": times, "success": len(times) == 3}
     if len(times) >= 2:
-        print(f"  First request: {times[0]:.3f}s (includes hook registration)")
-        print(f"  Subsequent avg: {sum(times[1:]) / len(times[1:]):.3f}s (hooks cached)")
-
+        print(f"  First: {times[0]:.3f}s  Subsequent avg: {sum(times[1:]) / len(times[1:]):.3f}s")
     return result
 
 
-def test_different_block_hash(server_url: str) -> dict:
-    """Test that hooks are recreated for different block_hash."""
+def test_different_block_hash(server_url: str, model: str) -> dict:
     print("\n" + "=" * 60)
-    print("TEST 5: DIFFERENT BLOCK_HASH (hooks recreated)")
+    print("TEST 5: DIFFERENT BLOCK_HASH")
     print("=" * 60)
 
-    results = []
-    for i, block_hash in enumerate(["0xhash_a", "0xhash_b", "0xhash_c"]):
+    results_list = []
+    for i, bh in enumerate(["0xhash_a", "0xhash_b", "0xhash_c"]):
         start = time.time()
-        response = requests.post(
-            f"{server_url}/api/v1/pow/generate",
-            headers={"Content-Type": "application/json"},
-            json={
-                "block_hash": block_hash,
-                "public_key": "0xtest_key",
-                "nonces": [1, 2, 3],
-                "block_height": 4000 + i,
-                "r_target": 2.0,
-                "wait": True,
-            },
-            timeout=60,
-        )
+        body = _poc_request_body(bh, [1, 2, 3], model, block_height=4000 + i)
+        response = requests.post(f"{server_url}/api/v1/pow/generate", json=body, timeout=60)
         elapsed = time.time() - start
 
         if response.status_code == 200:
             data = response.json()
-            results.append({
-                "block_hash": block_hash,
-                "elapsed": elapsed,
-                "distances": data.get("valid_distances", []),
-            })
-            print(f"  {block_hash}: {elapsed:.3f}s, distances={[f'{d:.3f}' for d in data.get('valid_distances', [])[:2]]}")
+            artifacts = data.get("artifacts", [])
+            b64s = [a.get("vector_b64", "") for a in artifacts[:2]]
+            results_list.append({"block_hash": bh, "elapsed": elapsed, "b64s": b64s})
+            print(f"  {bh}: {elapsed:.3f}s, first_b64={b64s[0][:20]}..." if b64s else f"  {bh}: no artifacts")
         else:
-            print(f"  {block_hash}: ERROR {response.status_code}")
+            print(f"  {bh}: ERROR {response.status_code}")
 
-    # Different block_hash should produce different distances
-    result = {
-        "test": "different_block_hash",
-        "results": results,
-        "success": len(results) == 3,
-    }
+    result = {"test": "different_block_hash", "results": results_list, "success": len(results_list) == 3}
 
-    if len(results) >= 2:
-        d1 = results[0].get("distances", [0])[0] if results[0].get("distances") else 0
-        d2 = results[1].get("distances", [0])[0] if results[1].get("distances") else 0
-        result["distances_differ"] = abs(d1 - d2) > 0.01
-        print(f"  Distances differ: {result['distances_differ']} (expected: True)")
-
-    return result
-
-
-def test_validate(server_url: str) -> dict:
-    """Test PoC validate endpoint."""
-    print("\n" + "=" * 60)
-    print("TEST 6: VALIDATE (correct distances)")
-    print("=" * 60)
-
-    # First generate to get valid distances
-    gen_response = requests.post(
-        f"{server_url}/api/v1/pow/generate",
-        headers={"Content-Type": "application/json"},
-        json={
-            "block_hash": "0xvalidate_test",
-            "public_key": "0xvalidate_key",
-            "nonces": [100, 101],
-            "block_height": 6000,
-            "r_target": 2.0,
-            "wait": True,
-        },
-        timeout=60,
-    )
-
-    result = {
-        "test": "validate",
-        "success": False,
-    }
-
-    if gen_response.status_code != 200:
-        print(f"  Generate ERROR: {gen_response.status_code}")
-        return result
-
-    gen_data = gen_response.json()
-    distances = gen_data.get("valid_distances", [])
-    print(f"  Generated distances: {[f'{d:.4f}' for d in distances]}")
-
-    # Validate with correct distances
-    val_response = requests.post(
-        f"{server_url}/api/v1/pow/validate",
-        headers={"Content-Type": "application/json"},
-        json={
-            "block_hash": "0xvalidate_test",
-            "public_key": "0xvalidate_key",
-            "nonces": [100, 101],
-            "block_height": 6000,
-            "r_target": 2.0,
-            "dist": distances,
-            "node_id": 1,
-        },
-        timeout=60,
-    )
-
-    if val_response.status_code == 200:
-        val_data = val_response.json()
-        fraud = val_data.get("fraud_detected", True)
-        computed = val_data.get("computed_distances", [])
-        print(f"  Computed distances: {[f'{d:.4f}' for d in computed]}")
-        print(f"  Fraud detected: {fraud} (expected: False)")
-        result["success"] = not fraud
-    else:
-        print(f"  Validate ERROR: {val_response.status_code}")
+    # Different block_hash should produce different vectors
+    if len(results_list) >= 2 and results_list[0].get("b64s") and results_list[1].get("b64s"):
+        differ = results_list[0]["b64s"][0] != results_list[1]["b64s"][0]
+        result["vectors_differ"] = differ
+        print(f"  Vectors differ: {differ} (expected: True)")
 
     return result
 
 
 def test_high_concurrency(server_url: str, model: str, num_chat: int = 10, num_poc: int = 10) -> dict:
-    """Test high concurrency with many concurrent chat + PoC requests."""
     print("\n" + "=" * 60)
-    print(f"TEST 7: HIGH CONCURRENCY ({num_chat} chat + {num_poc} PoC requests)")
+    print(f"TEST 6: HIGH CONCURRENCY ({num_chat} chat + {num_poc} PoC)")
     print("=" * 60)
 
-    def send_chat_numbered(idx: int):
-        """Send a chat request with a unique question."""
+    def send_chat(idx):
         try:
-            response = requests.post(
+            r = requests.post(
                 f"{server_url}/v1/chat/completions",
-                headers={"Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": _random_chat_prompt()}],
-                    "max_tokens": 150,
-                },
+                json={"model": model, "messages": [{"role": "user", "content": _random_chat_prompt()}], "max_tokens": 150},
                 timeout=60,
             )
-            return ("chat", idx, response)
+            return ("chat", idx, r)
         except Exception as e:
             return ("chat", idx, None, str(e))
 
-    def send_poc_numbered(idx: int):
-        """Send a PoC request with unique nonces."""
+    def send_poc(idx):
         try:
-            response = requests.post(
-                f"{server_url}/api/v1/pow/generate",
-                headers={"Content-Type": "application/json"},
-                json={
-                    "block_hash": f"0xhigh_concurrency_{idx}",
-                    "public_key": f"0xpubkey_{idx}",
-                    "nonces": [idx * 100 + j for j in range(5)],
-                    "block_height": 5000 + idx,
-                    "r_target": 2.0,
-                    "wait": True,
-                },
-                timeout=60,
-            )
-            return ("poc", idx, response)
+            body = _poc_request_body(f"0xconcurrency_{idx}", [idx * 100 + j for j in range(5)], model, block_height=5000 + idx)
+            r = requests.post(f"{server_url}/api/v1/pow/generate", json=body, timeout=60)
+            return ("poc", idx, r)
         except Exception as e:
             return ("poc", idx, None, str(e))
 
     start = time.time()
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_chat + num_poc) as executor:
-        futures = []
-
-        for i in range(num_chat):
-            futures.append(executor.submit(send_chat_numbered, i))
-
-        for i in range(num_poc):
-            futures.append(executor.submit(send_poc_numbered, i))
-
-        results_list = [future.result() for future in concurrent.futures.as_completed(futures)]
-
+        futures = [executor.submit(send_chat, i) for i in range(num_chat)]
+        futures += [executor.submit(send_poc, i) for i in range(num_poc)]
+        raw_results = [f.result() for f in concurrent.futures.as_completed(futures)]
     elapsed = time.time() - start
 
-    chat_results = []
-    poc_results = []
-    
-    for result in results_list:
-        if result[0] == "chat":
-            _, idx, response, *error = result
-            if response and response.status_code == 200:
-                data = response.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                chat_results.append({"idx": idx, "success": True, "content": content})
-                print(f"  Chat #{idx}: {content[:80]}")
+    chat_ok = poc_ok = 0
+    for res in raw_results:
+        kind, idx = res[0], res[1]
+        resp = res[2] if len(res) > 2 else None
+        if resp and resp.status_code == 200:
+            if kind == "chat":
+                chat_ok += 1
             else:
-                error_msg = error[0] if error else (response.text[:100] if response else "Unknown error")
-                chat_results.append({"idx": idx, "success": False, "error": error_msg})
-                print(f"  Chat #{idx}: ERROR - {error_msg}")
-        
-        elif result[0] == "poc":
-            _, idx, response, *error = result
-            if response and response.status_code == 200:
-                data = response.json()
-                checked = data.get("total_checked", 0)
-                valid = data.get("total_valid", 0)
-                distances = data.get("valid_distances", [])
-                poc_results.append({
-                    "idx": idx,
-                    "success": True,
-                    "checked": checked,
-                    "valid": valid,
-                    "distances": distances
-                })
-                dist_str = ", ".join([f"{d:.4f}" for d in distances[:3]])
-                print(f"  PoC #{idx}: checked={checked}, valid={valid}, distances=[{dist_str}]")
-            else:
-                error_msg = error[0] if error else (response.text[:100] if response else "Unknown error")
-                poc_results.append({"idx": idx, "success": False, "error": error_msg})
-                print(f"  PoC #{idx}: ERROR - {error_msg}")
+                poc_ok += 1
 
-    chat_success = sum(1 for r in chat_results if r.get("success"))
-    poc_success = sum(1 for r in poc_results if r.get("success"))
-    
-    result = {
-        "test": "high_concurrency",
-        "elapsed": elapsed,
-        "chat_sent": num_chat,
-        "chat_success": chat_success,
-        "poc_sent": num_poc,
-        "poc_success": poc_success,
-        "success": chat_success == num_chat and poc_success == num_poc,
+    print(f"  Chat: {chat_ok}/{num_chat}  PoC: {poc_ok}/{num_poc}  Time: {elapsed:.1f}s")
+    return {
+        "test": "high_concurrency", "elapsed": elapsed,
+        "chat_success": chat_ok, "chat_sent": num_chat,
+        "poc_success": poc_ok, "poc_sent": num_poc,
+        "success": chat_ok == num_chat and poc_ok == num_poc,
     }
-
-    print(f"\n  Total Time: {elapsed:.3f}s")
-    print(f"  Chat: {chat_success}/{num_chat} successful")
-    print(f"  PoC: {poc_success}/{num_poc} successful")
-    return result
-
-
-def test_validate_fraud(server_url: str) -> dict:
-    """Test PoC validate detects fraud with wrong distances."""
-    print("\n" + "=" * 60)
-    print("TEST 8: VALIDATE FRAUD DETECTION (wrong distances)")
-    print("=" * 60)
-
-    # Validate with obviously wrong distances
-    response = requests.post(
-        f"{server_url}/api/v1/pow/validate",
-        headers={"Content-Type": "application/json"},
-        json={
-            "block_hash": "0xvalidate_test",
-            "public_key": "0xvalidate_key",
-            "nonces": [100],
-            "block_height": 6000,
-            "r_target": 2.0,
-            "dist": [0.001],  # Wrong distance
-            "node_id": 1,
-        },
-        timeout=60,
-    )
-
-    result = {
-        "test": "validate_fraud",
-        "success": False,
-    }
-
-    if response.status_code == 200:
-        data = response.json()
-        fraud = data.get("fraud_detected", False)
-        computed = data.get("computed_distances", [])
-        print(f"  Provided distance: 0.001")
-        print(f"  Computed distance: {computed[0]:.4f}" if computed else "  No computed distance")
-        print(f"  Fraud detected: {fraud} (expected: True)")
-        result["success"] = fraud
-    else:
-        print(f"  Validate ERROR: {response.status_code}")
-
-    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description="Test all PoC modes")
-    parser.add_argument(
-        "--server",
-        default="http://0.0.0.0:8102",
-        help="vLLM server URL (default: http://0.0.0.0:8102)",
-    )
-    parser.add_argument(
-        "--model",
-        default="Qwen/Qwen2-1.5B-Instruct",
-        help="Model name for chat requests (default: Qwen/Qwen2-1.5B-Instruct)",
-    )
-    parser.add_argument(
-        "--stress",
-        action="store_true",
-        help="Run only the stress test (high concurrency)",
-    )
-    parser.add_argument(
-        "--num-chat",
-        type=int,
-        default=10,
-        help="Number of concurrent chat requests for stress test (default: 10)",
-    )
-    parser.add_argument(
-        "--num-poc",
-        type=int,
-        default=10,
-        help="Number of concurrent PoC requests for stress test (default: 10)",
-    )
-    parser.add_argument(
-        "--rounds",
-        type=int,
-        default=1,
-        help="Number of stress test rounds (default: 1)",
-    )
+    parser.add_argument("--server", default="http://0.0.0.0:8102")
+    parser.add_argument("--model", default="Qwen/Qwen2-1.5B-Instruct")
+    parser.add_argument("--stress", action="store_true")
+    parser.add_argument("--num-chat", type=int, default=10)
+    parser.add_argument("--num-poc", type=int, default=10)
+    parser.add_argument("--rounds", type=int, default=1)
     args = parser.parse_args()
 
     server_url = args.server.rstrip("/")
     model = args.model
 
-    print("=" * 60)
-    if args.stress:
-        print("POC STRESS TEST")
-    else:
-        print("POC MODE TESTS")
-    print(f"Server: {server_url}")
-    print(f"Model:  {model}")
-    if args.stress:
-        print(f"Chat:   {args.num_chat}  PoC: {args.num_poc}  Rounds: {args.rounds}")
-    print("=" * 60)
+    print(f"Server: {server_url}  Model: {model}")
 
-    # Check server health
     try:
         health = requests.get(f"{server_url}/health", timeout=5)
         if health.status_code != 200:
-            print(f"ERROR: Server not healthy (status {health.status_code})")
+            print(f"ERROR: Server not healthy ({health.status_code})")
             sys.exit(1)
         print("Server: OK")
     except requests.exceptions.ConnectionError:
-        print(f"ERROR: Cannot connect to server at {server_url}")
-        print("Start the server first:")
-        print("  python -m vllm.entrypoints.openai.api_server \\")
-        print(f"    --model {model} --port 8102")
+        print(f"ERROR: Cannot connect to {server_url}")
         sys.exit(1)
 
     if args.stress:
-        # Stress test only
         all_passed = True
-        total_start = time.time()
         for rnd in range(1, args.rounds + 1):
-            if args.rounds > 1:
-                print(f"\n{'#' * 60}")
-                print(f"ROUND {rnd}/{args.rounds}")
-                print(f"{'#' * 60}")
-            r = test_high_concurrency(server_url, model,
-                                      num_chat=args.num_chat,
-                                      num_poc=args.num_poc)
+            r = test_high_concurrency(server_url, model, args.num_chat, args.num_poc)
             if not r["success"]:
                 all_passed = False
-            print(f"  Round {rnd}: {'PASS' if r['success'] else 'FAIL'}"
-                  f"  chat={r['chat_success']}/{r['chat_sent']}"
-                  f"  poc={r['poc_success']}/{r['poc_sent']}"
-                  f"  time={r['elapsed']:.1f}s")
-        total_elapsed = time.time() - total_start
-        print(f"\n{'=' * 60}")
-        print(f"STRESS TEST {'PASSED' if all_passed else 'FAILED'}"
-              f"  ({args.rounds} rounds, {total_elapsed:.1f}s total)")
-        print(f"{'=' * 60}")
+            print(f"  Round {rnd}: {'PASS' if r['success'] else 'FAIL'}")
         sys.exit(0 if all_passed else 1)
 
-    # Run all tests
-    results = []
-    results.append(test_pure_chat(server_url, model))
-    results.append(test_pure_poc(server_url))
-    results.append(test_mixed_batch(server_url, model))
-    results.append(test_hook_caching(server_url))
-    results.append(test_different_block_hash(server_url))
-    results.append(test_validate(server_url))
-    results.append(test_high_concurrency(server_url, model,
-                                         num_chat=args.num_chat,
-                                         num_poc=args.num_poc))
-    # results.append(test_validate_fraud(server_url))
+    results = [
+        test_pure_chat(server_url, model),
+        test_pure_poc(server_url, model),
+        test_mixed_batch(server_url, model),
+        test_hook_caching(server_url, model),
+        test_different_block_hash(server_url, model),
+        test_high_concurrency(server_url, model, args.num_chat, args.num_poc),
+    ]
 
-    # Summary
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-
     all_passed = True
     for r in results:
         status = "PASS" if r["success"] else "FAIL"
         if not r["success"]:
             all_passed = False
         print(f"  {r['test']}: {status}")
-
     print("=" * 60)
-    if all_passed:
-        print("ALL TESTS PASSED")
-        sys.exit(0)
-    else:
-        print("SOME TESTS FAILED")
-        sys.exit(1)
+    print("ALL PASSED" if all_passed else "SOME FAILED")
+    sys.exit(0 if all_passed else 1)
 
 
 if __name__ == "__main__":

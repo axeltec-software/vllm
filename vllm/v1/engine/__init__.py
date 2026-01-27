@@ -124,7 +124,7 @@ class EngineCoreOutput(
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
     
-    # PoC: Output for PoC requests (nonce, distance, optional vector)
+    # PoC: Output for PoC requests (nonce, vector_b64)
     poc_output: dict[str, Any] | None = None
 
     # The number of NaNs in logits.

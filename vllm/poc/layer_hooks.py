@@ -145,9 +145,6 @@ class LayerHouseholderHook:
         vLLM decoder layers typically return (hidden_states, residual).
         We must transform BOTH to prevent residual connections from
         preserving untransformed values.
-
-        EXPERIMENT: Also normalize to unit sphere at each layer to break
-        magnitude-based structure accumulation.
         """
         def hook(module, input, output):
             poc_mask = get_poc_position_mask()
@@ -161,9 +158,8 @@ class LayerHouseholderHook:
 
             v = self.reflection_vectors[layer_idx]
 
-            def normalize_and_transform(x):
-                x_norm = x / (x.norm(dim=-1, keepdim=True) + 1e-8)
-                return apply_householder(x_norm, v.to(x_norm.dtype))
+            def transform(x):
+                return apply_householder(x, v.to(x.dtype))
 
             if isinstance(output, tuple):
                 if len(output) >= 2:
@@ -171,15 +167,15 @@ class LayerHouseholderHook:
                     hidden = output[0]
                     residual = output[1]
                     rest = output[2:] if len(output) > 2 else ()
-                    transformed_hidden = normalize_and_transform(hidden)
-                    transformed_residual = normalize_and_transform(residual)
+                    transformed_hidden = transform(hidden)
+                    transformed_residual = transform(residual)
                     return (transformed_hidden, transformed_residual) + rest
                 else:
                     hidden = output[0]
-                    transformed = normalize_and_transform(hidden)
+                    transformed = transform(hidden)
                     return (transformed,)
             else:
-                transformed = normalize_and_transform(output)
+                transformed = transform(output)
                 return transformed
 
         return hook
@@ -223,9 +219,7 @@ class LayerHouseholderHook:
                 return x.view(original_shape) if len(original_shape) == 3 else x
 
             poc_hidden = x[poc_indices]
-
-            poc_norm = poc_hidden / (poc_hidden.norm(dim=-1, keepdim=True) + 1e-8)
-            poc_transformed = apply_householder(poc_norm, v.to(poc_norm.dtype))
+            poc_transformed = apply_householder(poc_hidden, v.to(poc_hidden.dtype))
 
             result = x.clone()
             result[poc_indices] = poc_transformed

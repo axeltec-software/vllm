@@ -102,10 +102,8 @@ PoolerOutput = torch.Tensor | list[torch.Tensor]
 
 @dataclass
 class PoCOutput:
-    """Output for a single PoC (Proof of Compute) request."""
     nonce: int
-    distance: float
-    vector: list[float] | None = None
+    vector_b64: str
 
 
 @dataclass
@@ -178,7 +176,6 @@ class ModelRunnerOutput:
     num_nans_in_logits: dict[str, int] | None = None
 
     # PoC: req_id -> PoCOutput
-    # Contains distance and optional vector for PoC requests
     poc_outputs: dict[str, PoCOutput] | None = None
 
 # ModelRunnerOutput wrapper for async scheduling.

@@ -22,15 +22,14 @@ from vllm.v1.outputs import PoCOutput
 
 from .gpu_random import (
     generate_inputs,
-    generate_target,
     random_pick_indices,
     generate_haar_orthogonal_matrices,
 )
+from .data import encode_vector
 
 logger = init_logger(__name__)
 
-# Number of dimensions to pick for distance computation
-POC_PICK_K_DIMS = 12
+DEFAULT_K_DIM = 12
 
 
 @contextmanager
@@ -142,14 +141,11 @@ def execute_poc_batch(
     is_tp_driver = tp_group.rank_in_group == 0
     
     # Extract PoC parameters from requests
-    # All requests should have the same block_hash, public_key, seq_len, r_target
-    # (they're from the same PoC round), but different nonces
     first_poc = poc_requests[0].poc_params
     block_hash = first_poc.block_hash
     public_key = first_poc.public_key
     seq_len = first_poc.seq_len
-    r_target = first_poc.r_target
-    return_vectors = first_poc.return_vectors
+    k_dim = first_poc.k_dim
     
     nonces = [req.poc_params.nonce for req in poc_requests]
     batch_size = len(nonces)
@@ -176,15 +172,14 @@ def execute_poc_batch(
                 "seq_len": seq_len,
                 "hidden_size": hidden_size,
                 "nonces": nonces,
-                "return_vectors": return_vectors,
+                "k_dim": k_dim,
             }, src=0)
         else:
-            # Non-driver: block here until driver broadcasts
             broadcast_data = broadcast_tensor_dict(src=0)
             seq_len = int(broadcast_data["seq_len"])
             hidden_size = int(broadcast_data["hidden_size"])
             nonces = list(broadcast_data["nonces"])
-            return_vectors = bool(broadcast_data["return_vectors"])
+            k_dim = int(broadcast_data["k_dim"])
             batch_size = len(nonces)
     
     # Generate embeddings on first PP rank, receive intermediate tensors on others
@@ -274,24 +269,21 @@ def execute_poc_batch(
     last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
     
     # Per-nonce k-dim pick + Haar rotation
-    indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, POC_PICK_K_DIMS, device)
+    indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, k_dim, device)
     xk = torch.gather(last_hidden, 1, indices)
-    
-    Q = generate_haar_orthogonal_matrices(block_hash, public_key, nonces, POC_PICK_K_DIMS, device, dtype=xk.dtype)
+
+    Q = generate_haar_orthogonal_matrices(block_hash, public_key, nonces, k_dim, device, dtype=xk.dtype)
     yk = torch.bmm(Q, xk.unsqueeze(-1)).squeeze(-1)
-    
-    # Target in k-dim space (per-nonce)
-    target = generate_target(block_hash, public_key, POC_PICK_K_DIMS, device)
-    
-    # Normalize and compute distances
+
+    # Normalize
     yk = yk / (yk.norm(dim=-1, keepdim=True) + 1e-8)
-    target = target / (target.norm(dim=-1, keepdim=True) + 1e-8)
-    distances = (yk - target).norm(dim=-1)
-    
+
+    # Convert to FP16 for artifact encoding
+    vectors_f16 = yk.half().cpu().numpy()
+
     torch.cuda.synchronize()
     t_post_end = time.perf_counter()
-    
-    # Log timing results
+
     t_input = t_input_end - t_input_start
     t_fwd = t_fwd_end - t_fwd_start
     t_post = t_post_end - t_post_start
@@ -301,16 +293,13 @@ def execute_poc_batch(
         f"input_gen={t_input:.4f}s, model_fwd={t_fwd:.4f}s, postproc={t_post:.4f}s, "
         f"total={t_total:.4f}s"
     )
-    
-    # Create PoCOutput objects
+
     results = []
     for i, nonce in enumerate(nonces):
-        distance = float(distances[i].item())
-        vector = yk[i].cpu().tolist() if return_vectors else None
+        vector_b64 = encode_vector(vectors_f16[i])
         results.append(PoCOutput(
             nonce=nonce,
-            distance=distance,
-            vector=vector
+            vector_b64=vector_b64,
         ))
 
     return results
