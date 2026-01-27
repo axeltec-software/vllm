@@ -4,7 +4,7 @@
 Usage:
     # Start vLLM server first:
     python -m vllm.entrypoints.openai.api_server \
-        --model Qwen/Qwen3-0.6B \
+        --model Qwen/Qwen3-8B-FP8 \
         --port 5002 \
         --gpu-memory-utilization 0.5 \
         --max-model-len 4096
@@ -37,7 +37,7 @@ def test_pure_chat(server_url: str) -> dict:
         f"{server_url}/v1/chat/completions",
         headers={"Content-Type": "application/json"},
         json={
-            "model": "Qwen/Qwen3-0.6B",
+            "model": "Qwen/Qwen3-8B-FP8",
             "messages": [{"role": "user", "content": "What is 2+2? Answer briefly."}],
             "max_tokens": 20,
         },
@@ -127,7 +127,7 @@ def test_mixed_batch(server_url: str) -> dict:
             f"{server_url}/v1/chat/completions",
             headers={"Content-Type": "application/json"},
             json={
-                "model": "Qwen/Qwen3-0.6B",
+                "model": "Qwen/Qwen3-8B-FP8",
                 "messages": [{"role": "user", "content": "Count from 1 to 10."}],
                 "max_tokens": 50,
             },
@@ -357,10 +357,124 @@ def test_validate(server_url: str) -> dict:
     return result
 
 
+def test_high_concurrency(server_url: str, num_chat: int = 10, num_poc: int = 10) -> dict:
+    """Test high concurrency with many concurrent chat + PoC requests."""
+    print("\n" + "=" * 60)
+    print(f"TEST 7: HIGH CONCURRENCY ({num_chat} chat + {num_poc} PoC requests)")
+    print("=" * 60)
+
+    def send_chat_numbered(idx: int):
+        """Send a chat request with a unique question."""
+        try:
+            response = requests.post(
+                f"{server_url}/v1/chat/completions",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "model": "Qwen/Qwen3-8B-FP8",
+                    "messages": [{"role": "user", "content": f"What is {idx} + {idx}? Answer briefly."}],
+                    "max_tokens": 150,
+                },
+                timeout=60,
+            )
+            return ("chat", idx, response)
+        except Exception as e:
+            return ("chat", idx, None, str(e))
+
+    def send_poc_numbered(idx: int):
+        """Send a PoC request with unique nonces."""
+        try:
+            response = requests.post(
+                f"{server_url}/api/v1/pow/generate",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "block_hash": f"0xhigh_concurrency_{idx}",
+                    "public_key": f"0xpubkey_{idx}",
+                    "nonces": [idx * 100 + j for j in range(5)],
+                    "block_height": 5000 + idx,
+                    "r_target": 2.0,
+                    "wait": True,
+                },
+                timeout=60,
+            )
+            return ("poc", idx, response)
+        except Exception as e:
+            return ("poc", idx, None, str(e))
+
+    start = time.time()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_chat + num_poc) as executor:
+        futures = []
+
+        for i in range(num_chat):
+            futures.append(executor.submit(send_chat_numbered, i))
+
+        for i in range(num_poc):
+            futures.append(executor.submit(send_poc_numbered, i))
+
+        results_list = [future.result() for future in concurrent.futures.as_completed(futures)]
+
+    elapsed = time.time() - start
+
+    chat_results = []
+    poc_results = []
+    
+    for result in results_list:
+        if result[0] == "chat":
+            _, idx, response, *error = result
+            if response and response.status_code == 200:
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                chat_results.append({"idx": idx, "success": True, "content": content})
+                print(f"  Chat #{idx}: {content[:80]}")
+            else:
+                error_msg = error[0] if error else (response.text[:100] if response else "Unknown error")
+                chat_results.append({"idx": idx, "success": False, "error": error_msg})
+                print(f"  Chat #{idx}: ERROR - {error_msg}")
+        
+        elif result[0] == "poc":
+            _, idx, response, *error = result
+            if response and response.status_code == 200:
+                data = response.json()
+                checked = data.get("total_checked", 0)
+                valid = data.get("total_valid", 0)
+                distances = data.get("valid_distances", [])
+                poc_results.append({
+                    "idx": idx,
+                    "success": True,
+                    "checked": checked,
+                    "valid": valid,
+                    "distances": distances
+                })
+                dist_str = ", ".join([f"{d:.4f}" for d in distances[:3]])
+                print(f"  PoC #{idx}: checked={checked}, valid={valid}, distances=[{dist_str}]")
+            else:
+                error_msg = error[0] if error else (response.text[:100] if response else "Unknown error")
+                poc_results.append({"idx": idx, "success": False, "error": error_msg})
+                print(f"  PoC #{idx}: ERROR - {error_msg}")
+
+    chat_success = sum(1 for r in chat_results if r.get("success"))
+    poc_success = sum(1 for r in poc_results if r.get("success"))
+    
+    result = {
+        "test": "high_concurrency",
+        "elapsed": elapsed,
+        "chat_sent": num_chat,
+        "chat_success": chat_success,
+        "poc_sent": num_poc,
+        "poc_success": poc_success,
+        "success": chat_success == num_chat and poc_success == num_poc,
+    }
+
+    print(f"\n  Total Time: {elapsed:.3f}s")
+    print(f"  Chat: {chat_success}/{num_chat} successful")
+    print(f"  PoC: {poc_success}/{num_poc} successful")
+    return result
+
+
 def test_validate_fraud(server_url: str) -> dict:
     """Test PoC validate detects fraud with wrong distances."""
     print("\n" + "=" * 60)
-    print("TEST 7: VALIDATE FRAUD DETECTION (wrong distances)")
+    print("TEST 8: VALIDATE FRAUD DETECTION (wrong distances)")
     print("=" * 60)
 
     # Validate with obviously wrong distances
@@ -425,18 +539,19 @@ def main():
         print(f"ERROR: Cannot connect to server at {server_url}")
         print("Start the server first:")
         print("  python -m vllm.entrypoints.openai.api_server \\")
-        print("    --model Qwen/Qwen3-0.6B --port 5002")
+        print("    --model Qwen/Qwen3-8B-FP8 --port 5002")
         sys.exit(1)
 
     # Run all tests
     results = []
-    results.append(test_pure_chat(server_url))
-    results.append(test_pure_poc(server_url))
-    results.append(test_mixed_batch(server_url))
-    results.append(test_hook_caching(server_url))
-    results.append(test_different_block_hash(server_url))
-    results.append(test_validate(server_url))
-    results.append(test_validate_fraud(server_url))
+    # results.append(test_pure_chat(server_url))
+    # results.append(test_pure_poc(server_url))
+    # results.append(test_mixed_batch(server_url))
+    # results.append(test_hook_caching(server_url))
+    # results.append(test_different_block_hash(server_url))
+    # results.append(test_validate(server_url))
+    results.append(test_high_concurrency(server_url, num_chat=10, num_poc=10))
+    # results.append(test_validate_fraud(server_url))
 
     # Summary
     print("\n" + "=" * 60)
