@@ -2512,6 +2512,50 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             model_kwargs,
         )
 
+    def _compute_logits_with_poc_filter(
+            self,
+            sample_hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        mixed_batch_info = getattr(self, '_mixed_batch_info', None)
+        if not (mixed_batch_info and mixed_batch_info.get('poc_req_ids')):
+            return self.model.compute_logits(sample_hidden_states)
+
+        poc_req_ids = mixed_batch_info['poc_req_ids']
+        req_ids = self.input_batch.req_ids
+        num_reqs = len(req_ids)
+        num_samples = sample_hidden_states.shape[0]
+
+        if num_samples != num_reqs:
+            logger.warning(
+                f"PoC logits filter: sample_hidden_states={num_samples} "
+                f"!= num_reqs={num_reqs}, skipping filter"
+            )
+            return self.model.compute_logits(sample_hidden_states)
+
+        chat_mask = torch.tensor(
+            [req_id not in poc_req_ids for req_id in req_ids[:num_reqs]],
+            dtype=torch.bool,
+            device=sample_hidden_states.device
+        )
+
+        if chat_mask.any():
+            chat_hidden_states = sample_hidden_states[chat_mask]
+            chat_logits = self.model.compute_logits(chat_hidden_states)
+            logits = torch.zeros(
+                (num_reqs, chat_logits.shape[-1]),
+                dtype=chat_logits.dtype,
+                device=chat_logits.device
+            )
+            logits[chat_mask] = chat_logits
+            return logits
+
+        vocab_size = self.model_config.get_vocab_size()
+        return torch.zeros(
+            (num_reqs, vocab_size),
+            dtype=sample_hidden_states.dtype,
+            device=sample_hidden_states.device
+        )
+
     def _filter_sampling_metadata_for_chat(
             self,
             sampling_metadata,
@@ -3255,38 +3299,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-
-                mixed_batch_info = getattr(self, '_mixed_batch_info', None)
-                if mixed_batch_info and mixed_batch_info.get('poc_req_ids'):
-                    poc_req_ids = mixed_batch_info['poc_req_ids']
-                    req_ids = self.input_batch.req_ids
-                    num_reqs = len(req_ids)
-
-                    chat_mask = torch.tensor(
-                        [req_id not in poc_req_ids for req_id in req_ids[:num_reqs]],
-                        dtype=torch.bool,
-                        device=sample_hidden_states.device
-                    )
-
-                    if chat_mask.any():
-                        chat_hidden_states = sample_hidden_states[chat_mask]
-                        chat_logits = self.model.compute_logits(chat_hidden_states)
-
-                        logits = torch.zeros(
-                            (num_reqs, chat_logits.shape[-1]),
-                            dtype=chat_logits.dtype,
-                            device=chat_logits.device
-                        )
-                        logits[chat_mask] = chat_logits
-                    else:
-                        vocab_size = self.model_config.get_vocab_size()
-                        logits = torch.zeros(
-                            (num_reqs, vocab_size),
-                            dtype=sample_hidden_states.dtype,
-                            device=sample_hidden_states.device
-                        )
-                else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                logits = self._compute_logits_with_poc_filter(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -3306,37 +3319,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     logits = None
                 else:
                     sample_hidden_states = hidden_states[logits_indices]
-
-                    mixed_batch_info = getattr(self, '_mixed_batch_info', None)
-                    if mixed_batch_info and mixed_batch_info.get('poc_req_ids'):
-                        poc_req_ids = mixed_batch_info['poc_req_ids']
-                        req_ids = self.input_batch.req_ids
-                        num_reqs = len(req_ids)
-
-                        chat_mask = torch.tensor(
-                            [req_id not in poc_req_ids for req_id in req_ids[:num_reqs]],
-                            dtype=torch.bool,
-                            device=sample_hidden_states.device
-                        )
-
-                        if chat_mask.any():
-                            chat_hidden_states = sample_hidden_states[chat_mask]
-                            chat_logits = self.model.compute_logits(chat_hidden_states)
-                            logits = torch.zeros(
-                                (num_reqs, chat_logits.shape[-1]),
-                                dtype=chat_logits.dtype,
-                                device=chat_logits.device
-                            )
-                            logits[chat_mask] = chat_logits
-                        else:
-                            vocab_size = self.model_config.get_vocab_size()
-                            logits = torch.zeros(
-                                (num_reqs, vocab_size),
-                                dtype=sample_hidden_states.dtype,
-                                device=sample_hidden_states.device
-                            )
-                    else:
-                        logits = self.model.compute_logits(sample_hidden_states)
+                    logits = self._compute_logits_with_poc_filter(sample_hidden_states)
 
                 model_output_broadcast_data = {}
                 if logits is not None:
