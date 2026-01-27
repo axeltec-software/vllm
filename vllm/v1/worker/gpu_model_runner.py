@@ -2531,6 +2531,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         def filter_tensor(t, dim=0):
             if t is None:
                 return None
+            # Safety: skip filtering if tensor shape doesn't match mask
+            if t.shape[0] != chat_mask.shape[0]:
+                logger.warning(
+                    f"filter_tensor: mask shape {chat_mask.shape[0]} != "
+                    f"tensor shape {t.shape}, skipping filter"
+                )
+                return t
             return t[chat_mask] if dim == 0 else t[chat_mask, :]
 
         new_generators = {}
@@ -2693,7 +2700,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Update output token ids with tokens sampled in last step
             # if async scheduling and required by current sampling params.
             self.input_batch.update_async_output_token_ids()
-            return self.sampler(
+            sampler_output = self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
@@ -2702,6 +2709,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampler_output = self._expand_sampler_output_for_poc(
                     sampler_output, chat_mask, chat_indices, num_total_reqs
                 )
+
+            return sampler_output
         else:
             # When indexing with a tensor (bonus_logits_indices), PyTorch
             # creates a new tensor with separate storage from the original
