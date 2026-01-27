@@ -49,17 +49,17 @@ class EngineCoreRequest(
     gc=False,
 ):  # type: ignore[call-arg]
     request_id: str
-    prompt_token_ids: Optional[list[int]]
-    mm_features: Optional[list[MultiModalFeatureSpec]]
-    sampling_params: Optional[SamplingParams]
-    pooling_params: Optional[PoolingParams]
-    poc_params: Optional[PoCParams]
-    eos_token_id: Optional[int]
+    prompt_token_ids: list[int] | None
+    mm_features: list[MultiModalFeatureSpec] | None
+    sampling_params: SamplingParams | None
+    pooling_params: PoolingParams | None
+    eos_token_id: int | None
     arrival_time: float
     lora_request: LoRARequest | None
     cache_salt: str | None
     data_parallel_rank: int | None
     prompt_embeds: torch.Tensor | None = None
+    poc_params: PoCParams | None = None
 
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.
@@ -125,7 +125,7 @@ class EngineCoreOutput(
     num_cached_tokens: int = 0
     
     # PoC: Output for PoC requests (nonce, distance, optional vector)
-    poc_output: Optional[dict[str, Any]] = None
+    poc_output: dict[str, Any] | None = None
 
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.

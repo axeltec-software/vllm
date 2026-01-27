@@ -17,9 +17,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.v1.engine import FinishReason
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
-    compute_encoder_budget,
+    compute_encoder_budget
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
@@ -383,9 +384,12 @@ class Scheduler(SchedulerInterface):
                         self.waiting.pop_request()
                         self.running.append(request)
                         request.status = RequestStatus.RUNNING
-                        
+
                         scheduled_new_reqs.append(request)
                         num_scheduled_tokens[request.request_id] = num_new_tokens
+                        req_to_new_blocks[request.request_id] = KVCacheBlocks(
+                            blocks=tuple([] for _ in range(self.kv_cache_manager.num_kv_cache_groups))
+                        )
                         token_budget -= num_new_tokens
 
                         if self.log_stats:

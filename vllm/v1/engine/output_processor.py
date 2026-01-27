@@ -158,15 +158,24 @@ class RequestState:
             top_p = sampling_params.top_p
             n = sampling_params.n
             temperature = sampling_params.temperature
-        else:
+        elif request.pooling_params is not None:
             logprobs_processor = None
             detokenizer = None
             max_tokens_param = None
             top_p = None
             n = None
             temperature = None
-            assert request.pooling_params is not None
             output_kind = request.pooling_params.output_kind
+        else:
+            # PoC request - no sampling or pooling params
+            from vllm.sampling_params import RequestOutputKind
+            logprobs_processor = None
+            detokenizer = None
+            max_tokens_param = None
+            top_p = None
+            n = None
+            temperature = None
+            output_kind = RequestOutputKind.FINAL_ONLY
 
         return cls(
             request_id=request.request_id,

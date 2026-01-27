@@ -573,6 +573,40 @@ class FlashAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
+        # Check for prefill-only mode (e.g., PoC) where we skip KV cache
+        is_prefill_only = (
+            key is not None and value is not None and
+            attn_metadata.block_table.shape[1] == 0 and
+            attn_metadata.max_query_len == attn_metadata.max_seq_len
+        )
+
+        if is_prefill_only:
+            cu_seqlens_q = attn_metadata.query_start_loc
+            max_seqlen_q = attn_metadata.max_query_len
+
+            descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+
+            flash_attn_varlen_func(
+                q=query[:num_actual_tokens],
+                k=key[:num_actual_tokens],
+                v=value[:num_actual_tokens],
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_q,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=self.sliding_window,
+                softcap=self.logits_soft_cap,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=layer._q_scale.expand(descale_shape),
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+            )
+            return output
+
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
         # in KV cache.

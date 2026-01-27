@@ -105,7 +105,7 @@ class PoCOutput:
     """Output for a single PoC (Proof of Compute) request."""
     nonce: int
     distance: float
-    vector: Optional[list[float]] = None
+    vector: list[float] | None = None
 
 
 @dataclass
@@ -179,7 +179,7 @@ class ModelRunnerOutput:
 
     # PoC: req_id -> PoCOutput
     # Contains distance and optional vector for PoC requests
-    poc_outputs: Optional[dict[str, PoCOutput]] = None
+    poc_outputs: dict[str, PoCOutput] | None = None
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from typing_extensions import deprecated
 
 from vllm._bc_linter import bc_linter_include
-
+from vllm.poc.poc_params import PoCParams
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
     from vllm.lora.request import LoRARequest
     from vllm.multimodal.inputs import MultiModalFeatureSpec
+    
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request
@@ -41,6 +42,7 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
+    poc_params: PoCParams | None = None
 
     @classmethod
     def from_request(
@@ -58,6 +60,7 @@ class NewRequestData:
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
+            poc_params=request.poc_params,
         )
 
     def __repr__(self) -> str:
@@ -186,7 +189,7 @@ class SchedulerOutput:
     pending_structured_output_tokens: bool = False
 
     # KV Cache Connector metadata.
-    kv_connector_metadata: Optional[KVConnectorMetadata] = None
+    kv_connector_metadata: KVConnectorMetadata | None = None
 
     poc_req_ids: set[str] = None
     

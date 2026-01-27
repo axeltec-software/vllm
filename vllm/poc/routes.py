@@ -1,4 +1,35 @@
-"""PoC (Proof of Compute) API routes for vLLM server."""
+"""PoC (Proof of Compute) API routes for vLLM server.
+
+API Endpoints:
+    POST /api/v1/pow/generate - Generate PoC distances for nonces
+    POST /api/v1/pow/compute  - Compute single nonce via scheduler (mixed batch)
+    POST /api/v1/pow/validate - Validate nonces against expected distances
+    GET  /api/v1/pow/status   - Get generation status
+
+Request Modes:
+    The /generate endpoint supports two modes via the `wait` parameter:
+
+    1. Async mode (wait=false, default):
+       - Returns immediately with {"status": "queued", "request_id": "...", "poll_url": "..."}
+       - Poll GET /api/v1/pow/status/{request_id} to check progress
+       - Optional: provide callback_url for result notification
+
+    2. Sync mode (wait=true):
+       - Blocks until all nonces are processed
+       - Returns {"status": "completed", "valid_nonces": [...], ...}
+
+Example:
+    curl -X POST http://localhost:8000/api/v1/pow/generate \\
+        -H "Content-Type: application/json" \\
+        -d '{
+            "block_hash": "0xabc",
+            "block_height": 100,
+            "public_key": "0xdef",
+            "r_target": 1.5,
+            "nonces": [1, 2, 3],
+            "wait": true
+        }'
+"""
 import asyncio
 import time
 import uuid
@@ -53,7 +84,21 @@ class PoCValidateRequest(BaseModel):
 
 
 class PoCGenerateRequest(BaseModel):
-    """Request to generate distances for specific nonces."""
+    """Request to generate distances for specific nonces.
+
+    Args:
+        block_hash: Hex string of block hash (e.g., "0xabc123")
+        block_height: Block height for deterministic seed
+        public_key: Hex string of node's public key
+        r_target: Distance threshold - nonces with distance < r_target are valid
+        nonces: List of nonces to check
+        node_id: Node identifier (default 0)
+        seq_len: Sequence length for embeddings (default 256)
+        batch_size: Processing batch size (default 32)
+        callback_url: Optional URL for async result callback
+        wait: If True, block until complete (recommended for V1 engine)
+        return_vectors: If True, include output vectors in response (requires wait=True)
+    """
     block_hash: str
     block_height: int
     public_key: str
@@ -63,8 +108,8 @@ class PoCGenerateRequest(BaseModel):
     seq_len: int = 256
     batch_size: int = 32
     callback_url: Optional[str] = None
-    wait: bool = False  # If True, block until all nonces are processed
-    return_vectors: bool = False  # If True, return output vectors (requires wait=True)
+    wait: bool = False
+    return_vectors: bool = False
 
 
 class PoCComputeRequest(BaseModel):
@@ -382,12 +427,12 @@ async def run_one_batch(request: Request) -> dict:
 @router.get("/status", response_model=PoCStatusResponse)
 async def get_status(request: Request) -> PoCStatusResponse:
     """Get current PoC status.
-    
+
     Note: V1 doesn't have stateful PoC tracking. Returns empty status.
     """
     await check_poc_enabled(request)
     engine_client = await get_engine_client(request)
-    
+
     # In V0: engine_client.poc_request("status", {})
     # In V1: No state to query
     return PoCStatusResponse(
@@ -399,6 +444,43 @@ async def get_status(request: Request) -> PoCStatusResponse:
         elapsed_seconds=0.0,
         rate_per_second=0.0
     )
+
+
+@router.get("/status/{request_id}")
+async def get_request_status(request: Request, request_id: str) -> dict:
+    """Get status of a specific async PoC request.
+
+    Poll this endpoint after submitting a request with wait=false.
+
+    Returns:
+        - status: "running", "completed", or "failed"
+        - When completed: valid_nonces, valid_distances, total_valid, etc.
+    """
+    app_id = id(request.app)
+
+    if app_id not in _poc_tasks or request_id not in _poc_tasks[app_id]:
+        raise HTTPException(status_code=404, detail=f"Request {request_id} not found")
+
+    task_state = _poc_tasks[app_id][request_id]
+
+    response = {
+        "request_id": request_id,
+        "status": task_state["status"],
+        "total_nonces": task_state.get("total_nonces", 0),
+        "completed": task_state.get("completed", 0),
+    }
+
+    if task_state["status"] == "completed":
+        response.update({
+            "total_valid": task_state.get("total_valid", 0),
+            "valid_nonces": task_state.get("valid_nonces", []),
+            "valid_distances": task_state.get("valid_distances", []),
+            "elapsed_seconds": task_state.get("completed_at", 0) - task_state.get("started_at", 0),
+        })
+    elif task_state["status"] == "failed":
+        response["error"] = task_state.get("error", "Unknown error")
+
+    return response
 
 
 @router.post("/validate")
@@ -437,11 +519,13 @@ async def validate_nonces(request: Request, body: PoCValidateRequest) -> dict:
             ):
                 if output.finished:
                     if hasattr(output, 'poc_output') and output.poc_output:
-                        computed_distances.append(output.poc_output.distance)
+                        poc_out = output.poc_output
+                        dist = poc_out['distance'] if isinstance(poc_out, dict) else poc_out.distance
+                        computed_distances.append(dist)
                         # Check if distance matches (within tolerance)
                         if i < len(body.dist):
                             expected = body.dist[i]
-                            computed = output.poc_output.distance
+                            computed = dist
                             if abs(computed - expected) > 0.01:  # 1% tolerance
                                 fraud_detected = True
         except Exception as e:
@@ -522,24 +606,33 @@ async def generate_nonces(request: Request, body: PoCGenerateRequest) -> dict:
                 if output.finished:
                     # In V1, output has .poc_output (not .outputs like V0)
                     if hasattr(output, 'poc_output') and output.poc_output:
-                        result = {
-                            "nonce": output.poc_output.nonce,
-                            "distance": output.poc_output.distance,
-                        }
-                        if body.return_vectors and output.poc_output.vector:
-                            result["vector"] = output.poc_output.vector
+                        poc_out = output.poc_output
+                        # Handle both dict and object access
+                        if isinstance(poc_out, dict):
+                            result = {
+                                "nonce": poc_out.get('nonce', nonce),
+                                "distance": poc_out.get('distance'),
+                            }
+                            if body.return_vectors and poc_out.get('vector'):
+                                result["vector"] = poc_out['vector']
+                        else:
+                            result = {
+                                "nonce": poc_out.nonce,
+                                "distance": poc_out.distance,
+                            }
+                            if body.return_vectors and poc_out.vector:
+                                result["vector"] = poc_out.vector
                         return result
             return {"nonce": nonce, "distance": None, "error": "No output"}
         except Exception as e:
-            logger.error(f"Error computing nonce {nonce}: {e}")
+            import traceback
+            logger.error(f"Error computing nonce {nonce}: {e}\n{traceback.format_exc()}")
             return {"nonce": nonce, "distance": None, "error": str(e)}
     
     if body.wait:
-        # Process all nonces concurrently through scheduler
         tasks = [compute_single_nonce(nonce) for nonce in body.nonces]
         results = await asyncio.gather(*tasks)
-        
-        # Filter valid results
+
         valid_results = [r for r in results if r.get("distance") is not None]
         valid_under_target = [r for r in valid_results if r["distance"] < body.r_target]
         
@@ -556,12 +649,63 @@ async def generate_nonces(request: Request, body: PoCGenerateRequest) -> dict:
             response["all_results"] = results
         
         return response
-    
-    # Non-blocking: fire and forget (for callback-based usage)
+
+    request_id = str(uuid.uuid4())
+    app_id = id(request.app)
+
+    if app_id not in _poc_tasks:
+        _poc_tasks[app_id] = {}
+
+    _poc_tasks[app_id][request_id] = {
+        "status": "running",
+        "started_at": time.time(),
+        "total_nonces": len(body.nonces),
+        "completed": 0,
+        "results": [],
+    }
+
+    async def process_in_background():
+        """Background task to process all nonces."""
+        task_state = _poc_tasks[app_id][request_id]
+        try:
+            tasks = [compute_single_nonce(nonce) for nonce in body.nonces]
+            results = await asyncio.gather(*tasks)
+
+            valid_results = [r for r in results if r.get("distance") is not None]
+            valid_under_target = [r for r in valid_results if r["distance"] < body.r_target]
+
+            task_state.update({
+                "status": "completed",
+                "completed_at": time.time(),
+                "completed": len(results),
+                "results": results,
+                "total_valid": len(valid_under_target),
+                "valid_nonces": [r["nonce"] for r in valid_under_target],
+                "valid_distances": [r["distance"] for r in valid_under_target],
+            })
+
+            if body.callback_url:
+                try:
+                    import httpx
+                    async with httpx.AsyncClient() as client:
+                        await client.post(body.callback_url, json=task_state, timeout=10)
+                except Exception as e:
+                    logger.warning(f"Callback failed: {e}")
+
+        except Exception as e:
+            task_state.update({
+                "status": "failed",
+                "error": str(e),
+                "completed_at": time.time(),
+            })
+
+    asyncio.create_task(process_in_background())
+
     return {
         "status": "queued",
-        "message": "Non-blocking mode not fully implemented for V1. Use wait=True.",
+        "request_id": request_id,
         "nonce_count": len(body.nonces),
+        "poll_url": f"/api/v1/pow/status/{request_id}",
     }
 
 
@@ -576,8 +720,7 @@ async def compute_nonce(request: Request, body: PoCComputeRequest) -> dict:
     """
     await check_poc_enabled(request)
     engine_client = await get_engine_client(request)
-    
-    # Create PoCParams for this request
+
     poc_params = PoCParams(
         block_hash=body.block_hash,
         public_key=body.public_key,
@@ -614,13 +757,23 @@ async def compute_nonce(request: Request, body: PoCComputeRequest) -> dict:
             detail="No PoC output in response"
         )
     
+    poc_out = final_output.poc_output
+    if isinstance(poc_out, dict):
+        nonce_val = poc_out.get('nonce', body.nonce)
+        distance_val = poc_out.get('distance')
+        vector_val = poc_out.get('vector')
+    else:
+        nonce_val = poc_out.nonce
+        distance_val = poc_out.distance
+        vector_val = poc_out.vector
+
     response = {
-        "nonce": final_output.poc_output.nonce,
-        "distance": final_output.poc_output.distance,
-        "valid": final_output.poc_output.distance < body.r_target,
+        "nonce": nonce_val,
+        "distance": distance_val,
+        "valid": distance_val < body.r_target if distance_val is not None else False,
     }
-    
-    if body.return_vectors and final_output.poc_output.vector:
-        response["vector"] = final_output.poc_output.vector
+
+    if body.return_vectors and vector_val:
+        response["vector"] = vector_val
     
     return response
