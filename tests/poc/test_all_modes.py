@@ -4,29 +4,63 @@
 Usage:
     # Start vLLM server first:
     python -m vllm.entrypoints.openai.api_server \
-        --model Qwen/Qwen3-8B-FP8 \
-        --port 5002 \
+        --model Qwen/Qwen2-1.5B-Instruct \
+        --port 8102 \
         --gpu-memory-utilization 0.5 \
         --max-model-len 4096
 
     # Run tests:
     python tests/poc/test_all_modes.py
 
-    # Or with custom server URL:
-    python tests/poc/test_all_modes.py --server http://localhost:5002
+    # Or with custom server URL and model:
+    python tests/poc/test_all_modes.py --server http://0.0.0.0:8102 --model Qwen/Qwen2-1.5B-Instruct
 """
 
 import argparse
 import concurrent.futures
 import json
+import random
 import sys
 import time
 from typing import Optional
 
+CHAT_PROMPTS = [
+    "Explain how a {thing} works in 2-3 sentences.",
+    "Write a short poem about {thing}.",
+    "What are 3 interesting facts about {thing}?",
+    "Compare and contrast {thing} with {thing2}.",
+    "If you were a {thing}, what would your day look like?",
+    "Describe {thing} to a 5-year-old.",
+    "What would happen if {thing} didn't exist?",
+    "Give me a recipe that uses {thing} as the main ingredient.",
+    "Write a haiku about {thing}.",
+    "Tell me a joke involving {thing}.",
+    "What are the pros and cons of {thing}?",
+    "Summarize the history of {thing} in 3 sentences.",
+]
+
+THINGS = [
+    "quantum computing", "black holes", "sourdough bread", "the Roman Empire",
+    "electric cars", "photosynthesis", "jazz music", "the Mariana Trench",
+    "neural networks", "volcanoes", "origami", "the stock market",
+    "bioluminescence", "espresso", "tidal waves", "the printing press",
+    "glaciers", "chess", "DNA", "coral reefs", "satellites", "penguins",
+    "compilers", "thunderstorms", "fermentation", "the moon landing",
+    "cephalopods", "renewable energy", "the Silk Road", "fractals",
+]
+
+
+def _random_chat_prompt() -> str:
+    """Generate a random chat prompt to avoid prefix caching."""
+    template = random.choice(CHAT_PROMPTS)
+    thing = random.choice(THINGS)
+    thing2 = random.choice(THINGS)
+    return template.format(thing=thing, thing2=thing2)
+
 import requests
 
 
-def test_pure_chat(server_url: str) -> dict:
+def test_pure_chat(server_url: str, model: str) -> dict:
     """Test pure chat request (no PoC)."""
     print("\n" + "=" * 60)
     print("TEST 1: PURE CHAT")
@@ -37,7 +71,7 @@ def test_pure_chat(server_url: str) -> dict:
         f"{server_url}/v1/chat/completions",
         headers={"Content-Type": "application/json"},
         json={
-            "model": "Qwen/Qwen3-8B-FP8",
+            "model": model,
             "messages": [{"role": "user", "content": "What is 2+2? Answer briefly."}],
             "max_tokens": 20,
         },
@@ -116,7 +150,7 @@ def test_pure_poc(server_url: str) -> dict:
     return result
 
 
-def test_mixed_batch(server_url: str) -> dict:
+def test_mixed_batch(server_url: str, model: str) -> dict:
     """Test mixed batch (concurrent chat + PoC)."""
     print("\n" + "=" * 60)
     print("TEST 3: MIXED BATCH (concurrent chat + PoC)")
@@ -127,7 +161,7 @@ def test_mixed_batch(server_url: str) -> dict:
             f"{server_url}/v1/chat/completions",
             headers={"Content-Type": "application/json"},
             json={
-                "model": "Qwen/Qwen3-8B-FP8",
+                "model": model,
                 "messages": [{"role": "user", "content": "Count from 1 to 10."}],
                 "max_tokens": 50,
             },
@@ -357,7 +391,7 @@ def test_validate(server_url: str) -> dict:
     return result
 
 
-def test_high_concurrency(server_url: str, num_chat: int = 10, num_poc: int = 10) -> dict:
+def test_high_concurrency(server_url: str, model: str, num_chat: int = 10, num_poc: int = 10) -> dict:
     """Test high concurrency with many concurrent chat + PoC requests."""
     print("\n" + "=" * 60)
     print(f"TEST 7: HIGH CONCURRENCY ({num_chat} chat + {num_poc} PoC requests)")
@@ -370,8 +404,8 @@ def test_high_concurrency(server_url: str, num_chat: int = 10, num_poc: int = 10
                 f"{server_url}/v1/chat/completions",
                 headers={"Content-Type": "application/json"},
                 json={
-                    "model": "Qwen/Qwen3-8B-FP8",
-                    "messages": [{"role": "user", "content": f"What is {idx} + {idx}? Answer briefly."}],
+                    "model": model,
+                    "messages": [{"role": "user", "content": _random_chat_prompt()}],
                     "max_tokens": 150,
                 },
                 timeout=60,
@@ -516,16 +550,51 @@ def main():
     parser = argparse.ArgumentParser(description="Test all PoC modes")
     parser.add_argument(
         "--server",
-        default="http://localhost:5002",
-        help="vLLM server URL (default: http://localhost:5002)",
+        default="http://0.0.0.0:8102",
+        help="vLLM server URL (default: http://0.0.0.0:8102)",
+    )
+    parser.add_argument(
+        "--model",
+        default="Qwen/Qwen2-1.5B-Instruct",
+        help="Model name for chat requests (default: Qwen/Qwen2-1.5B-Instruct)",
+    )
+    parser.add_argument(
+        "--stress",
+        action="store_true",
+        help="Run only the stress test (high concurrency)",
+    )
+    parser.add_argument(
+        "--num-chat",
+        type=int,
+        default=10,
+        help="Number of concurrent chat requests for stress test (default: 10)",
+    )
+    parser.add_argument(
+        "--num-poc",
+        type=int,
+        default=10,
+        help="Number of concurrent PoC requests for stress test (default: 10)",
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        help="Number of stress test rounds (default: 1)",
     )
     args = parser.parse_args()
 
     server_url = args.server.rstrip("/")
+    model = args.model
 
     print("=" * 60)
-    print("POC MODE TESTS")
+    if args.stress:
+        print("POC STRESS TEST")
+    else:
+        print("POC MODE TESTS")
     print(f"Server: {server_url}")
+    print(f"Model:  {model}")
+    if args.stress:
+        print(f"Chat:   {args.num_chat}  PoC: {args.num_poc}  Rounds: {args.rounds}")
     print("=" * 60)
 
     # Check server health
@@ -539,18 +608,45 @@ def main():
         print(f"ERROR: Cannot connect to server at {server_url}")
         print("Start the server first:")
         print("  python -m vllm.entrypoints.openai.api_server \\")
-        print("    --model Qwen/Qwen3-8B-FP8 --port 5002")
+        print(f"    --model {model} --port 8102")
         sys.exit(1)
+
+    if args.stress:
+        # Stress test only
+        all_passed = True
+        total_start = time.time()
+        for rnd in range(1, args.rounds + 1):
+            if args.rounds > 1:
+                print(f"\n{'#' * 60}")
+                print(f"ROUND {rnd}/{args.rounds}")
+                print(f"{'#' * 60}")
+            r = test_high_concurrency(server_url, model,
+                                      num_chat=args.num_chat,
+                                      num_poc=args.num_poc)
+            if not r["success"]:
+                all_passed = False
+            print(f"  Round {rnd}: {'PASS' if r['success'] else 'FAIL'}"
+                  f"  chat={r['chat_success']}/{r['chat_sent']}"
+                  f"  poc={r['poc_success']}/{r['poc_sent']}"
+                  f"  time={r['elapsed']:.1f}s")
+        total_elapsed = time.time() - total_start
+        print(f"\n{'=' * 60}")
+        print(f"STRESS TEST {'PASSED' if all_passed else 'FAILED'}"
+              f"  ({args.rounds} rounds, {total_elapsed:.1f}s total)")
+        print(f"{'=' * 60}")
+        sys.exit(0 if all_passed else 1)
 
     # Run all tests
     results = []
-    # results.append(test_pure_chat(server_url))
-    # results.append(test_pure_poc(server_url))
-    # results.append(test_mixed_batch(server_url))
-    # results.append(test_hook_caching(server_url))
-    # results.append(test_different_block_hash(server_url))
-    # results.append(test_validate(server_url))
-    results.append(test_high_concurrency(server_url, num_chat=10, num_poc=10))
+    results.append(test_pure_chat(server_url, model))
+    results.append(test_pure_poc(server_url))
+    results.append(test_mixed_batch(server_url, model))
+    results.append(test_hook_caching(server_url))
+    results.append(test_different_block_hash(server_url))
+    results.append(test_validate(server_url))
+    results.append(test_high_concurrency(server_url, model,
+                                         num_chat=args.num_chat,
+                                         num_poc=args.num_poc))
     # results.append(test_validate_fraud(server_url))
 
     # Summary
