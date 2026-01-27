@@ -2522,7 +2522,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             return self.model.compute_logits(sample_hidden_states)
 
         poc_req_ids = mixed_batch_info['poc_req_ids']
-        req_ids = self.input_batch.req_ids
+        req_ids = mixed_batch_info.get('req_ids_snapshot', self.input_batch.req_ids)
         num_reqs = len(req_ids)
         num_samples = sample_hidden_states.shape[0]
 
@@ -2726,7 +2726,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         if mixed_batch_info and mixed_batch_info.get('poc_req_ids') and logits is not None:
             poc_req_ids = mixed_batch_info['poc_req_ids']
-            req_ids = self.input_batch.req_ids
+            req_ids = mixed_batch_info.get('req_ids_snapshot', self.input_batch.req_ids)
 
             # Create mask for chat requests
             chat_indices = [i for i, req_id in enumerate(req_ids) if req_id not in poc_req_ids]
@@ -3054,6 +3054,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     'poc_requests': poc_requests,
                     'chat_requests': chat_requests,
                     'poc_req_ids': poc_req_ids,
+                    'req_ids_snapshot': list(self.input_batch.req_ids),
+                    'num_reqs_snapshot': self.input_batch.num_reqs,
                 } if is_mixed_batch else None
 
                 if not num_scheduled_tokens:
