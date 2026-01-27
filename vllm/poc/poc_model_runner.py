@@ -23,7 +23,7 @@ from vllm.v1.outputs import PoCOutput
 from .gpu_random import (
     generate_inputs,
     random_pick_indices,
-    generate_haar_orthogonal_matrices,
+    apply_haar_rotation,
 )
 from .data import encode_vector
 
@@ -272,8 +272,7 @@ def execute_poc_batch(
     indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, k_dim, device)
     xk = torch.gather(last_hidden, 1, indices)
 
-    Q = generate_haar_orthogonal_matrices(block_hash, public_key, nonces, k_dim, device, dtype=xk.dtype)
-    yk = torch.bmm(Q, xk.unsqueeze(-1)).squeeze(-1)
+    yk = apply_haar_rotation(block_hash, public_key, nonces, xk, device)
 
     # Normalize
     yk = yk / (yk.norm(dim=-1, keepdim=True) + 1e-8)

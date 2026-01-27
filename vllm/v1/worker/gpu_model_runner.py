@@ -783,7 +783,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> dict[str, "PoCOutput"]:
         from vllm.poc.gpu_random import (
             random_pick_indices,
-            generate_haar_orthogonal_matrices,
+            apply_haar_rotation,
         )
         from vllm.poc.data import encode_vector
 
@@ -809,15 +809,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             xk = last_hidden[indices[0]]
 
-            Q = generate_haar_orthogonal_matrices(
+            yk = apply_haar_rotation(
                 poc_params.block_hash,
                 poc_params.public_key,
                 [poc_params.nonce],
-                k_dim,
+                xk.unsqueeze(0),
                 self.device,
-                dtype=xk.dtype,
-            )
-            yk = torch.mv(Q[0], xk)
+            )[0]
             yk = yk / (yk.norm() + 1e-8)
 
             vector_b64 = encode_vector(yk.half().cpu().numpy())
