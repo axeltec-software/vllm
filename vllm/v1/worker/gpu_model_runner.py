@@ -240,6 +240,7 @@ class ExecuteModelState(NamedTuple):
     sample_hidden_states: torch.Tensor
     aux_hidden_states: list[torch.Tensor] | None
     kv_connector_output: KVConnectorOutput | None
+    mixed_batch_info: dict | None = None
 
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
@@ -3340,6 +3341,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sample_hidden_states,
             aux_hidden_states,
             kv_connector_output,
+            mixed_batch_info=getattr(self, '_mixed_batch_info', None),
         )
         return None
 
@@ -3361,9 +3363,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sample_hidden_states,
             aux_hidden_states,
             kv_connector_output,
+            mixed_batch_info,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+        self._mixed_batch_info = mixed_batch_info
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
