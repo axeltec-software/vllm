@@ -2806,22 +2806,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
 
-        mixed_batch_info = getattr(self, '_mixed_batch_info', None)
-        if mixed_batch_info and mixed_batch_info.get('poc_req_ids'):
-            poc_req_ids = mixed_batch_info['poc_req_ids']
-            new_index = 0
-            old_to_new_index = {}
-            for req_id in self.input_batch.req_ids:
-                if req_id not in poc_req_ids:
-                    old_to_new_index[self.input_batch.req_id_to_index[req_id]] = new_index
-                    new_index += 1
-
-            req_id_to_index_output_copy = {}
-            for req_id in self.input_batch.req_ids:
-                if req_id not in poc_req_ids:
-                    old_idx = self.input_batch.req_id_to_index[req_id]
-                    req_id_to_index_output_copy[req_id] = old_to_new_index[old_idx]
-
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
         invalid_req_indices = []
@@ -2910,6 +2894,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             hidden_states[:num_scheduled_tokens],
             scheduler_output.num_scheduled_tokens,
         )
+
+        # Filter PoC requests out of output arrays so indices stay consistent.
+        mixed_batch_info = getattr(self, '_mixed_batch_info', None)
+        if mixed_batch_info and mixed_batch_info.get('poc_req_ids'):
+            poc_req_ids = mixed_batch_info['poc_req_ids']
+            chat_indices = [
+                i for i, rid in enumerate(req_ids_output_copy)
+                if rid not in poc_req_ids
+            ]
+            req_ids_output_copy = [req_ids_output_copy[i] for i in chat_indices]
+            req_id_to_index_output_copy = {
+                rid: new_i for new_i, rid in enumerate(req_ids_output_copy)
+            }
+            if valid_sampled_token_ids:
+                valid_sampled_token_ids = [
+                    valid_sampled_token_ids[i] for i in chat_indices
+                ]
 
         return (
             num_nans_in_logits,
