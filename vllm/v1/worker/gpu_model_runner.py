@@ -2554,13 +2554,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         def filter_tensor(t, dim=0):
             if t is None:
                 return None
-            # Safety: skip filtering if tensor shape doesn't match mask
             if t.shape[0] != chat_mask.shape[0]:
-                logger.warning(
-                    f"filter_tensor: mask shape {chat_mask.shape[0]} != "
-                    f"tensor shape {t.shape}, skipping filter"
-                )
-                return t
+                if t.shape[0] >= max(chat_indices) + 1 if chat_indices else 0:
+                    return t[chat_indices] if dim == 0 else t[chat_indices, :]
+                else:
+                    logger.warning(
+                        f"filter_tensor: mask shape {chat_mask.shape[0]} != "
+                        f"tensor shape {t.shape}, and cannot index by chat_indices. Skipping filter."
+                    )
+                    return t
             return t[chat_mask] if dim == 0 else t[chat_mask, :]
 
         new_generators = {}
