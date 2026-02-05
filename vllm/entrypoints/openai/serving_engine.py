@@ -1395,7 +1395,7 @@ class OpenAIServing:
         if return_as_token_id:
             if enforced_tokens:
                 return str(token_id)
-            return f"token_id:{token_id}"
+            return f"{token_id}"
 
         if logprob.decoded_token is not None:
             return logprob.decoded_token
