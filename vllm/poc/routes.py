@@ -18,10 +18,12 @@ from pydantic import BaseModel, ConfigDict
 from vllm.logger import init_logger
 from .config import PoCState
 from .data import (
+    Artifact,
     DEFAULT_DIST_THRESHOLD,
     DEFAULT_P_MISMATCH,
     DEFAULT_FRAUD_THRESHOLD,
 )
+from .callbacks import CallbackSender
 from .poc_params import PoCParams
 
 logger = init_logger(__name__)
@@ -170,7 +172,8 @@ async def _cancel_poc_tasks(app_id: int):
                 await tasks["gen_task"]
             except asyncio.CancelledError:
                 pass
-
+        if tasks.get("callback_sender"):
+            tasks["callback_sender"].clear()
 
 # =============================================================================
 # Core: compute artifacts for a list of nonces
@@ -261,12 +264,20 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     stats = {"start_time": 0, "total_processed": 0}
     stop_event = asyncio.Event()
 
+    callback_sender = None
+    callback_task = None
+    if body.url:
+        callback_sender = CallbackSender(body.url, stop_event, body.params.k_dim)
+        callback_task = asyncio.create_task(callback_sender.run())
+
     gen_task = asyncio.create_task(
-        _generation_loop(engine_client, stop_event, config, stats)
+        _generation_loop(engine_client, stop_event, callback_sender, config, stats)
     )
 
     _poc_tasks[app_id] = {
         "gen_task": gen_task,
+        "callback_task": callback_task,
+        "callback_sender": callback_sender,
         "stop_event": stop_event,
         "config": config,
         "stats": stats,
@@ -278,6 +289,7 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
 async def _generation_loop(
     engine_client,
     stop_event: asyncio.Event,
+    callback_sender: Optional[CallbackSender],
     config: dict,
     stats: dict,
 ):
@@ -308,6 +320,15 @@ async def _generation_loop(
                 config.get("block_height", 0),
                 config["seq_len"], config["k_dim"],
             )
+            
+            if artifacts and callback_sender:
+                artifact_objs = [Artifact(nonce=a["nonce"], vector_b64=a["vector_b64"]) for a in artifacts]
+                callback_sender.add_artifacts(artifact_objs, {
+                    "public_key": config["public_key"],
+                    "block_hash": config["block_hash"],
+                    "block_height": config["block_height"],
+                    "node_id": config["node_id"],
+                })
 
             stats["total_processed"] += len(nonces)
 
