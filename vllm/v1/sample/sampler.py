@@ -243,7 +243,7 @@ class Sampler(nn.Module):
         logprobs: torch.Tensor,
         num_logprobs: int,
         token_ids: torch.Tensor,
-        sampling_metadata: SamplingMetadata
+        sampling_metadata: SamplingMetadata | None = None
     ) -> LogprobsTensors:
         """
         Gather logprobs for topk and sampled/prompt token.
@@ -264,7 +264,7 @@ class Sampler(nn.Module):
           Sampled token rank tensor, (num tokens)
         """
         assert token_ids.dtype == torch.int64
-        if sampling_metadata.enforced_tokens:
+        if sampling_metadata and sampling_metadata.enforced_tokens:
             enforced_top_map = sampling_metadata.enforced_tokens
             enforced_map = sampling_metadata.enforced_token_ids
             
