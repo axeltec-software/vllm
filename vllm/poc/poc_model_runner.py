@@ -53,68 +53,6 @@ def bypass_torch_compile():
         torch.compiler._is_compiling_flag = old_flag
 
 
-def _create_v1_attn_metadata(
-    model_runner,
-    batch_size: int,
-    seq_len: int,
-    device: torch.device,
-) -> Dict[str, Any]:
-    """Create V1 attention metadata for PoC prefill.
-
-    Uses the model runner's metadata builders to create proper backend-specific
-    metadata for each attention layer. Uses PAD_SLOT_ID to skip KV cache writes.
-
-    Returns:
-        Dict mapping layer names to their backend-specific AttentionMetadata
-    """
-    from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-
-    num_tokens = batch_size * seq_len
-
-    query_start_loc = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    query_start_loc[1:] = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device) * seq_len
-    query_start_loc_cpu = query_start_loc.cpu()
-
-    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
-    seq_lens_cpu = seq_lens.cpu()
-
-    num_computed_tokens_cpu = torch.zeros(batch_size, dtype=torch.int32, device="cpu")
-
-    block_table_tensor = torch.empty((batch_size, 0), dtype=torch.int32, device=device)
-
-    slot_mapping = torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.int64, device=device)
-
-    common_attn_metadata = CommonAttentionMetadata(
-        query_start_loc=query_start_loc,
-        query_start_loc_cpu=query_start_loc_cpu,
-        seq_lens=seq_lens,
-        seq_lens_cpu=seq_lens_cpu,
-        num_computed_tokens_cpu=num_computed_tokens_cpu,
-        num_reqs=batch_size,
-        num_actual_tokens=num_tokens,
-        max_query_len=seq_len,
-        max_seq_len=seq_len,
-        block_table_tensor=block_table_tensor,
-        slot_mapping=slot_mapping,
-        causal=True,
-    )
-
-    attn_metadata_dict: Dict[str, Any] = {}
-
-    for attn_groups in model_runner.attn_groups:
-        for attn_group in attn_groups:
-            builder = attn_group.get_metadata_builder()
-            layer_metadata = builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=common_attn_metadata,
-                fast_build=True,  # Skip AOT scheduling for PoC
-            )
-            for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name] = layer_metadata
-
-    return attn_metadata_dict
-
-
 @torch.inference_mode()
 def execute_poc_batch(
     model_runner,
@@ -213,8 +151,8 @@ def execute_poc_batch(
     
     # Create attention metadata and positions
     positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    attn_metadata = _create_v1_attn_metadata(model_runner, batch_size, seq_len, device)
-    
+    attn_metadata = None
+
     torch.cuda.synchronize()
     t_input_end = time.perf_counter()
     
