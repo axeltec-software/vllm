@@ -17,6 +17,9 @@ from pydantic import BaseModel, ConfigDict
 
 from vllm.logger import init_logger
 from .config import PoCState
+
+# Blocking execution: backoff time when chat is active
+POC_CHAT_BUSY_BACKOFF_SEC = 0.05
 from .data import (
     Artifact,
     DEFAULT_DIST_THRESHOLD,
@@ -70,6 +73,7 @@ class PoCInitGenerateRequest(BaseModel):
     batch_size: int = 32
     params: PoCParamsModel
     url: Optional[str] = None
+    blocking: bool = False
 
 
 class PoCGenerateRequest(BaseModel):
@@ -85,6 +89,7 @@ class PoCGenerateRequest(BaseModel):
     url: Optional[str] = None
     validation: Optional[ValidationModel] = None
     stat_test: Optional[StatTestModel] = None
+    blocking: bool = False
 
 
 # =============================================================================
@@ -175,6 +180,7 @@ async def _cancel_poc_tasks(app_id: int):
         if tasks.get("callback_sender"):
             tasks["callback_sender"].clear()
 
+
 # =============================================================================
 # Core: compute artifacts for a list of nonces
 # =============================================================================
@@ -187,14 +193,24 @@ async def _compute_nonce_artifacts(
     block_height: int,
     seq_len: int,
     k_dim: int,
+    app=None,
+    blocking: bool = False,
 ) -> List[dict]:
-    """Compute artifacts for nonces via the scheduler.
+    """Compute artifacts for nonces via the scheduler."""
+    exclusive_mode_set = False
+    if blocking and app:
+        # Step 1: Wait for in-flight requests to drain
+        load = getattr(app.state, 'server_load_metrics', 0)
+        if load > 0:
+            logger.info(f"PoC blocking: waiting for {load} in-flight request(s)")
+        while load > 0:
+            await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
+            load = getattr(app.state, 'server_load_metrics', 0)
+        # Step 2: Set exclusive mode to reject new chat requests
+        app.state.poc_exclusive_mode = True
+        exclusive_mode_set = True
+        logger.info("PoC exclusive mode: rejecting new chat requests")
 
-    Each nonce is submitted as a PoC request. The scheduler batches them
-    with chat requests for mixed execution.
-
-    Returns list of {"nonce": int, "vector_b64": str}.
-    """
     async def compute_one(nonce: int) -> Optional[dict]:
         poc_params = PoCParams(
             block_hash=block_hash,
@@ -229,9 +245,14 @@ async def _compute_nonce_artifacts(
             logger.error(f"Error computing nonce {nonce}: {e}")
         return None
 
-    tasks = [compute_one(n) for n in nonces]
-    results = await asyncio.gather(*tasks)
-    return [r for r in results if r is not None]
+    try:
+        tasks = [compute_one(n) for n in nonces]
+        results = await asyncio.gather(*tasks)
+        return [r for r in results if r is not None]
+    finally:
+        if exclusive_mode_set and app:
+            app.state.poc_exclusive_mode = False
+            logger.info("PoC exclusive mode: ended, accepting chat requests")
 
 
 # =============================================================================
@@ -271,7 +292,8 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
         callback_task = asyncio.create_task(callback_sender.run())
 
     gen_task = asyncio.create_task(
-        _generation_loop(engine_client, stop_event, callback_sender, config, stats)
+        _generation_loop(engine_client, stop_event, callback_sender, config, stats,
+                         app=request.app, blocking=body.blocking)
     )
 
     _poc_tasks[app_id] = {
@@ -292,6 +314,8 @@ async def _generation_loop(
     callback_sender: Optional[CallbackSender],
     config: dict,
     stats: dict,
+    app=None,
+    blocking: bool = False,
 ):
     """Continuous generation loop for /init/generate."""
     from .data import pad_nonces, filter_artifacts
@@ -319,6 +343,7 @@ async def _generation_loop(
                 config["block_hash"], config["public_key"],
                 config.get("block_height", 0),
                 config["seq_len"], config["k_dim"],
+                app=app, blocking=blocking,
             )
             
             if artifacts and callback_sender:
@@ -358,6 +383,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             engine_client, body.nonces,
             body.block_hash, body.public_key, body.block_height,
             body.params.seq_len, body.params.k_dim,
+            app=request.app, blocking=body.blocking,
         )
 
         response = {
@@ -418,6 +444,8 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         "total_nonces": len(body.nonces),
     }
 
+    app = request.app
+
     async def process_in_background():
         task_state = _poc_tasks[app_id][request_id]
         try:
@@ -425,6 +453,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 engine_client, body.nonces,
                 body.block_hash, body.public_key, body.block_height,
                 body.params.seq_len, body.params.k_dim,
+                app=app, blocking=body.blocking,
             )
             task_state.update({
                 "status": "completed",
