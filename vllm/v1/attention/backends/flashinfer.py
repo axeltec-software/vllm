@@ -932,45 +932,6 @@ class FlashInferImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Check for prefill-only mode (e.g., PoC) where we skip KV cache
-        is_prefill_only = (
-            key is not None and value is not None and
-            attn_metadata.block_table_tensor.shape[1] == 0 and
-            attn_metadata.max_q_len == attn_metadata.max_seq_len and
-            attn_metadata.num_decode_tokens == 0
-        )
-
-        if is_prefill_only:
-            from flash_attn import flash_attn_varlen_func
-            query_sliced = query[:num_actual_tokens]
-            key_sliced = key[:num_actual_tokens]
-            value_sliced = value[:num_actual_tokens]
-
-            cu_seqlens = torch.zeros(
-                attn_metadata.num_prefills + 1,
-                dtype=torch.int32,
-                device=query.device
-            )
-            cu_seqlens[1:] = torch.cumsum(
-                attn_metadata.seq_lens[:attn_metadata.num_prefills], dim=0
-            )
-
-            flash_attn_varlen_func(
-                q=query_sliced,
-                k=key_sliced,
-                v=value_sliced,
-                out=output[:num_actual_tokens],
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=attn_metadata.max_q_len,
-                max_seqlen_k=attn_metadata.max_seq_len,
-                softmax_scale=self.scale,
-                causal=True,
-                window_size=self.sliding_window,
-                softcap=self.logits_soft_cap,
-            )
-            return output
-
         if self.kv_sharing_target_layer_name is None:
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.

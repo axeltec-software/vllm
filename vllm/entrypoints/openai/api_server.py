@@ -1854,8 +1854,10 @@ async def init_app_state(
         else None
     )
 
-    state.enable_server_load_tracking = args.enable_server_load_tracking
+    # Auto-enable when PoC is enabled (for blocking mode support)
+    state.enable_server_load_tracking = args.enable_server_load_tracking or getattr(state, 'poc_enabled', False)
     state.server_load_metrics = 0
+    state.poc_exclusive_mode = False
 
 
 def create_server_socket(addr: tuple[str, int]) -> socket.socket:
