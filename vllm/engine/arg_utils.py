@@ -515,6 +515,7 @@ class EngineArgs:
     )
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
+    poc_decode_interval: int = SchedulerConfig.poc_decode_interval
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     override_pooler_config: dict | PoolerConfig | None = (
@@ -1049,6 +1050,9 @@ class EngineArgs:
             "--scheduling-policy", **scheduler_kwargs["policy"]
         )
         scheduler_group.add_argument(
+            "--poc-decode-interval", **scheduler_kwargs["poc_decode_interval"]
+        )
+        scheduler_group.add_argument(
             "--enable-chunked-prefill", **scheduler_kwargs["enable_chunked_prefill"]
         )
         scheduler_group.add_argument(
@@ -1556,6 +1560,7 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
+            poc_decode_interval=self.poc_decode_interval
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

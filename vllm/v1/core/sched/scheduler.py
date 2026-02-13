@@ -122,9 +122,10 @@ class Scheduler(SchedulerInterface):
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
         # Priority queues for requests.
+        self.chat_decode_count = 0
+        self.poc_decode_interval = self.scheduler_config.poc_decode_interval
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
-
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
         # requests so that they can free the cached states for those requests.
@@ -209,7 +210,7 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            
+
             # PoC: Handle PoC requests specially
             if request.poc_params is not None:
                 # PoC is prefill-only, always finish after one step
@@ -370,15 +371,20 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
+        should_schedule_poc = self.chat_decode_count >= self.poc_decode_interval
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
                 request = self.waiting.peek_request()
-                
                 # PoC: Handle PoC requests
                 if request.poc_params is not None:
+                    if not should_schedule_poc:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+                    
                     num_new_tokens = request.poc_params.seq_len
                     if num_new_tokens <= token_budget:
                         self.waiting.pop_request()
@@ -391,6 +397,7 @@ class Scheduler(SchedulerInterface):
                             blocks=tuple([] for _ in range(self.kv_cache_manager.num_kv_cache_groups))
                         )
                         token_budget -= num_new_tokens
+                        self.chat_decode_count = 0
 
                         if self.log_stats:
                             request.record_event(
@@ -1026,6 +1033,9 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            
+            if generated_token_ids:
+                self.chat_decode_count += 1
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)

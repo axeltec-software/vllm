@@ -141,6 +141,8 @@ class SchedulerConfig:
     Async scheduling is currently not supported with some features such as
     speculative decoding and pipeline parallelism.
     """
+    
+    poc_decode_interval: int = 1
 
     def get_scheduler_cls(self) -> type["SchedulerInterface"]:
         if self.scheduler_cls is None:
