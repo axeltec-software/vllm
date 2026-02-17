@@ -15,7 +15,7 @@ from flashinfer import (
 from flashinfer.decode import _get_range_buf, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 from flashinfer.utils import FP4Tensor
-
+from vllm.vllm_flash_attn import flash_attn_varlen_func
 from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
@@ -51,6 +51,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.attention.utils.fa_utils import get_flash_attn_version
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
@@ -265,6 +266,9 @@ class FlashInferMetadata:
 
     qo_indptr_gpu: torch.Tensor | None = None
     paged_kv_indptr_gpu: torch.Tensor | None = None
+    
+    query_start_loc: torch.Tensor | None = None
+    is_poc: bool = False
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -491,7 +495,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         seq_lens_np = seq_lens_cpu.numpy()
         block_table_tensor = common_attn_metadata.block_table_tensor
 
-        num_blocks_np = (seq_lens_np + (page_size - 1)) // page_size
+        # Check if block table is empty (for POC requests with no KV cache)
+        if block_table_tensor.shape[1] == 0:
+            num_blocks_np = np.zeros(num_reqs, dtype=np.int32)
+        else:
+            num_blocks_np = (seq_lens_np + (page_size - 1)) // page_size
 
         use_cascade = common_prefix_len > 0
         if use_cascade:
@@ -540,13 +548,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # write self.paged_kv_indices inplace
         num_actual_pages = self.paged_kv_indptr_np[num_reqs]
         paged_kv_indices = self.paged_kv_indices[:num_actual_pages]
-        _copy_page_indices_kernel[(num_reqs,)](
-            paged_kv_indices,
-            block_table_tensor,
-            block_table_tensor.stride(0),
-            paged_kv_indptr,
-            BLOCK_SIZE=1024,
-        )
+        # for POC requests with empty KV cache
+        if num_actual_pages > 0:
+            _copy_page_indices_kernel[(num_reqs,)](
+                paged_kv_indices,
+                block_table_tensor,
+                block_table_tensor.stride(0),
+                paged_kv_indptr,
+                BLOCK_SIZE=1024,
+            )
 
         # write self.paged_kv_last_page_len_cpu inplace
         paged_kv_last_page_len_np = seq_lens_np % page_size
@@ -621,6 +631,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             use_cascade=use_cascade,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            is_poc=common_attn_metadata.is_poc,
         )
 
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
@@ -825,6 +837,8 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
+        
+        self.vllm_flash_attn_version = get_flash_attn_version()
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return (
@@ -932,43 +946,60 @@ class FlashInferImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Check for prefill-only mode (e.g., PoC) where we skip KV cache
-        is_prefill_only = (
-            key is not None and value is not None and
-            attn_metadata.block_table_tensor.shape[1] == 0 and
-            attn_metadata.max_q_len == attn_metadata.max_seq_len and
-            attn_metadata.num_decode_tokens == 0
-        )
+        if attn_metadata.is_poc:
+            cu_seqlens_q = attn_metadata.query_start_loc
+            max_seqlen_q = attn_metadata.max_q_len
 
-        if is_prefill_only:
-            from flash_attn import flash_attn_varlen_func
-            query_sliced = query[:num_actual_tokens]
-            key_sliced = key[:num_actual_tokens]
-            value_sliced = value[:num_actual_tokens]
-
-            cu_seqlens = torch.zeros(
-                attn_metadata.num_prefills + 1,
-                dtype=torch.int32,
-                device=query.device
-            )
-            cu_seqlens[1:] = torch.cumsum(
-                attn_metadata.seq_lens[:attn_metadata.num_prefills], dim=0
+            assert cu_seqlens_q is not None, "cu_seqlens_q is None"
+            assert cu_seqlens_q.shape[0] >= 2, f"cu_seqlens_q must have at least 2 elements, got {cu_seqlens_q.shape[0]}"
+            assert cu_seqlens_q[-1] == num_actual_tokens, (
+                f"cu_seqlens_q[-1] ({cu_seqlens_q[-1]}) must equal num_actual_tokens ({num_actual_tokens})"
             )
 
-            flash_attn_varlen_func(
-                q=query_sliced,
-                k=key_sliced,
-                v=value_sliced,
-                out=output[:num_actual_tokens],
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=attn_metadata.max_q_len,
-                max_seqlen_k=attn_metadata.max_seq_len,
-                softmax_scale=self.scale,
-                causal=True,
-                window_size=self.sliding_window,
-                softcap=self.logits_soft_cap,
+            q_sliced = query[:num_actual_tokens]
+            k_sliced = key[:num_actual_tokens]
+            v_sliced = value[:num_actual_tokens]
+            out_sliced = output[:num_actual_tokens]
+            
+            assert q_sliced.shape[0] == num_actual_tokens, (
+                f"query shape mismatch: {q_sliced.shape[0]} != {num_actual_tokens}"
             )
+            assert q_sliced.ndim == 3, f"query must be 3D, got {q_sliced.ndim}D"
+            assert q_sliced.shape[1] == self.num_heads, (
+                f"query num_heads mismatch: {q_sliced.shape[1]} != {self.num_heads}"
+            )
+            assert q_sliced.shape[2] == self.head_size, (
+                f"query head_size mismatch: {q_sliced.shape[2]} != {self.head_size}"
+            )
+            descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+            try:
+                flash_attn_varlen_func(
+                    q=q_sliced,
+                    k=k_sliced,
+                    v=v_sliced,
+                    out=out_sliced,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_q,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    softcap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=layer._q_scale.expand(descale_shape),
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                )
+            except Exception as e:
+                logger.error(
+                    f"flash_attn_varlen_func failed with error: {e}\n"
+                    f"Inputs: q.shape={q_sliced.shape}, k.shape={k_sliced.shape}, "
+                    f"v.shape={v_sliced.shape}, cu_seqlens_q={cu_seqlens_q.tolist()}, "
+                    f"max_seqlen_q={max_seqlen_q}"
+                )
+                raise
             return output
 
         if self.kv_sharing_target_layer_name is None:

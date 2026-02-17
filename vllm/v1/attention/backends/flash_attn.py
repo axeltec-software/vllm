@@ -161,6 +161,8 @@ class FlashAttentionMetadata:
     max_num_splits: int = 0
 
     causal: bool = True
+    
+    is_poc: bool = False
 
 
 def _get_sliding_window_configs(
@@ -435,6 +437,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
+            is_poc=common_attn_metadata.is_poc,
         )
         return attn_metadata
 
@@ -573,14 +576,7 @@ class FlashAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
-        # Check for prefill-only mode (e.g., PoC) where we skip KV cache
-        is_prefill_only = (
-            key is not None and value is not None and
-            attn_metadata.block_table.shape[1] == 0 and
-            attn_metadata.max_query_len == attn_metadata.max_seq_len
-        )
-
-        if is_prefill_only:
+        if attn_metadata.is_poc:
             cu_seqlens_q = attn_metadata.query_start_loc
             max_seqlen_q = attn_metadata.max_query_len
 

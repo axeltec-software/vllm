@@ -97,6 +97,7 @@ def _create_v1_attn_metadata(
         block_table_tensor=block_table_tensor,
         slot_mapping=slot_mapping,
         causal=True,
+        is_poc=True,
     )
 
     attn_metadata_dict: Dict[str, Any] = {}
@@ -214,7 +215,7 @@ def execute_poc_batch(
     # Create attention metadata and positions
     positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
     attn_metadata = _create_v1_attn_metadata(model_runner, batch_size, seq_len, device)
-    
+
     torch.cuda.synchronize()
     t_input_end = time.perf_counter()
     
