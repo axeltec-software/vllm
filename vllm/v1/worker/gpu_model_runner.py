@@ -3014,8 +3014,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 if is_pure_poc_batch:
                     from vllm.poc.poc_model_runner import execute_poc_batch
-                    poc_outputs_list = execute_poc_batch(self, poc_requests)
+                    poc_result = execute_poc_batch(
+                        self, poc_requests, intermediate_tensors
+                    )
 
+                    if not get_pp_group().is_last_rank:
+                        return poc_result 
+
+                    poc_outputs_list = poc_result
                     poc_outputs_dict = {}
                     for i, req in enumerate(poc_requests):
                         poc_outputs_dict[req.req_id] = poc_outputs_list[i]
