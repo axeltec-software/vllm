@@ -120,15 +120,19 @@ def _create_v1_attn_metadata(
 def execute_poc_batch(
     model_runner,
     poc_requests: List[Any],  # List of Request objects with poc_params
-) -> List[PoCOutput]:
+    intermediate_tensors: Optional["IntermediateTensors"] = None,
+) -> "List[PoCOutput] | IntermediateTensors":
     """Execute PoC forward pass for a batch of PoC requests.
-    
+
     Args:
         model_runner: The GPUModelRunner instance
         poc_requests: List of Request objects with poc_params set
-        
+        intermediate_tensors: Pre-received tensors from the previous PP stage
+            (provided by gpu_worker.py for non-first PP ranks).
+
     Returns:
-        List of PoCOutput objects, one per request
+        List[PoCOutput] on the last PP rank, or IntermediateTensors on
+        non-last PP ranks (for gpu_worker.py to send to the next stage).
     """
     if not poc_requests:
         return []
@@ -183,11 +187,9 @@ def execute_poc_batch(
             k_dim = int(broadcast_data["k_dim"])
             batch_size = len(nonces)
     
-    # Generate embeddings on first PP rank, receive intermediate tensors on others
-    intermediate_tensors = None
-    inputs_embeds = None
-    
     pp_group = get_pp_group()
+
+    inputs_embeds = None
     
     # =========================================================================
     # TIMING: Phase 1 - Input Generation
@@ -206,11 +208,6 @@ def execute_poc_batch(
             raise RuntimeError(f"generate_inputs returned None for batch_size={batch_size}, "
                              f"seq_len={seq_len}, hidden_size={hidden_size}")
         logger.debug(f"PoC inputs_embeds shape: {inputs_embeds.shape}")
-    else:
-        # Receive from previous PP rank
-        intermediate_tensors = IntermediateTensors(
-            pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
-        )
     
     # Create attention metadata and positions
     positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
@@ -248,14 +245,14 @@ def execute_poc_batch(
     
     torch.cuda.synchronize()
     t_fwd_end = time.perf_counter()
-    
-    # PP: send to next rank if not last
+
     if not pp_group.is_last_rank:
-        if isinstance(hidden_states, IntermediateTensors):
-            pp_group.send_tensor_dict(
-                hidden_states.tensors, all_gather_group=get_tp_group()
-            )
-        return []
+        assert isinstance(hidden_states, IntermediateTensors), (
+            f"Expected IntermediateTensors from non-last PP rank model forward, "
+            f"got {type(hidden_states)}"
+        )
+        hidden_states.kv_connector_output = None
+        return hidden_states
     
     # =========================================================================
     # TIMING: Phase 3 - Post-processing
