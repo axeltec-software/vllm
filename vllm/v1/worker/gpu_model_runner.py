@@ -2990,10 +2990,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 has_poc_requests = bool(poc_req_ids)
 
                 if has_poc_requests:
-                    poc_requests = [
-                        self.requests[req_id] for req_id in poc_req_ids
-                        if req_id in self.requests
-                    ]
+                    # Sort by nonce to ensure consistent ordering across all PP
+                    # ranks. Each PP rank runs in a separate process with a
+                    # different PYTHONHASHSEED, so iterating poc_req_ids (a set)
+                    # produces different orderings per rank. Without sorting,
+                    # rank 0 generates inputs for nonces in one order while rank
+                    # 1 assigns output vectors in a different order, causing
+                    # every nonce to receive the wrong vector.
+                    poc_requests = sorted(
+                        [
+                            self.requests[req_id] for req_id in poc_req_ids
+                            if req_id in self.requests
+                        ],
+                        key=lambda req: req.poc_params.nonce,
+                    )
 
                     scheduled_req_ids = set(scheduler_output.num_scheduled_tokens.keys())
                     chat_requests = [
