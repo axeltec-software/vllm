@@ -1135,6 +1135,33 @@ class OpenAIServing:
         engine_prompt = EngineTokensPrompt(
             prompt_token_ids=prompt_inputs["prompt_token_ids"]
         )
+
+        # if request.enforced_str or request.enforced_tokens:
+        #     filepath = 'infer_resp.json'
+        #     data = []
+        #     decoded_tokens = []
+        #     with open(filepath, 'r', encoding='utf-8') as f:
+        #         for line in f:
+        #             try:
+        #                 data.append(json.loads(line.strip()))
+        #                 break
+        #             except json.JSONDecodeError as e:
+        #                 print(f"Skipping malformed line: {line.strip()} - Error: {e}")
+
+        #     if data:
+        #         for req in data:
+        #             logprobs_resp = req["choices"][0]["logprobs"]["content"]
+        #             for el in logprobs_resp:
+        #                 decoded_tokens.append(int(el['token']))
+
+        #     engine_prompt['prompt_token_ids'].extend(decoded_tokens)
+
+        if request.enforced_tokens:
+            request.max_tokens = 1
+            request.prompt_logprobs = request.top_logprobs
+            decoded_tokens = [int(request.enforced_tokens.tokens[i].token) for i in range(len(request.enforced_tokens.tokens))]
+            engine_prompt['prompt_token_ids'].extend(decoded_tokens)
+
         if mm_data is not None:
             engine_prompt["multi_modal_data"] = mm_data
 
