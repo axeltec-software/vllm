@@ -44,6 +44,8 @@ from vllm.sampling_params import (
 )
 from vllm.utils import random_uuid
 
+from vllm.validation import EnforcedTokens
+
 logger = init_logger(__name__)
 
 
@@ -353,6 +355,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "numeric values, used by custom extensions."
         ),
     )
+    
+    enforced_str: str | None = Field(default=None)
+    enforced_tokens: EnforcedTokens | None = Field(default=None)
 
     # --8<-- [end:chat-completion-extra-params]
 
@@ -388,6 +393,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         max_tokens: int,
         logits_processor_pattern: str | None,
         default_sampling_params: dict,
+        # tokenizer,
     ) -> SamplingParams:
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
@@ -452,6 +458,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+
+
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

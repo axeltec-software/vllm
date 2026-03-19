@@ -1222,6 +1222,11 @@ class OpenAIServing:
                 engine_prompt["prompt"],
                 add_special_tokens=add_special_tokens,
             )
+            if request.enforced_tokens:
+                request.max_tokens = 1
+                request.prompt_logprobs = request.top_logprobs
+                decoded_tokens = [int(request.enforced_tokens.tokens[i].token) for i in range(len(request.enforced_tokens.tokens))]
+                engine_prompt['prompt_token_ids'].extend(decoded_tokens)
             # Fill in other keys like MM data
             engine_prompt.update(extra_data)  # type: ignore
         else:
