@@ -22,6 +22,7 @@ from vllm.v1.outputs import PoCOutput
 
 from .gpu_random import (
     generate_inputs,
+    generate_inputs_from_vocab,
     random_pick_indices,
     apply_haar_rotation,
 )
@@ -204,6 +205,14 @@ def execute_poc_batch(
             dim=hidden_size, seq_len=seq_len,
             device=device, dtype=dtype,
         )
+        vocab_size = model_runner.model_config.get_vocab_size()
+        # inputs_embeds = generate_inputs_from_vocab(
+        #     block_hash, public_key, nonces,
+        #     vocab_size=vocab_size,
+        #     seq_len=seq_len,
+        #     model=model,
+        #     device=device, dtype=dtype,
+        # )
         if inputs_embeds is None:
             raise RuntimeError(f"generate_inputs returned None for batch_size={batch_size}, "
                              f"seq_len={seq_len}, hidden_size={hidden_size}")
@@ -261,10 +270,40 @@ def execute_poc_batch(
     
     # Extract last token hidden state
     hidden_states = hidden_states.view(batch_size, seq_len, -1)
-    last_hidden = hidden_states[:, -1, :].float()
-    
+    last_hidden = hidden_states[:, -1, :]
+    # argmax_indices = last_hidden.argmax(dim=-1).cpu().tolist()
+    # Argmax of the normalized last hidden state per nonce
+    logits = model.compute_logits(last_hidden)
+    logits_indices = random_pick_indices(block_hash, public_key, nonces, vocab_size, 4, device)
+    sampled_logits = torch.gather(logits, dim=1, index=logits_indices)
+    # sampled_logits shape: [batch_size, k_dim]  — logit values at those positions
+    # Previous approaches (commented out):
+    # argmax:
+    local_argmax = sampled_logits.argmax(dim=-1)
+    batch_arange = torch.arange(len(nonces), device=device)
+    argmax_indices = logits_indices[batch_arange, local_argmax].cpu().tolist()
+    argmax_logits = sampled_logits[batch_arange, local_argmax].float().cpu().tolist()
+
+    #   geo-mean + bit-reinterpret:
+    #           log_sum = torch.log(vals.abs() + 1e-8).median(dim=-1).values
+    #           geo_mean = torch.exp(log_sum)
+    #           argmax_indices = (geo_mean.view(torch.int32).abs() % vocab_size).tolist()
+
+    # Current: symmetric invariants of (logits_indices, sampled_logits) via F()
+    # argmax_indices: list[int] = []
+    # argmax_logits:  list[float] = []
+    # for i in range(len(nonces)):
+    #     idx, score = F(logits_indices[i], sampled_logits[i], vocab_size)
+    #     argmax_indices.append(idx)
+    #     argmax_logits.append(score)
+
+
     # Normalize to unit sphere
-    last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
+    last_hidden = last_hidden.float() / (last_hidden.float().norm(dim=-1, keepdim=True) + 1e-8)
+    
+    # # Argmax of the normalized last hidden state per nonce
+    # argmax_indices = last_hidden.argmax(dim=-1).cpu().tolist()
+    
     
     # Per-nonce k-dim pick + Haar rotation
     indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, k_dim, device)
@@ -277,6 +316,8 @@ def execute_poc_batch(
 
     # Convert to FP16 for artifact encoding
     vectors_f16 = yk.half().cpu().numpy()
+    xk_f16 = xk.half().cpu().numpy()
+    hidden_f16 = last_hidden.half().cpu().numpy()
 
     torch.cuda.synchronize()
     t_post_end = time.perf_counter()
@@ -297,6 +338,10 @@ def execute_poc_batch(
         results.append(PoCOutput(
             nonce=nonce,
             vector_b64=vector_b64,
+            argmax_idx=int(argmax_indices[i]),
+            argmax_logit=float(argmax_logits[i]),
+            xk_b64=encode_vector(xk_f16[i]),
+            hidden_b64=encode_vector(hidden_f16[i]),
         ))
 
     return results

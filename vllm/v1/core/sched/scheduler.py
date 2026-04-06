@@ -1003,6 +1003,10 @@ class Scheduler(SchedulerInterface):
                         poc_output = {
                             "nonce": poc_obj.nonce,
                             "vector_b64": poc_obj.vector_b64,
+                            "argmax_idx": getattr(poc_obj, "argmax_idx", -1),
+                            "argmax_logit": getattr(poc_obj, "argmax_logit", 0.0),
+                            "xk_b64": getattr(poc_obj, "xk_b64", ""),
+                            "hidden_b64": getattr(poc_obj, "hidden_b64", ""),
                         }
 
                 outputs[request.client_index].append(

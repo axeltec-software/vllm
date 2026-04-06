@@ -236,10 +236,18 @@ async def _compute_nonce_artifacts(
                         return {
                             "nonce": poc_out.get("nonce", nonce),
                             "vector_b64": poc_out.get("vector_b64", ""),
+                            "argmax_idx": poc_out.get("argmax_idx", -1),
+                            "argmax_logit": poc_out.get("argmax_logit", 0.0),
+                            "xk_b64": poc_out.get("xk_b64", ""),
+                            "hidden_b64": poc_out.get("hidden_b64", ""),
                         }
                     return {
                         "nonce": poc_out.nonce,
                         "vector_b64": poc_out.vector_b64,
+                        "argmax_idx": getattr(poc_out, "argmax_idx", -1),
+                        "argmax_logit": getattr(poc_out, "argmax_logit", 0.0),
+                        "xk_b64": getattr(poc_out, "xk_b64", ""),
+                        "hidden_b64": getattr(poc_out, "hidden_b64", ""),
                     }
         except Exception as e:
             logger.error(f"Error computing nonce {nonce}: {e}")

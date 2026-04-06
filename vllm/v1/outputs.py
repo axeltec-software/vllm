@@ -104,6 +104,10 @@ PoolerOutput = torch.Tensor | list[torch.Tensor]
 class PoCOutput:
     nonce: int
     vector_b64: str
+    argmax_idx: int = -1
+    argmax_logit: float = 0.0
+    xk_b64: str = ""
+    hidden_b64: str = ""
 
 
 @dataclass

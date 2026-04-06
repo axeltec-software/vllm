@@ -90,6 +90,63 @@ def generate_inputs(
     return result
 
 
+def generate_inputs_from_vocab(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    vocab_size: int,
+    seq_len: int,
+    model: "torch.nn.Module",
+    device: torch.device,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """Generate deterministic input embeddings by sampling random token ids.
+
+    Instead of drawing from a Gaussian distribution (like generate_inputs),
+    this function samples token ids uniformly from [0, vocab_size) using the
+    same deterministic seeding scheme, then retrieves their embeddings through
+    the model's embedding table via model.get_input_embeddings().
+
+    The resulting embeddings therefore live in the same semantic space as
+    real token embeddings, while remaining fully deterministic per
+    (block_hash, public_key, nonce).
+
+    Args:
+        block_hash: Block hash for seeding.
+        public_key: Public key for seeding.
+        nonces: List of nonce values; one sequence is produced per nonce.
+        vocab_size: Vocabulary size — token ids are sampled from [0, vocab_size).
+        seq_len: Number of tokens per sequence.
+        model: The LLM module; must expose get_input_embeddings(input_ids).
+        device: Target device.
+        dtype: Output dtype (default float16).
+
+    Returns:
+        Tensor of shape [batch_size, seq_len, hidden_size].
+    """
+    batch_size = len(nonces)
+    total_tokens = seq_len  # tokens needed per nonce
+
+    # Build the flat token-id tensor for all nonces at once, then embed in
+    # a single call to avoid repeated CPU→GPU copies.
+    all_token_ids = torch.empty(
+        batch_size * total_tokens, dtype=torch.int64, device=device
+    )
+
+    for i, nonce in enumerate(nonces):
+        seed_str = f"{block_hash}_{public_key}_nonce{nonce}_vocab"
+        seed = _seed_from_string(seed_str)
+        # _uniform returns float32 in [0, 1); scale and floor to [0, vocab_size).
+        u = _uniform(seed, total_tokens, device)
+        token_ids = (u * vocab_size).long().clamp(0, vocab_size - 1)
+        all_token_ids[i * total_tokens : (i + 1) * total_tokens] = token_ids
+
+    # Single embedding lookup: [batch_size * seq_len, hidden_size]
+    embeds = model.get_input_embeddings(all_token_ids)
+
+    return embeds.view(batch_size, seq_len, -1).to(dtype)
+
+
 def generate_target(
     block_hash: str,
     public_key: str,
