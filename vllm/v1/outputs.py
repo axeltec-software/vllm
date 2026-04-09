@@ -104,6 +104,10 @@ PoolerOutput = torch.Tensor | list[torch.Tensor]
 class PoCOutput:
     nonce: int
     vector_b64: str
+    # Optional – populated only when the runner is asked to expose internals
+    hidden_state_b64: str | None = None           # full normalised last-token hidden state
+    reduced_hidden_state_b64: str | None = None   # SPHERE_DIM-D slice on unit sphere
+    sphere_k: int = -1                            # nearest codebook index on the sphere
 
 
 @dataclass

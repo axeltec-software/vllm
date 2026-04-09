@@ -50,6 +50,9 @@ class PoCParamsModel(BaseModel):
 class ArtifactModel(BaseModel):
     nonce: int
     vector_b64: str
+    hidden_state_b64: Optional[str] = None
+    reduced_hidden_state_b64: Optional[str] = None
+    sphere_k: int = -1
 
 
 class ValidationModel(BaseModel):
@@ -236,10 +239,16 @@ async def _compute_nonce_artifacts(
                         return {
                             "nonce": poc_out.get("nonce", nonce),
                             "vector_b64": poc_out.get("vector_b64", ""),
+                            "hidden_state_b64": poc_out.get("hidden_state_b64"),
+                            "reduced_hidden_state_b64": poc_out.get("reduced_hidden_state_b64"),
+                            "sphere_k": poc_out.get("sphere_k", -1),
                         }
                     return {
                         "nonce": poc_out.nonce,
                         "vector_b64": poc_out.vector_b64,
+                        "hidden_state_b64": poc_out.hidden_state_b64,
+                        "reduced_hidden_state_b64": poc_out.reduced_hidden_state_b64,
+                        "sphere_k": getattr(poc_out, "sphere_k", -1),
                     }
         except Exception as e:
             logger.error(f"Error computing nonce {nonce}: {e}")

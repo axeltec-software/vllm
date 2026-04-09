@@ -31,6 +31,14 @@ logger = init_logger(__name__)
 
 DEFAULT_K_DIM = 12
 
+# ── Sphere experiment knobs ───────────────────────────────────────────────
+# SPHERE_DIM : dimension of the truncated hidden-state slice.
+#              3 = ordinary sphere S², 2 = circle S¹, 16 = hypersphere, …
+# K_POINTS   : number of reference codebook points on that sphere.
+#              Points are placed to be as equidistant as possible (Thomson problem).
+SPHERE_DIM: int = 256
+K_POINTS:   int = 16
+
 
 @contextmanager
 def bypass_torch_compile():
@@ -114,6 +122,114 @@ def _create_v1_attn_metadata(
                 attn_metadata_dict[layer_name] = layer_metadata
 
     return attn_metadata_dict
+
+
+# ---------------------------------------------------------------------------
+# Sphere projection utilities  (experimental)
+# ---------------------------------------------------------------------------
+
+def project_to_sphere(v: torch.Tensor) -> torch.Tensor:
+    """Normalize [..., dim] vectors to the unit sphere (L2 norm = 1)."""
+    return v / (v.norm(dim=-1, keepdim=True) + 1e-8)
+
+
+def _halton_on_sphere(n_points: int, dim: int) -> torch.Tensor:
+    """Return n_points deterministic, low-discrepancy unit vectors on S^(dim-1).
+
+    Uses the Halton sequence (base-prime per dimension) mapped to the sphere
+    via the logit transform.  No randomness — identical output for any call
+    with the same (n_points, dim).
+    """
+    _PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53]
+    coords: list[list[float]] = []
+    for d in range(dim):
+        base = _PRIMES[d % len(_PRIMES)]
+        col: list[float] = []
+        for i in range(1, n_points + 1):
+            f, r = 1.0, 0.0
+            j = i
+            while j > 0:
+                f /= base
+                r += f * (j % base)
+                j //= base
+            col.append(r)
+        coords.append(col)
+
+    # [n_points, dim] in (0, 1)^dim  →  logit  →  R^dim  →  sphere
+    raw = torch.tensor(coords, dtype=torch.float32).T.clamp(0.01, 0.99)
+    pts = torch.log(raw / (1.0 - raw))          # logit: roughly normal spread
+    return project_to_sphere(pts)
+
+
+def build_equidistant_codebook(
+    n_points: int,
+    dim: int,
+    n_steps: int = 500,
+    lr: float = 0.05,
+) -> torch.Tensor:
+    """Build a codebook of approximately equidistant points on S^(dim-1).
+
+    Solves the Thomson problem: minimize the electrostatic repulsion energy
+    (sum of 1/distance for all pairs) so points spread as uniformly as
+    possible over the sphere.
+
+    Initialisation is deterministic (Halton sequence) — no randomness.
+    The result is cached in _SPHERE_CODEBOOK at module load time.
+
+    Args:
+        n_points : number of points  → K_POINTS
+        dim      : sphere dimension  → SPHERE_DIM
+        n_steps  : gradient-descent steps (more = closer to optimum)
+        lr       : Adam learning rate
+
+    Returns:
+        [n_points, dim]  float32 unit vectors
+    """
+    # inference_mode(False) is required: the worker process runs inside
+    # torch.inference_mode which is stricter than no_grad — tensors cannot
+    # track gradients at all, so .backward() would fail without this.
+    with torch.inference_mode(mode=False):
+        pts = _halton_on_sphere(n_points, dim).clone().requires_grad_(True)
+        opt = torch.optim.Adam([pts], lr=lr)
+
+        eye = torch.eye(n_points)                   # mask for diagonal
+        for _ in range(n_steps):
+            opt.zero_grad()
+            p = project_to_sphere(pts)              # keep on sphere each step
+            diff = p.unsqueeze(0) - p.unsqueeze(1)  # [n, n, dim]
+            d2   = (diff * diff).sum(-1)            # [n, n]  pairwise sq-dist
+            # Thomson energy: repulsion ∝ 1/d; mask self-pairs
+            energy = ((1.0 - eye) / (d2 + 1e-8)).sum()
+            energy.backward()
+            opt.step()
+
+        result = project_to_sphere(pts).detach()
+    return result
+
+
+# Built once at module load — reused for every batch.
+# Change SPHERE_DIM / K_POINTS at the top and restart to get a new codebook.
+_SPHERE_CODEBOOK: torch.Tensor = build_equidistant_codebook(K_POINTS, SPHERE_DIM)
+
+
+def nearest_sphere_index(
+    query: torch.Tensor,
+    codebook: torch.Tensor,
+) -> torch.Tensor:
+    """Return the index of the nearest codebook point for each query vector.
+
+    On the unit sphere cosine similarity = dot product, so argmax of the
+    dot product gives the nearest neighbour.
+
+    Args:
+        query    : [batch, dim]    — unit vectors (one per nonce)
+        codebook : [K_POINTS, dim] — unit vectors from _SPHERE_CODEBOOK
+
+    Returns:
+        [batch]  int64 — index k in [0, K_POINTS)
+    """
+    sims = query.float() @ codebook.float().T   # [batch, K_POINTS]
+    return sims.argmax(dim=-1)                  # [batch]
 
 
 @torch.inference_mode()
@@ -278,6 +394,24 @@ def execute_poc_batch(
     # Convert to FP16 for artifact encoding
     vectors_f16 = yk.half().cpu().numpy()
 
+    # ── Sphere projection experiment ──────────────────────────────────────
+    # Pick SPHERE_DIM dimensions from the hidden state and project to sphere.
+    # The K_POINTS equidistant codebook is pre-built at module load (_SPHERE_CODEBOOK).
+    sphere_indices = random_pick_indices(
+        block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device
+    )
+    xk_sphere = project_to_sphere(
+        torch.gather(last_hidden, 1, sphere_indices)
+    )   # [batch, SPHERE_DIM]  — unit vectors on S^(SPHERE_DIM-1)
+
+    codebook = _SPHERE_CODEBOOK.to(device=device, dtype=last_hidden.dtype)
+    # k ∈ [0, K_POINTS): index of nearest equidistant codebook point per nonce
+    sphere_k      = nearest_sphere_index(xk_sphere, codebook)  # [batch]
+    sphere_k_list = sphere_k.cpu().tolist()
+
+    last_hidden_cpu = last_hidden.float().cpu().numpy()
+    xk_sphere_cpu   = xk_sphere.float().cpu().numpy()
+
     torch.cuda.synchronize()
     t_post_end = time.perf_counter()
 
@@ -297,6 +431,9 @@ def execute_poc_batch(
         results.append(PoCOutput(
             nonce=nonce,
             vector_b64=vector_b64,
+            hidden_state_b64=encode_vector(last_hidden_cpu[i]),
+            reduced_hidden_state_b64=encode_vector(xk_sphere_cpu[i]),
+            sphere_k=sphere_k_list[i],
         ))
 
     return results

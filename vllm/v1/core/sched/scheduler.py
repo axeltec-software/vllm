@@ -1003,6 +1003,9 @@ class Scheduler(SchedulerInterface):
                         poc_output = {
                             "nonce": poc_obj.nonce,
                             "vector_b64": poc_obj.vector_b64,
+                            "hidden_state_b64": poc_obj.hidden_state_b64,
+                            "reduced_hidden_state_b64": poc_obj.reduced_hidden_state_b64,
+                            "sphere_k": getattr(poc_obj, "sphere_k", -1),
                         }
 
                 outputs[request.client_index].append(
