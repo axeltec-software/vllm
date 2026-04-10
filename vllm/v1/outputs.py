@@ -107,7 +107,11 @@ class PoCOutput:
     # Optional – populated only when the runner is asked to expose internals
     hidden_state_b64: str | None = None           # full normalised last-token hidden state
     reduced_hidden_state_b64: str | None = None   # SPHERE_DIM-D slice on unit sphere
-    sphere_k: int = -1                            # nearest codebook index on the sphere
+    sphere_k: int = -1                            # nearest codebook index on the sphere (prefill)
+    # Decode-mode statistics: sphere_k chosen at each step.
+    # Index 0 = prefill, indices 1..N = decode steps.
+    # Empty when poc_decode is disabled.
+    sphere_k_steps: list[int] = field(default_factory=list)
 
 
 @dataclass

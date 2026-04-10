@@ -90,6 +90,46 @@ def generate_inputs(
     return result
 
 
+def generate_decode_inputs(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    prev_k: List[int],
+    step: int,
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """Generate deterministic decode-step input embedding chained to previous sphere_k.
+
+    The seed incorporates the nearest codebook index (k) chosen in the previous
+    step so that each decode step is deterministically linked to its predecessor.
+
+    Args:
+        block_hash: Block hash for seeding
+        public_key: Public key for seeding
+        nonces: List of nonce values
+        prev_k: Nearest sphere index from the previous step (one per nonce)
+        step: Decode step index (1-based; step 0 is the prefill)
+        dim: Hidden dimension size
+        device: Target device
+        dtype: Output dtype (default float16)
+
+    Returns:
+        Tensor of shape [batch_size, 1, dim]
+    """
+    batch_size = len(nonces)
+    result = torch.empty(batch_size, 1, dim, device=device, dtype=dtype)
+
+    for i, (nonce, k) in enumerate(zip(nonces, prev_k)):
+        seed_str = f"{block_hash}_{public_key}_nonce{nonce}_decode{step}_k{k}"
+        seed = _seed_from_string(seed_str)
+        normal = _normal(seed, dim, device)
+        result[i, 0] = normal.to(dtype)
+
+    return result
+
+
 def generate_target(
     block_hash: str,
     public_key: str,

@@ -22,6 +22,7 @@ from vllm.v1.outputs import PoCOutput
 
 from .gpu_random import (
     generate_inputs,
+    generate_decode_inputs,
     random_pick_indices,
     apply_haar_rotation,
 )
@@ -282,6 +283,9 @@ def execute_poc_batch(
         model_runner._poc_layer_hooks = cached_hooks
         logger.debug(f"PoC: Registered {cached_hooks.num_layers} layer hooks for block_hash={block_hash[:16]}...")
 
+    poc_decode = first_poc.poc_decode
+    max_tokens = first_poc.max_tokens
+
     if tp_group.world_size > 1:
         # Rendezvous: ensure all TP ranks have entered before broadcast
         dist.barrier(group=tp_group.cpu_group)
@@ -294,6 +298,8 @@ def execute_poc_batch(
                 "hidden_size": hidden_size,
                 "nonces": nonces,
                 "k_dim": k_dim,
+                "poc_decode": 1 if poc_decode else 0,
+                "max_tokens": max_tokens,
             }, src=0)
         else:
             broadcast_data = broadcast_tensor_dict(src=0)
@@ -302,6 +308,8 @@ def execute_poc_batch(
             nonces = list(broadcast_data["nonces"])
             k_dim = int(broadcast_data["k_dim"])
             batch_size = len(nonces)
+            poc_decode = bool(broadcast_data["poc_decode"])
+            max_tokens = int(broadcast_data["max_tokens"])
     
     pp_group = get_pp_group()
 
@@ -371,7 +379,7 @@ def execute_poc_batch(
         return hidden_states
     
     # =========================================================================
-    # TIMING: Phase 3 - Post-processing
+    # TIMING: Phase 3 - Post-processing (prefill)
     # =========================================================================
     t_post_start = time.perf_counter()
     
@@ -415,13 +423,100 @@ def execute_poc_batch(
     torch.cuda.synchronize()
     t_post_end = time.perf_counter()
 
+    # =========================================================================
+    # TIMING: Phase 4 - Decode loop (poc_decode mode)
+    # =========================================================================
+    # sphere_k_steps_per_nonce[i] accumulates the chosen k at every step for
+    # nonce i: index 0 = prefill, indices 1..max_tokens = decode steps.
+    sphere_k_steps_per_nonce: List[List[int]] = [[k] for k in sphere_k_list]
+
+    t_decode_total = 0.0
+
+    if poc_decode and max_tokens > 0:
+        if pp_group.world_size > 1:
+            logger.warning(
+                "PoC decode loop is not supported with pipeline parallelism "
+                "(pp_group.world_size=%d); skipping decode steps.",
+                pp_group.world_size,
+            )
+        else:
+            prev_k: List[int] = sphere_k_list  # k values from the prefill step
+
+            for step in range(1, max_tokens + 1):
+                torch.cuda.synchronize()
+                t_dec_step_start = time.perf_counter()
+
+                # ── TP sync ──────────────────────────────────────────────
+                if tp_group.world_size > 1:
+                    dist.barrier(group=tp_group.cpu_group)
+
+                # Generate decode embedding: seed incorporates previous k
+                decode_embeds = generate_decode_inputs(
+                    block_hash, public_key, nonces, prev_k,
+                    step=step, dim=hidden_size,
+                    device=device, dtype=dtype,
+                )  # [batch_size, 1, hidden_size]
+
+                # Position for this decode token (seq_len + step - 1)
+                decode_pos = torch.full(
+                    (batch_size,), seq_len + step - 1,
+                    device=device, dtype=torch.long,
+                )
+                decode_attn_meta = _create_v1_attn_metadata(
+                    model_runner, batch_size, 1, device
+                )
+
+                with set_forward_context(decode_attn_meta, vllm_config,
+                                         cudagraph_runtime_mode=CUDAGraphMode.NONE):
+                    with poc_forward_context():
+                        with bypass_torch_compile():
+                            hs_dec = model(
+                                input_ids=None,
+                                positions=decode_pos,
+                                intermediate_tensors=None,
+                                inputs_embeds=decode_embeds.view(-1, hidden_size),
+                            )
+
+                torch.cuda.synchronize()
+
+                # Extract hidden state for the single decode token
+                hs_dec = hs_dec.view(batch_size, 1, -1)
+                last_hidden_dec = hs_dec[:, 0, :].float()
+                last_hidden_dec = last_hidden_dec / (
+                    last_hidden_dec.norm(dim=-1, keepdim=True) + 1e-8
+                )
+
+                # Project to sphere and find nearest codebook index
+                sph_idx_dec = random_pick_indices(
+                    block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device
+                )
+                xk_sph_dec = project_to_sphere(
+                    torch.gather(last_hidden_dec, 1, sph_idx_dec)
+                )
+                sphere_k_dec = nearest_sphere_index(xk_sph_dec, codebook)
+                step_k_list: List[int] = sphere_k_dec.cpu().tolist()
+
+                for i, k in enumerate(step_k_list):
+                    sphere_k_steps_per_nonce[i].append(k)
+
+                prev_k = step_k_list
+
+                t_decode_total += time.perf_counter() - t_dec_step_start
+
+            logger.debug(
+                "PoC decode: %d steps completed in %.4fs total",
+                max_tokens, t_decode_total,
+            )
+
     t_input = t_input_end - t_input_start
     t_fwd = t_fwd_end - t_fwd_start
     t_post = t_post_end - t_post_start
-    t_total = t_input + t_fwd + t_post
+    t_total = t_input + t_fwd + t_post + t_decode_total
     logger.info(
-        f"POC Timing: batch={batch_size}, seq_len={seq_len} | "
-        f"input_gen={t_input:.4f}s, model_fwd={t_fwd:.4f}s, postproc={t_post:.4f}s, "
+        f"POC Timing: batch={batch_size}, seq_len={seq_len}, "
+        f"decode_steps={max_tokens if poc_decode else 0} | "
+        f"input_gen={t_input:.4f}s, model_fwd={t_fwd:.4f}s, "
+        f"postproc={t_post:.4f}s, decode={t_decode_total:.4f}s, "
         f"total={t_total:.4f}s"
     )
 
@@ -434,6 +529,7 @@ def execute_poc_batch(
             hidden_state_b64=encode_vector(last_hidden_cpu[i]),
             reduced_hidden_state_b64=encode_vector(xk_sphere_cpu[i]),
             sphere_k=sphere_k_list[i],
+            sphere_k_steps=sphere_k_steps_per_nonce[i],
         ))
 
     return results

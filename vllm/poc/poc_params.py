@@ -12,6 +12,9 @@ class PoCParams:
     nonce: int
     seq_len: int = 256
     k_dim: int = 12
+    # Decode-mode parameters (enabled by --poc-decode server flag)
+    poc_decode: bool = False   # run decode steps after prefill
+    max_tokens: int = 0        # number of decode steps (0 = prefill-only)
 
     def clone(self) -> "PoCParams":
         return PoCParams(
@@ -21,6 +24,8 @@ class PoCParams:
             nonce=self.nonce,
             seq_len=self.seq_len,
             k_dim=self.k_dim,
+            poc_decode=self.poc_decode,
+            max_tokens=self.max_tokens,
         )
 
     def __post_init__(self):
@@ -28,3 +33,5 @@ class PoCParams:
             raise ValueError(f"seq_len must be positive, got {self.seq_len}")
         if self.k_dim <= 0:
             raise ValueError(f"k_dim must be positive, got {self.k_dim}")
+        if self.max_tokens < 0:
+            raise ValueError(f"max_tokens must be >= 0, got {self.max_tokens}")

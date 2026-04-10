@@ -1544,7 +1544,11 @@ def build_app(args: Namespace) -> FastAPI:
     from vllm.poc.routes import router as poc_router
     app.include_router(poc_router)
     app.state.poc_enabled = True
-    logger.info("PoC (Proof of Compute) API enabled")
+    app.state.poc_decode = getattr(args, "poc_decode", False)
+    if app.state.poc_decode:
+        logger.info("PoC (Proof of Compute) API enabled [decode mode ON]")
+    else:
+        logger.info("PoC (Proof of Compute) API enabled")
 
     mount_metrics(app)
 

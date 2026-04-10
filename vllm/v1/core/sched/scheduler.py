@@ -1006,6 +1006,7 @@ class Scheduler(SchedulerInterface):
                             "hidden_state_b64": poc_obj.hidden_state_b64,
                             "reduced_hidden_state_b64": poc_obj.reduced_hidden_state_b64,
                             "sphere_k": getattr(poc_obj, "sphere_k", -1),
+                            "sphere_k_steps": getattr(poc_obj, "sphere_k_steps", []),
                         }
 
                 outputs[request.client_index].append(

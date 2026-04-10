@@ -45,6 +45,7 @@ class PoCParamsModel(BaseModel):
     model: str
     seq_len: int
     k_dim: int = 12
+    max_tokens: int = 0   # decode steps after prefill (0 = prefill-only)
 
 
 class ArtifactModel(BaseModel):
@@ -53,6 +54,7 @@ class ArtifactModel(BaseModel):
     hidden_state_b64: Optional[str] = None
     reduced_hidden_state_b64: Optional[str] = None
     sphere_k: int = -1
+    sphere_k_steps: List[int] = []   # k at each step: [prefill, decode1, …]
 
 
 class ValidationModel(BaseModel):
@@ -196,6 +198,8 @@ async def _compute_nonce_artifacts(
     block_height: int,
     seq_len: int,
     k_dim: int,
+    poc_decode: bool = False,
+    max_tokens: int = 0,
     app=None,
     blocking: bool = False,
 ) -> List[dict]:
@@ -222,6 +226,8 @@ async def _compute_nonce_artifacts(
             nonce=nonce,
             seq_len=seq_len,
             k_dim=k_dim,
+            poc_decode=poc_decode,
+            max_tokens=max_tokens,
         )
         request_id = f"poc-{uuid.uuid4()}"
 
@@ -242,6 +248,7 @@ async def _compute_nonce_artifacts(
                             "hidden_state_b64": poc_out.get("hidden_state_b64"),
                             "reduced_hidden_state_b64": poc_out.get("reduced_hidden_state_b64"),
                             "sphere_k": poc_out.get("sphere_k", -1),
+                            "sphere_k_steps": poc_out.get("sphere_k_steps", []),
                         }
                     return {
                         "nonce": poc_out.nonce,
@@ -249,6 +256,7 @@ async def _compute_nonce_artifacts(
                         "hidden_state_b64": poc_out.hidden_state_b64,
                         "reduced_hidden_state_b64": poc_out.reduced_hidden_state_b64,
                         "sphere_k": getattr(poc_out, "sphere_k", -1),
+                        "sphere_k_steps": getattr(poc_out, "sphere_k_steps", []),
                     }
         except Exception as e:
             logger.error(f"Error computing nonce {nonce}: {e}")
@@ -289,6 +297,8 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
         "batch_size": body.batch_size,
         "seq_len": body.params.seq_len,
         "k_dim": body.params.k_dim,
+        "poc_decode": getattr(request.app.state, "poc_decode", False),
+        "max_tokens": body.params.max_tokens,
     }
 
     stats = {"start_time": 0, "total_processed": 0}
@@ -352,6 +362,8 @@ async def _generation_loop(
                 config["block_hash"], config["public_key"],
                 config.get("block_height", 0),
                 config["seq_len"], config["k_dim"],
+                poc_decode=config.get("poc_decode", False),
+                max_tokens=config.get("max_tokens", 0),
                 app=app, blocking=blocking,
             )
             
@@ -386,12 +398,16 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
 
     app_id = id(request.app)
 
+    poc_decode = getattr(request.app.state, "poc_decode", False)
+
     if body.wait:
         # Sync path: compute all nonces and return
         artifacts = await _compute_nonce_artifacts(
             engine_client, body.nonces,
             body.block_hash, body.public_key, body.block_height,
             body.params.seq_len, body.params.k_dim,
+            poc_decode=poc_decode,
+            max_tokens=body.params.max_tokens,
             app=request.app, blocking=body.blocking,
         )
 
@@ -462,6 +478,8 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 engine_client, body.nonces,
                 body.block_hash, body.public_key, body.block_height,
                 body.params.seq_len, body.params.k_dim,
+                poc_decode=poc_decode,
+                max_tokens=body.params.max_tokens,
                 app=app, blocking=body.blocking,
             )
             task_state.update({
