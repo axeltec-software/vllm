@@ -426,9 +426,32 @@ def execute_poc_batch(
     # =========================================================================
     # TIMING: Phase 4 - Decode loop (poc_decode mode)
     # =========================================================================
-    # sphere_k_steps_per_nonce[i] accumulates the chosen k at every step for
-    # nonce i: index 0 = prefill, indices 1..max_tokens = decode steps.
+    # sphere_k_steps_per_nonce[i]: computed k at each step (index 0 = prefill).
     sphere_k_steps_per_nonce: List[List[int]] = [[k] for k in sphere_k_list]
+
+    # Per-nonce mismatch counters for validation requests.
+    # -1 means the nonce is an inference (non-validation) request.
+    inf_steps_per_nonce: List[Optional[List[int]]] = [
+        req.poc_params.inference_sphere_k_steps for req in poc_requests
+    ]
+    mismatch_count: List[int] = [
+        0 if s is not None else -1 for s in inf_steps_per_nonce
+    ]
+
+    # Check prefill k against inference reference (step 0).
+    for i, inf_steps in enumerate(inf_steps_per_nonce):
+        if inf_steps is not None and len(inf_steps) > 0:
+            if sphere_k_list[i] != inf_steps[0]:
+                mismatch_count[i] += 1
+
+    # Initial prev_k for the decode loop: validation requests use the
+    # inference prefill k so both servers share the same decode trajectory.
+    prev_k: List[int] = [
+        (inf_steps_per_nonce[i][0]
+         if inf_steps_per_nonce[i] is not None and len(inf_steps_per_nonce[i]) > 0
+         else sphere_k_list[i])
+        for i in range(batch_size)
+    ]
 
     t_decode_total = 0.0
 
@@ -440,8 +463,6 @@ def execute_poc_batch(
                 pp_group.world_size,
             )
         else:
-            prev_k: List[int] = sphere_k_list  # k values from the prefill step
-
             for step in range(1, max_tokens + 1):
                 torch.cuda.synchronize()
                 t_dec_step_start = time.perf_counter()
@@ -450,14 +471,15 @@ def execute_poc_batch(
                 if tp_group.world_size > 1:
                     dist.barrier(group=tp_group.cpu_group)
 
-                # Generate decode embedding: seed incorporates previous k
+                # Generate decode embedding seeded by prev_k.
+                # For validation nonces prev_k already holds the inference k,
+                # so both servers run an identical forward pass.
                 decode_embeds = generate_decode_inputs(
                     block_hash, public_key, nonces, prev_k,
                     step=step, dim=hidden_size,
                     device=device, dtype=dtype,
                 )  # [batch_size, 1, hidden_size]
 
-                # Position for this decode token (seq_len + step - 1)
                 decode_pos = torch.full(
                     (batch_size,), seq_len + step - 1,
                     device=device, dtype=torch.long,
@@ -479,14 +501,12 @@ def execute_poc_batch(
 
                 torch.cuda.synchronize()
 
-                # Extract hidden state for the single decode token
                 hs_dec = hs_dec.view(batch_size, 1, -1)
                 last_hidden_dec = hs_dec[:, 0, :].float()
                 last_hidden_dec = last_hidden_dec / (
                     last_hidden_dec.norm(dim=-1, keepdim=True) + 1e-8
                 )
 
-                # Project to sphere and find nearest codebook index
                 sph_idx_dec = random_pick_indices(
                     block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device
                 )
@@ -496,10 +516,22 @@ def execute_poc_batch(
                 sphere_k_dec = nearest_sphere_index(xk_sph_dec, codebook)
                 step_k_list: List[int] = sphere_k_dec.cpu().tolist()
 
-                for i, k in enumerate(step_k_list):
-                    sphere_k_steps_per_nonce[i].append(k)
+                for i, computed_k in enumerate(step_k_list):
+                    sphere_k_steps_per_nonce[i].append(computed_k)
 
-                prev_k = step_k_list
+                # Build prev_k for the next step.  Validation nonces use the
+                # inference reference k so the trajectories stay aligned.
+                new_prev_k: List[int] = []
+                for i, computed_k in enumerate(step_k_list):
+                    inf_steps = inf_steps_per_nonce[i]
+                    if inf_steps is not None and step < len(inf_steps):
+                        inf_k = inf_steps[step]
+                        if computed_k != inf_k:
+                            mismatch_count[i] += 1
+                        new_prev_k.append(inf_k)
+                    else:
+                        new_prev_k.append(computed_k)
+                prev_k = new_prev_k
 
                 t_decode_total += time.perf_counter() - t_dec_step_start
 
@@ -530,6 +562,7 @@ def execute_poc_batch(
             reduced_hidden_state_b64=encode_vector(xk_sphere_cpu[i]),
             sphere_k=sphere_k_list[i],
             sphere_k_steps=sphere_k_steps_per_nonce[i],
+            n_sphere_mismatches=mismatch_count[i],
         ))
 
     return results

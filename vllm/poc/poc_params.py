@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 
 @dataclass
@@ -15,6 +16,18 @@ class PoCParams:
     # Decode-mode parameters (enabled by --poc-decode server flag)
     poc_decode: bool = False   # run decode steps after prefill
     max_tokens: int = 0        # number of decode steps (0 = prefill-only)
+    # Validation mode: when set, this request tracks deviations from an
+    # inference run instead of freely generating its own k-id sequence.
+    # The list contains sphere_k_steps from the reference inference run
+    # (index 0 = prefill, 1..N = decode steps).  At each step the validation
+    # server computes its own k-id, compares against the reference, and uses
+    # the reference k-id to seed the *next* decode embedding so that both
+    # servers always run the same forward pass regardless of local deviations.
+    inference_sphere_k_steps: Optional[List[int]] = field(default=None, repr=False)
+
+    @property
+    def is_validation(self) -> bool:
+        return self.inference_sphere_k_steps is not None
 
     def clone(self) -> "PoCParams":
         return PoCParams(
@@ -26,6 +39,10 @@ class PoCParams:
             k_dim=self.k_dim,
             poc_decode=self.poc_decode,
             max_tokens=self.max_tokens,
+            inference_sphere_k_steps=(
+                list(self.inference_sphere_k_steps)
+                if self.inference_sphere_k_steps is not None else None
+            ),
         )
 
     def __post_init__(self):

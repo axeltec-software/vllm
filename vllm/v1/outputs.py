@@ -112,6 +112,9 @@ class PoCOutput:
     # Index 0 = prefill, indices 1..N = decode steps.
     # Empty when poc_decode is disabled.
     sphere_k_steps: list[int] = field(default_factory=list)
+    # Validation mode only: number of steps where the locally computed k-id
+    # differed from the reference inference k-id.  -1 for inference requests.
+    n_sphere_mismatches: int = -1
 
 
 @dataclass
