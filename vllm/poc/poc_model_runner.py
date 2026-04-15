@@ -405,6 +405,7 @@ def execute_poc_batch(
     # ── Sphere projection experiment ──────────────────────────────────────
     # Pick SPHERE_DIM dimensions from the hidden state and project to sphere.
     # The K_POINTS equidistant codebook is pre-built at module load (_SPHERE_CODEBOOK).
+    t_sphere_start = time.perf_counter()
     sphere_indices = random_pick_indices(
         block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device
     )
@@ -416,6 +417,8 @@ def execute_poc_batch(
     # k ∈ [0, K_POINTS): index of nearest equidistant codebook point per nonce
     sphere_k      = nearest_sphere_index(xk_sphere, codebook)  # [batch]
     sphere_k_list = sphere_k.cpu().tolist()
+    t_sphere_end = time.perf_counter()
+    t_sphere = t_sphere_end - t_sphere_start
 
     last_hidden_cpu = last_hidden.float().cpu().numpy()
     xk_sphere_cpu   = xk_sphere.float().cpu().numpy()
@@ -549,6 +552,7 @@ def execute_poc_batch(
         f"decode_steps={max_tokens if poc_decode else 0} | "
         f"input_gen={t_input:.4f}s, model_fwd={t_fwd:.4f}s, "
         f"postproc={t_post:.4f}s, decode={t_decode_total:.4f}s, "
+        f"sphere_projection={t_sphere:.4f}s, "
         f"total={t_total:.4f}s"
     )
 

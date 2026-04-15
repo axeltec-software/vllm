@@ -19,10 +19,14 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import traceback
 from typing import Dict, List, Optional, Tuple
+from itertools import islice
+import paramiko
 
 import requests
 
@@ -30,11 +34,17 @@ import requests
 # Defaults
 # ---------------------------------------------------------------------------
 # 65.108.33.83
-PRIMARY_URL        = "http://65.108.33.83:8001"
-PRIMARY_MODEL      = "RedHatAI/Qwen2.5-7B-Instruct-quantized.w8a16"
+#PRIMARY_URL        = "http://65.108.33.83:8001"
+#PRIMARY_MODEL      = "RedHatAI/Qwen2.5-7B-Instruct-quantized.w8a16"
 
-VALIDATION_URL     = "http://0.0.0.0:8001"
-VALIDATION_MODEL   = "RedHatAI/Qwen2.5-7B-Instruct-quantized.w8a16"
+#VALIDATION_URL     = "http://0.0.0.0:8001"
+#VALIDATION_MODEL   = "RedHatAI/Qwen2.5-7B-Instruct-quantized.w8a16"
+
+PRIMARY_URL        = "http://0.0.0.0:8005"
+PRIMARY_MODEL      = "Qwen/Qwen3-0.6B-FP8"
+
+VALIDATION_URL     = "http://0.0.0.0:8010"
+VALIDATION_MODEL   = "Qwen/Qwen3-0.6B"
 
 PUBLIC_KEY   = "default_public_key"
 SEQ_LEN      = 256
@@ -42,6 +52,10 @@ K_DIM        = 12
 BATCH_SIZE   = 8
 TIMEOUT_SEC  = 300
 OUTPUT_DIR   = "results"
+LOG_FN       = "/home/irene/projects/gonka_poc/poc_decode/vllm/vllm.log"
+SERVER_FLAG  = "primary"
+UNAME        = "irene"
+KEY_PATH     = "/home/irene/.ssh/id_rsa" # "/home/irene/.ssh/id_verda_cloud"
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +163,78 @@ def parse_artifacts(resp: dict) -> Dict[int, int]:
     return out
 
 
+# def find_latencies_in_logs(filename: str, start_at_line: int):
+#     batch_latency = 0.0
+#     try:
+#         with open(filename, "r") as f_log:
+#             for s in islice(f_log, start_at_line, None):
+#                 match = re.search(r"sphere_projection=([0-9]+\.[0-9]+)s", s)
+#                 if match:
+#                     batch_latency += float(match.group(1))
+#     except Exception:
+#         traceback.print_exc()
+
+#     return batch_latency
+
+
+# def calc_file_len(filename: str):
+#     try:
+#         with open(filename, "r") as f:
+#             count = 0
+#             for count, line in enumerate(f, 1):
+#                 pass
+#     except Exception:
+#         count = 0
+
+#     return count
+
+def find_latencies_in_logs(filename: str, start_at_line: int, hostname: str, uname: str, key_path: str):
+    batch_sphere_latency = 0.0
+    batch_fwd_latency = 0.0
+
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(hostname, username=uname, key_filename=key_path)
+        sftp = ssh.open_sftp()
+
+        with sftp.open(filename, "r") as f_log:
+            for s in islice(f_log, start_at_line, None):
+                match_sph = re.search(r"sphere_projection=([0-9]+\.[0-9]+)s", s)
+                match_fwd = re.search(r"model_fwd=([0-9]+\.[0-9]+)s", s)
+                if match_sph:
+                    batch_sphere_latency += float(match_sph.group(1))
+                if match_fwd:
+                    batch_fwd_latency += float(match_fwd.group(1))
+        
+        sftp.close()
+        ssh.close()
+    except Exception:
+        traceback.print_exc()
+
+    return batch_sphere_latency, batch_fwd_latency
+
+
+def calc_file_len(filename: str, hostname: str, uname: str, key_path: str):
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(hostname, username=uname, key_filename=key_path)
+        sftp = ssh.open_sftp()
+
+        with sftp.open(filename, "r") as f:
+            count = 0
+            for count, line in enumerate(f, 1):
+                pass
+
+        sftp.close()
+        ssh.close()
+    except Exception:
+        count = 0
+
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -180,6 +266,13 @@ def main() -> None:
     parser.add_argument("--output", default=None,
                         help="Output JSON file (default: auto-generated in results/)")
     args = parser.parse_args()
+
+    if SERVER_FLAG == "primary":
+        url_split = args.primary.split(":")
+    else:
+        url_split = args.validation.split(":")
+
+    server_ip = ':'.join(url_split[:-1]).replace("http://", "").replace("https://", "")
 
     # ── block hashes ──────────────────────────────────────────────────────
     if args.num_hashes is not None:
@@ -217,6 +310,11 @@ def main() -> None:
     # consistency counters: same server, repeated requests
     n_p_consistent = n_p_inconsistent = 0
     n_v_consistent = n_v_inconsistent = 0
+
+    log_lines_number_prev = calc_file_len(LOG_FN, server_ip, UNAME, KEY_PATH)
+    latency_sphere_proj_list = []
+    latency_fwd_list = []
+    rel_lat_sph_list = []
 
     for block_hash in block_hashes:
         print(f"block_hash={block_hash[:12]}...")
@@ -256,6 +354,9 @@ def main() -> None:
 
             if had_error and args.num_requests == 1:
                 continue
+
+            cur_batch_sphere_latency, cur_batch_fwd_latency = find_latencies_in_logs(LOG_FN, log_lines_number_prev, server_ip, UNAME, KEY_PATH)
+            log_lines_number_prev = calc_file_len(LOG_FN, server_ip, UNAME, KEY_PATH)
 
             batch_match = batch_mismatch = 0
             for nonce in batch:
@@ -307,7 +408,14 @@ def main() -> None:
                     n_mismatch     += 1
                     batch_mismatch += 1
 
-            status = "OK" if batch_mismatch == 0 else f"MISMATCH x{batch_mismatch}"
+            status = "OK" if batch_mismatch == 0 else f"MISMATCH x{batch_mismatch}"  
+
+            sph_latency_per_batch = f"latency_sphere_proj={cur_batch_sphere_latency:.4f}s"
+            latency_sphere_proj_list.append(cur_batch_sphere_latency)
+            fwd_latency_per_batch = f"latency_forward_pass={cur_batch_fwd_latency:.4f}s"
+            latency_fwd_list.append(cur_batch_fwd_latency)
+            rel_lat_sph_list.append(cur_batch_sphere_latency / cur_batch_fwd_latency)
+
             extra = ""
             if args.num_requests > 1:
                 p_inc = sum(1 for n in batch if not all(
@@ -315,7 +423,7 @@ def main() -> None:
                 v_inc = sum(1 for n in batch if not all(
                     v == v_runs[n][0] for v in v_runs[n]) if v_runs[n])
                 extra = f"  inconsistent: P={p_inc} V={v_inc}"
-            print(f"{tag}  -> {status}  (match={batch_match}, mismatch={batch_mismatch}){extra}")
+            print(f"{tag}   ->  {status}    (match={batch_match}, mismatch={batch_mismatch})    {extra} {sph_latency_per_batch} {fwd_latency_per_batch}")
 
     # ── output document ───────────────────────────────────────────────────
     n_total    = n_match + n_mismatch
@@ -397,6 +505,18 @@ def main() -> None:
             print("\n  Mismatches per block_hash:")
             for h, cnt in sorted(per_hash.items(), key=lambda x: -x[1]):
                 print(f"    {h[:16]}...  {cnt}")
+
+    mean_sph_latency = sum(latency_sphere_proj_list) / len(latency_sphere_proj_list)
+    mean_fwd_latency = sum(latency_fwd_list) / len(latency_fwd_list)
+    mean_rel_lat_sph = sum(rel_lat_sph_list) / len(rel_lat_sph_list)
+
+    print(f"\nMean forward pass latency per batch: {mean_fwd_latency:.4f}s")
+    print(f"Max forward pass latency per batch: {max(latency_fwd_list):.4f}s")
+    print(f"Min forward pass latency per batch: {min(latency_fwd_list):.4f}s")
+
+    print(f"\nMean sphere projection latency per batch: {mean_sph_latency:.4f}s, relative to forward pass time: {mean_rel_lat_sph:.4f}")
+    print(f"Max sphere projection latency per batch: {max(latency_sphere_proj_list):.4f}s, relative to forward pass time: {max(rel_lat_sph_list):.4f}")
+    print(f"Min sphere projection latency per batch: {min(latency_sphere_proj_list):.4f}s, relative to forward pass time: {min(rel_lat_sph_list):.4f}")
 
     print("=" * 60)
     sys.exit(0 if n_mismatch == 0 else 1)
