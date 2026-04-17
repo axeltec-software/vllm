@@ -27,6 +27,7 @@ import traceback
 from typing import Dict, List, Optional, Tuple
 from itertools import islice
 import paramiko
+import statistics
 
 import requests
 
@@ -47,9 +48,9 @@ VALIDATION_URL     = "http://0.0.0.0:8010"
 VALIDATION_MODEL   = "Qwen/Qwen3-0.6B"
 
 PUBLIC_KEY   = "default_public_key"
-SEQ_LEN      = 256
+SEQ_LEN      = 16
 K_DIM        = 12
-BATCH_SIZE   = 8
+BATCH_SIZE   = 1
 TIMEOUT_SEC  = 300
 OUTPUT_DIR   = "results"
 LOG_FN       = "/home/irene/projects/gonka_poc/poc_decode/vllm/vllm.log"
@@ -121,7 +122,7 @@ def fetch_both(
     def _fetch(label, url, model):
         return label, send_batch(url, model, block_hash, nonces)
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         futures = {
             pool.submit(_fetch, "primary",    primary_url,    primary_model):    "primary",
             pool.submit(_fetch, "validation", validation_url, validation_model): "validation",
@@ -191,6 +192,7 @@ def parse_artifacts(resp: dict) -> Dict[int, int]:
 def find_latencies_in_logs(filename: str, start_at_line: int, hostname: str, uname: str, key_path: str):
     batch_sphere_latency = 0.0
     batch_fwd_latency = 0.0
+    batch_pp_latency = 0.0
 
     try:
         ssh = paramiko.SSHClient()
@@ -201,18 +203,23 @@ def find_latencies_in_logs(filename: str, start_at_line: int, hostname: str, una
         with sftp.open(filename, "r") as f_log:
             for s in islice(f_log, start_at_line, None):
                 match_sph = re.search(r"sphere_projection=([0-9]+\.[0-9]+)s", s)
-                match_fwd = re.search(r"model_fwd=([0-9]+\.[0-9]+)s", s)
+                match_fwd_only = re.search(r"model_fwd=([0-9]+\.[0-9]+)s", s)
+                match_fwd_post = re.search(r"postproc=([0-9]+\.[0-9]+)s", s)
+
                 if match_sph:
                     batch_sphere_latency += float(match_sph.group(1))
-                if match_fwd:
-                    batch_fwd_latency += float(match_fwd.group(1))
+                if match_fwd_only:
+                    batch_fwd_latency += float(match_fwd_only.group(1))
+                if match_fwd_post:
+                    batch_pp_latency += float(match_fwd_post.group(1))
+                
         
         sftp.close()
         ssh.close()
     except Exception:
         traceback.print_exc()
 
-    return batch_sphere_latency, batch_fwd_latency
+    return batch_sphere_latency, batch_fwd_latency, batch_pp_latency
 
 
 def calc_file_len(filename: str, hostname: str, uname: str, key_path: str):
@@ -314,7 +321,7 @@ def main() -> None:
     log_lines_number_prev = calc_file_len(LOG_FN, server_ip, UNAME, KEY_PATH)
     latency_sphere_proj_list = []
     latency_fwd_list = []
-    rel_lat_sph_list = []
+    latency_pp_list = []
 
     for block_hash in block_hashes:
         print(f"block_hash={block_hash[:12]}...")
@@ -355,7 +362,7 @@ def main() -> None:
             if had_error and args.num_requests == 1:
                 continue
 
-            cur_batch_sphere_latency, cur_batch_fwd_latency = find_latencies_in_logs(LOG_FN, log_lines_number_prev, server_ip, UNAME, KEY_PATH)
+            cur_batch_sphere_latency, cur_batch_fwd_latency, cur_batch_pp_latency = find_latencies_in_logs(LOG_FN, log_lines_number_prev, server_ip, UNAME, KEY_PATH)
             log_lines_number_prev = calc_file_len(LOG_FN, server_ip, UNAME, KEY_PATH)
 
             batch_match = batch_mismatch = 0
@@ -414,7 +421,8 @@ def main() -> None:
             latency_sphere_proj_list.append(cur_batch_sphere_latency)
             fwd_latency_per_batch = f"latency_forward_pass={cur_batch_fwd_latency:.4f}s"
             latency_fwd_list.append(cur_batch_fwd_latency)
-            rel_lat_sph_list.append(cur_batch_sphere_latency / cur_batch_fwd_latency)
+            pp_latency_per_batch = f"latency_postprocessing={cur_batch_pp_latency:.4f}s"
+            latency_pp_list.append(cur_batch_pp_latency)
 
             extra = ""
             if args.num_requests > 1:
@@ -423,7 +431,7 @@ def main() -> None:
                 v_inc = sum(1 for n in batch if not all(
                     v == v_runs[n][0] for v in v_runs[n]) if v_runs[n])
                 extra = f"  inconsistent: P={p_inc} V={v_inc}"
-            print(f"{tag}   ->  {status}    (match={batch_match}, mismatch={batch_mismatch})    {extra} {sph_latency_per_batch} {fwd_latency_per_batch}")
+            print(f"{tag}   ->  {status}    (match={batch_match}, mismatch={batch_mismatch})    {extra} {sph_latency_per_batch} {fwd_latency_per_batch} {pp_latency_per_batch}")
 
     # ── output document ───────────────────────────────────────────────────
     n_total    = n_match + n_mismatch
@@ -508,15 +516,22 @@ def main() -> None:
 
     mean_sph_latency = sum(latency_sphere_proj_list) / len(latency_sphere_proj_list)
     mean_fwd_latency = sum(latency_fwd_list) / len(latency_fwd_list)
-    mean_rel_lat_sph = sum(rel_lat_sph_list) / len(rel_lat_sph_list)
+    mean_pp_latency = sum(latency_pp_list) / len(latency_pp_list)
 
-    print(f"\nMean forward pass latency per batch: {mean_fwd_latency:.4f}s")
-    print(f"Max forward pass latency per batch: {max(latency_fwd_list):.4f}s")
-    print(f"Min forward pass latency per batch: {min(latency_fwd_list):.4f}s")
+    print(f"\nMean forward pass latency per batch: {mean_fwd_latency * 1000:.2f}ms")
+    print(f"Median forward pass latency per batch: {statistics.median(latency_fwd_list) * 1000:.2f}ms")
+    print(f"Max forward pass latency per batch: {max(latency_fwd_list) * 1000:.2f}ms")
+    print(f"Min forward pass latency per batch: {min(latency_fwd_list) * 1000:.2f}ms")
 
-    print(f"\nMean sphere projection latency per batch: {mean_sph_latency:.4f}s, relative to forward pass time: {mean_rel_lat_sph:.4f}")
-    print(f"Max sphere projection latency per batch: {max(latency_sphere_proj_list):.4f}s, relative to forward pass time: {max(rel_lat_sph_list):.4f}")
-    print(f"Min sphere projection latency per batch: {min(latency_sphere_proj_list):.4f}s, relative to forward pass time: {min(rel_lat_sph_list):.4f}")
+    print(f"\nMean postprocessing latency per batch: {mean_pp_latency * 1000:.2f}ms")
+    print(f"Median postprocessing latency per batch: {statistics.median(latency_pp_list) * 1000:.2f}ms")
+    print(f"Max postprocessing latency per batch: {max(latency_pp_list) * 1000:.2f}ms")
+    print(f"Min postprocessing latency per batch: {min(latency_pp_list) * 1000:.2f}ms")
+
+    print(f"\nMean sphere projection latency per batch: {mean_sph_latency * 1000:.2f}ms")
+    print(f"Median sphere projection latency per batch: {statistics.median(latency_sphere_proj_list) * 1000:.2f}ms")
+    print(f"Max sphere projection latency per batch: {max(latency_sphere_proj_list) * 1000:.2f}ms")
+    print(f"Min sphere projection latency per batch: {min(latency_sphere_proj_list) * 1000:.2f}ms")
 
     print("=" * 60)
     sys.exit(0 if n_mismatch == 0 else 1)
