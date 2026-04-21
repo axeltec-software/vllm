@@ -51,6 +51,7 @@ PUBLIC_KEY   = "default_public_key"
 SEQ_LEN      = 16
 K_DIM        = 12
 BATCH_SIZE   = 1
+MAX_TOKENS   = 16 # 0 - for poc-prefill only 
 TIMEOUT_SEC  = 300
 OUTPUT_DIR   = "results"
 LOG_FN       = "/home/irene/projects/gonka_poc/poc_decode/vllm/vllm.log"
@@ -98,7 +99,7 @@ def send_batch(
         "node_id":      0,
         "node_count":   1,
         "nonces":       nonces,
-        "params":       {"model": model, "seq_len": SEQ_LEN, "k_dim": K_DIM},
+        "params":       {"model": model, "seq_len": SEQ_LEN, "k_dim": K_DIM, "max_tokens": MAX_TOKENS},
         "batch_size":   len(nonces),
         "wait":         True,
     }
@@ -193,6 +194,10 @@ def find_latencies_in_logs(filename: str, start_at_line: int, hostname: str, una
     batch_sphere_latency = 0.0
     batch_fwd_latency = 0.0
     batch_pp_latency = 0.0
+    batch_decode_latency = 0.0
+    batch_sphere_decode_latency = 0.0
+    batch_decode_step_med_latency = 0.0
+    batch_sphere_decode_step_med_latency = 0.0
 
     try:
         ssh = paramiko.SSHClient()
@@ -202,9 +207,14 @@ def find_latencies_in_logs(filename: str, start_at_line: int, hostname: str, una
 
         with sftp.open(filename, "r") as f_log:
             for s in islice(f_log, start_at_line, None):
-                match_sph = re.search(r"sphere_projection=([0-9]+\.[0-9]+)s", s)
+                match_sph = re.search(r"sphere_projection_prefill=([0-9]+\.[0-9]+)s", s)
                 match_fwd_only = re.search(r"model_fwd=([0-9]+\.[0-9]+)s", s)
                 match_fwd_post = re.search(r"postproc=([0-9]+\.[0-9]+)s", s)
+                match_decode = re.search(r"decode=([0-9]+\.[0-9]+)s", s)
+                match_sphere_decode = re.search(r"sphere_projection_decode=([0-9]+\.[0-9]+)s", s)
+                match_decode_step = re.search(r"decode_step_median=([0-9]+\.[0-9]+)s", s)
+                match_sphere_decode_step = re.search(r"sphere_decode_step_median=([0-9]+\.[0-9]+)s", s)
+
 
                 if match_sph:
                     batch_sphere_latency += float(match_sph.group(1))
@@ -212,14 +222,21 @@ def find_latencies_in_logs(filename: str, start_at_line: int, hostname: str, una
                     batch_fwd_latency += float(match_fwd_only.group(1))
                 if match_fwd_post:
                     batch_pp_latency += float(match_fwd_post.group(1))
-                
-        
+                if match_decode:
+                    batch_decode_latency += float(match_decode.group(1))
+                if match_sphere_decode:
+                    batch_sphere_decode_latency += float(match_sphere_decode.group(1))
+                if match_decode_step:
+                    batch_decode_step_med_latency = float(match_decode_step.group(1))
+                if match_sphere_decode_step:
+                    batch_sphere_decode_step_med_latency = float(match_sphere_decode_step.group(1))
+
         sftp.close()
         ssh.close()
     except Exception:
         traceback.print_exc()
 
-    return batch_sphere_latency, batch_fwd_latency, batch_pp_latency
+    return batch_sphere_latency, batch_fwd_latency, batch_pp_latency, batch_decode_latency, batch_sphere_decode_latency, batch_decode_step_med_latency, batch_sphere_decode_step_med_latency
 
 
 def calc_file_len(filename: str, hostname: str, uname: str, key_path: str):
@@ -319,9 +336,14 @@ def main() -> None:
     n_v_consistent = n_v_inconsistent = 0
 
     log_lines_number_prev = calc_file_len(LOG_FN, server_ip, UNAME, KEY_PATH)
+
     latency_sphere_proj_list = []
     latency_fwd_list = []
     latency_pp_list = []
+    latency_decode_list = []
+    latency_sphere_decode_list = []
+    latency_decode_step_med_list = []
+    latency_sphere_decode_step_med_list = []   
 
     for block_hash in block_hashes:
         print(f"block_hash={block_hash[:12]}...")
@@ -362,7 +384,7 @@ def main() -> None:
             if had_error and args.num_requests == 1:
                 continue
 
-            cur_batch_sphere_latency, cur_batch_fwd_latency, cur_batch_pp_latency = find_latencies_in_logs(LOG_FN, log_lines_number_prev, server_ip, UNAME, KEY_PATH)
+            cur_batch_sphere_latency, cur_batch_fwd_latency, cur_batch_pp_latency, cur_batch_decode_latency, cur_batch_sphere_decode_latency, cur_batch_decode_step_med_latency, cur_batch_sphere_decode_step_med_latency = find_latencies_in_logs(LOG_FN, log_lines_number_prev, server_ip, UNAME, KEY_PATH)
             log_lines_number_prev = calc_file_len(LOG_FN, server_ip, UNAME, KEY_PATH)
 
             batch_match = batch_mismatch = 0
@@ -417,12 +439,24 @@ def main() -> None:
 
             status = "OK" if batch_mismatch == 0 else f"MISMATCH x{batch_mismatch}"  
 
-            sph_latency_per_batch = f"latency_sphere_proj={cur_batch_sphere_latency:.4f}s"
+            # Prefill
+            sph_latency_per_batch = f"latency_sphere_prefill={cur_batch_sphere_latency:.4f}s"
             latency_sphere_proj_list.append(cur_batch_sphere_latency)
             fwd_latency_per_batch = f"latency_forward_pass={cur_batch_fwd_latency:.4f}s"
             latency_fwd_list.append(cur_batch_fwd_latency)
             pp_latency_per_batch = f"latency_postprocessing={cur_batch_pp_latency:.4f}s"
             latency_pp_list.append(cur_batch_pp_latency)
+
+            # Decode
+            decode_latency_per_batch = f"latency_decode={cur_batch_decode_latency:.4f}s"
+            latency_decode_list.append(cur_batch_decode_latency)
+            sphere_decode_latency_per_batch = f"latency_sphere_decode={cur_batch_sphere_decode_latency:.4f}s"
+            latency_sphere_decode_list.append(cur_batch_sphere_decode_latency)
+            decode_step_med_latency_per_batch = f"latency_decode_step_med={cur_batch_decode_step_med_latency:.4f}s"
+            latency_decode_step_med_list.append(cur_batch_decode_step_med_latency)
+            sphere_decode_step_med_latency_per_batch = f"latency_sphere_decode_step_med={cur_batch_sphere_decode_step_med_latency:.4f}s"
+            latency_sphere_decode_step_med_list.append(cur_batch_sphere_decode_step_med_latency)
+
 
             extra = ""
             if args.num_requests > 1:
@@ -431,7 +465,10 @@ def main() -> None:
                 v_inc = sum(1 for n in batch if not all(
                     v == v_runs[n][0] for v in v_runs[n]) if v_runs[n])
                 extra = f"  inconsistent: P={p_inc} V={v_inc}"
-            print(f"{tag}   ->  {status}    (match={batch_match}, mismatch={batch_mismatch})    {extra} {sph_latency_per_batch} {fwd_latency_per_batch} {pp_latency_per_batch}")
+            print(f"{tag}   ->  {status}    (match={batch_match}, mismatch={batch_mismatch})    \
+                  {extra} {sph_latency_per_batch} {fwd_latency_per_batch} {pp_latency_per_batch}  \
+                  {decode_latency_per_batch}  {sphere_decode_latency_per_batch}   \
+                  {decode_step_med_latency_per_batch} {sphere_decode_step_med_latency_per_batch}")
 
     # ── output document ───────────────────────────────────────────────────
     n_total    = n_match + n_mismatch
@@ -517,7 +554,12 @@ def main() -> None:
     mean_sph_latency = sum(latency_sphere_proj_list) / len(latency_sphere_proj_list)
     mean_fwd_latency = sum(latency_fwd_list) / len(latency_fwd_list)
     mean_pp_latency = sum(latency_pp_list) / len(latency_pp_list)
+    mean_decode_latency = sum(latency_decode_list) / len(latency_decode_list)
+    mean_sphere_decode_latency = sum(latency_sphere_decode_list) / len(latency_sphere_decode_list)
+    mean_decode_latency_step_med = sum(latency_decode_step_med_list) / len(latency_decode_step_med_list)
+    mean_sphere_decode_latency_step_med = sum(latency_sphere_decode_step_med_list) / len(latency_sphere_decode_step_med_list)
 
+    # Prefill
     print(f"\nMean forward pass latency per batch: {mean_fwd_latency * 1000:.2f}ms")
     print(f"Median forward pass latency per batch: {statistics.median(latency_fwd_list) * 1000:.2f}ms")
     print(f"Max forward pass latency per batch: {max(latency_fwd_list) * 1000:.2f}ms")
@@ -532,6 +574,27 @@ def main() -> None:
     print(f"Median sphere projection latency per batch: {statistics.median(latency_sphere_proj_list) * 1000:.2f}ms")
     print(f"Max sphere projection latency per batch: {max(latency_sphere_proj_list) * 1000:.2f}ms")
     print(f"Min sphere projection latency per batch: {min(latency_sphere_proj_list) * 1000:.2f}ms")
+
+    # Decode
+    print(f"\nMean decode latency per batch: {mean_decode_latency * 1000:.2f}ms")
+    print(f"Median decode latency per batch: {statistics.median(latency_decode_list) * 1000:.2f}ms")
+    print(f"Max decode latency per batch: {max(latency_decode_list) * 1000:.2f}ms")
+    print(f"Min decode latency per batch: {min(latency_decode_list) * 1000:.2f}ms")
+
+    print(f"\nMean sphere decode latency per batch: {mean_sphere_decode_latency * 1000:.2f}ms")
+    print(f"Median sphere decode latency per batch: {statistics.median(latency_sphere_decode_list) * 1000:.2f}ms")
+    print(f"Max sphere decode latency per batch: {max(latency_sphere_decode_list) * 1000:.2f}ms")
+    print(f"Min sphere decode latency per batch: {min(latency_sphere_decode_list) * 1000:.2f}ms")
+
+    print(f"\nMean decode step median latency per batch: {mean_decode_latency_step_med * 1000:.2f}ms")
+    print(f"Median decode step median latency per batch: {statistics.median(latency_decode_step_med_list) * 1000:.2f}ms")
+    print(f"Max decode step median latency per batch: {max(latency_decode_step_med_list) * 1000:.2f}ms")
+    print(f"Min decode step median latency per batch: {min(latency_decode_step_med_list) * 1000:.2f}ms")
+
+    print(f"\nMean sphere decode step median latency per batch: {mean_sphere_decode_latency_step_med * 1000:.2f}ms")
+    print(f"Median sphere decode step median latency per batch: {statistics.median(latency_sphere_decode_step_med_list) * 1000:.2f}ms")
+    print(f"Max sphere decode step median latency per batch: {max(latency_sphere_decode_step_med_list) * 1000:.2f}ms")
+    print(f"Min sphere decode step median latency per batch: {min(latency_sphere_decode_step_med_list) * 1000:.2f}ms")
 
     print("=" * 60)
     sys.exit(0 if n_mismatch == 0 else 1)

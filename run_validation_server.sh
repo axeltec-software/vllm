@@ -10,4 +10,5 @@ python -m vllm.entrypoints.openai.api_server \
     --port 8010 \
     --gpu-memory-utilization 0.3 \
     --tensor-parallel-size 1 \
-    --pipeline-parallel-size 1
+    --pipeline-parallel-size 1 \
+    --poc-decode 

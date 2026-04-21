@@ -3,6 +3,7 @@
 Executes PoC forward passes for requests identified by the scheduler.
 Adapted from v0.9.1 integration to work with V1's unified scheduler.
 """
+import statistics
 import time
 from contextlib import contextmanager
 from typing import List, Optional, Dict, Any
@@ -457,6 +458,9 @@ def execute_poc_batch(
     ]
 
     t_decode_total = 0.0
+    t_sphere_decode_total = 0.0
+    t_decode_step_list: List[float] = []
+    t_sphere_decode_step_list: List[float] = []
 
     if poc_decode and max_tokens > 0:
         if pp_group.world_size > 1:
@@ -510,6 +514,7 @@ def execute_poc_batch(
                     last_hidden_dec.norm(dim=-1, keepdim=True) + 1e-8
                 )
 
+                t_sphere_dec_step_start = time.perf_counter()
                 sph_idx_dec = random_pick_indices(
                     block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device
                 )
@@ -518,6 +523,8 @@ def execute_poc_batch(
                 )
                 sphere_k_dec = nearest_sphere_index(xk_sph_dec, codebook)
                 step_k_list: List[int] = sphere_k_dec.cpu().tolist()
+                t_sphere_dec_step_stop = time.perf_counter()
+
 
                 for i, computed_k in enumerate(step_k_list):
                     sphere_k_steps_per_nonce[i].append(computed_k)
@@ -536,7 +543,13 @@ def execute_poc_batch(
                         new_prev_k.append(computed_k)
                 prev_k = new_prev_k
 
-                t_decode_total += time.perf_counter() - t_dec_step_start
+                t_dec_step_stop = time.perf_counter()
+                t_decode_total += t_dec_step_stop - t_dec_step_start
+                t_decode_step_list.append(t_dec_step_stop - t_dec_step_start)
+
+                t_sphere_decode_step = t_sphere_dec_step_stop - t_sphere_dec_step_start
+                t_sphere_decode_total += t_sphere_decode_step
+                t_sphere_decode_step_list.append(t_sphere_decode_step)   
 
             logger.debug(
                 "PoC decode: %d steps completed in %.4fs total",
@@ -547,12 +560,18 @@ def execute_poc_batch(
     t_fwd = t_fwd_end - t_fwd_start
     t_post = t_post_end - t_post_start
     t_total = t_input + t_fwd + t_post + t_decode_total
+    t_decode_step_median = statistics.median(t_decode_step_list) if t_decode_step_list else 0.0
+    t_sphere_decode_step_median = statistics.median(t_sphere_decode_step_list) if t_sphere_decode_step_list else 0.0
+
     logger.info(
         f"POC Timing: batch={batch_size}, seq_len={seq_len}, "
         f"decode_steps={max_tokens if poc_decode else 0} | "
         f"input_gen={t_input:.4f}s, model_fwd={t_fwd:.4f}s, "
         f"postproc={t_post:.4f}s, decode={t_decode_total:.4f}s, "
-        f"sphere_projection={t_sphere:.4f}s, "
+        f"sphere_projection_prefill={t_sphere:.4f}s, "
+        f"sphere_projection_decode={t_sphere_decode_total:.4f}s, "
+        f"decode_step_median={t_decode_step_median:.4f}s, "
+        f"sphere_decode_step_median={t_sphere_decode_step_median:.4f}s, "
         f"total={t_total:.4f}s"
     )
 

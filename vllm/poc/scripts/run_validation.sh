@@ -1,1 +1,1 @@
-python3 sphere_cross_validation_v2.py --num-hashes 4 --nonces 0:256 --num-requests 1 --output ./results/sphere_xval_v2-dim256_k16_hashes4_nonce256.json
+python3 sphere_cross_validation_v2.py --num-hashes 2 --nonces 0:64 --num-requests 1 --output ./results/sphere_xval_v2_decode-dim256_k16_hashes2_nonce64.json
