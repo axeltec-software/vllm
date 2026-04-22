@@ -53,6 +53,7 @@ class ArtifactModel(BaseModel):
     vector_b64: str
     hidden_state_b64: Optional[str] = None
     reduced_hidden_state_b64: Optional[str] = None
+    reduced_hidden_state_decode_b64: List[str] = []
     sphere_k: int = -1
     sphere_k_steps: List[int] = []   # k at each step: [prefill, decode1, …]
     # Validation mode only: steps where locally computed k differed from
@@ -259,6 +260,7 @@ async def _compute_nonce_artifacts(
                             "vector_b64": poc_out.get("vector_b64", ""),
                             "hidden_state_b64": poc_out.get("hidden_state_b64"),
                             "reduced_hidden_state_b64": poc_out.get("reduced_hidden_state_b64"),
+                            "reduced_hidden_state_decode_b64": poc_out.get("reduced_hidden_state_decode_b64", []),
                             "sphere_k": poc_out.get("sphere_k", -1),
                             "sphere_k_steps": poc_out.get("sphere_k_steps", []),
                             "n_sphere_mismatches": poc_out.get("n_sphere_mismatches", -1),
@@ -268,6 +270,7 @@ async def _compute_nonce_artifacts(
                         "vector_b64": poc_out.vector_b64,
                         "hidden_state_b64": poc_out.hidden_state_b64,
                         "reduced_hidden_state_b64": poc_out.reduced_hidden_state_b64,
+                        "reduced_hidden_state_decode_b64": getattr(poc_out, "reduced_hidden_state_decode_b64", []),
                         "sphere_k": getattr(poc_out, "sphere_k", -1),
                         "sphere_k_steps": getattr(poc_out, "sphere_k_steps", []),
                         "n_sphere_mismatches": getattr(poc_out, "n_sphere_mismatches", -1),

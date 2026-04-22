@@ -420,6 +420,9 @@ def execute_poc_batch(
     last_hidden_cpu = last_hidden.float().cpu().numpy()
     xk_sphere_cpu   = xk_sphere.float().cpu().numpy()
 
+    # Per-step decode sphere projections (populated in the decode loop below).
+    xk_sph_dec_steps: List = []  # each entry: numpy [batch, SPHERE_DIM]
+
     torch.cuda.synchronize()
     t_post_end = time.perf_counter()
 
@@ -508,13 +511,14 @@ def execute_poc_batch(
                 )
 
                 sph_idx_dec = random_pick_indices(
-                    block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device
+                    block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device, prev_k[-1]
                 )
                 xk_sph_dec = project_to_sphere(
                     torch.gather(last_hidden_dec, 1, sph_idx_dec)
                 )
                 sphere_k_dec = nearest_sphere_index(xk_sph_dec, codebook)
                 step_k_list: List[int] = sphere_k_dec.cpu().tolist()
+                # xk_sph_dec_steps.append(xk_sph_dec.float().cpu().numpy())
 
                 for i, computed_k in enumerate(step_k_list):
                     sphere_k_steps_per_nonce[i].append(computed_k)
@@ -560,6 +564,10 @@ def execute_poc_batch(
             vector_b64=vector_b64,
             hidden_state_b64=encode_vector(last_hidden_cpu[i]),
             reduced_hidden_state_b64=encode_vector(xk_sphere_cpu[i]),
+            # reduced_hidden_state_decode_b64=[
+            #     encode_vector(xk_sph_dec_steps[step][i])
+            #     for step in range(len(xk_sph_dec_steps))
+            # ],
             sphere_k=sphere_k_list[i],
             sphere_k_steps=sphere_k_steps_per_nonce[i],
             n_sphere_mismatches=mismatch_count[i],

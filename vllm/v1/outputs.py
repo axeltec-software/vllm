@@ -106,7 +106,8 @@ class PoCOutput:
     vector_b64: str
     # Optional – populated only when the runner is asked to expose internals
     hidden_state_b64: str | None = None           # full normalised last-token hidden state
-    reduced_hidden_state_b64: str | None = None   # SPHERE_DIM-D slice on unit sphere
+    reduced_hidden_state_b64: str | None = None   # SPHERE_DIM-D slice on unit sphere (prefill)
+    reduced_hidden_state_decode_b64: list[str] = field(default_factory=list)  # per decode step
     sphere_k: int = -1                            # nearest codebook index on the sphere (prefill)
     # Decode-mode statistics: sphere_k chosen at each step.
     # Index 0 = prefill, indices 1..N = decode steps.

@@ -201,6 +201,7 @@ def random_pick_indices(
     dim: int,
     k: int,
     device: torch.device,
+    prev_point_id: int | None = None,
 ) -> torch.Tensor:
     """Pick k dimensions per nonce deterministically (seed-based).
     
@@ -226,9 +227,14 @@ def random_pick_indices(
     all_idx = torch.arange(dim, device=device, dtype=torch.int32)
 
     for i, nonce in enumerate(nonces):
-        seed = _seed_from_string(
-            f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
-        )
+        if prev_point_id is None:
+            seed = _seed_from_string(
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
+            )
+        else:
+            seed = _seed_from_string(
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_k_{prev_point_id}"
+            )
         scores = _murmur3_32(all_idx, seed)  # int64
         # Take k smallest scores via topk on the negated values (O(dim log k)).
         _, chosen = torch.topk(-scores, k=k, largest=True, sorted=False)
