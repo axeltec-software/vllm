@@ -59,6 +59,10 @@ class ArtifactModel(BaseModel):
     # Validation mode only: steps where locally computed k differed from
     # the inference reference.  -1 for inference requests.
     n_sphere_mismatches: int = -1
+    # Debug mode only: per-step sphere slice indices and values.
+    # Index 0 = prefill, 1..N = decode steps.
+    sph_indices_steps: List[List[int]] = []   # [step][SPHERE_DIM] int indices
+    sph_values_steps: List[str] = []          # [step] b64-encoded float16 vector
 
 
 class ValidationModel(BaseModel):
@@ -105,6 +109,8 @@ class PoCGenerateRequest(BaseModel):
     # its own k-ids but uses the reference k-ids to seed each subsequent
     # decode step, and returns the total mismatch count per nonce.
     inference_k_steps: Optional[Dict[int, List[int]]] = None
+    # Enable per-step sphere index + value collection for mismatch debugging.
+    debug: bool = False
 
 
 # =============================================================================
@@ -213,6 +219,7 @@ async def _compute_nonce_artifacts(
     app=None,
     blocking: bool = False,
     inference_k_steps: Optional[Dict[int, List[int]]] = None,
+    debug: bool = False,
 ) -> List[dict]:
     """Compute artifacts for nonces via the scheduler."""
     exclusive_mode_set = False
@@ -241,6 +248,7 @@ async def _compute_nonce_artifacts(
             poc_decode=poc_decode,
             max_tokens=max_tokens,
             inference_sphere_k_steps=inf_steps,
+            debug=debug,
         )
         request_id = f"poc-{uuid.uuid4()}"
 
@@ -264,6 +272,8 @@ async def _compute_nonce_artifacts(
                             "sphere_k": poc_out.get("sphere_k", -1),
                             "sphere_k_steps": poc_out.get("sphere_k_steps", []),
                             "n_sphere_mismatches": poc_out.get("n_sphere_mismatches", -1),
+                            "sph_indices_steps": poc_out.get("sph_indices_steps", []),
+                            "sph_values_steps": poc_out.get("sph_values_steps", []),
                         }
                     return {
                         "nonce": poc_out.nonce,
@@ -274,6 +284,8 @@ async def _compute_nonce_artifacts(
                         "sphere_k": getattr(poc_out, "sphere_k", -1),
                         "sphere_k_steps": getattr(poc_out, "sphere_k_steps", []),
                         "n_sphere_mismatches": getattr(poc_out, "n_sphere_mismatches", -1),
+                        "sph_indices_steps": getattr(poc_out, "sph_indices_steps", []),
+                        "sph_values_steps": getattr(poc_out, "sph_values_steps", []),
                     }
         except Exception as e:
             logger.error(f"Error computing nonce {nonce}: {e}")
@@ -427,6 +439,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             max_tokens=body.params.max_tokens,
             app=request.app, blocking=body.blocking,
             inference_k_steps=body.inference_k_steps,
+            debug=body.debug,
         )
 
         response = {
@@ -500,6 +513,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 max_tokens=body.params.max_tokens,
                 app=app, blocking=body.blocking,
                 inference_k_steps=body.inference_k_steps,
+                debug=body.debug,
             )
             task_state.update({
                 "status": "completed",

@@ -1009,6 +1009,8 @@ class Scheduler(SchedulerInterface):
                             "sphere_k": getattr(poc_obj, "sphere_k", -1),
                             "sphere_k_steps": getattr(poc_obj, "sphere_k_steps", []),
                             "n_sphere_mismatches": getattr(poc_obj, "n_sphere_mismatches", -1),
+                            "sph_indices_steps": getattr(poc_obj, "sph_indices_steps", []),
+                            "sph_values_steps": getattr(poc_obj, "sph_values_steps", []),
                         }
 
                 outputs[request.client_index].append(

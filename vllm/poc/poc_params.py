@@ -24,6 +24,8 @@ class PoCParams:
     # the reference k-id to seed the *next* decode embedding so that both
     # servers always run the same forward pass regardless of local deviations.
     inference_sphere_k_steps: Optional[List[int]] = field(default=None, repr=False)
+    # Debug mode: collect per-step sphere indices and values for mismatch analysis.
+    debug: bool = False
 
     @property
     def is_validation(self) -> bool:
@@ -43,6 +45,7 @@ class PoCParams:
                 list(self.inference_sphere_k_steps)
                 if self.inference_sphere_k_steps is not None else None
             ),
+            debug=self.debug,
         )
 
     def __post_init__(self):
