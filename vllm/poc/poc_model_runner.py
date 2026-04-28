@@ -22,6 +22,7 @@ from vllm.v1.outputs import PoCOutput
 
 from .gpu_random import (
     generate_inputs,
+    generate_decode_inputs,
     random_pick_indices,
     apply_haar_rotation,
 )
@@ -30,6 +31,13 @@ from .data import encode_vector
 logger = init_logger(__name__)
 
 DEFAULT_K_DIM = 12
+
+# SPHERE_DIM: dimension of the truncated hidden-state slice.
+#              3 = ordinary sphere S², 2 = circle S¹, 16 = hypersphere
+# SPHERE_POINTS: number of reference codebook points on that sphere.
+#              Points are placed to be as equidistant as possible.
+SPHERE_DIM = 256
+SPHERE_POINTS = 16
 
 
 @contextmanager
@@ -116,6 +124,106 @@ def _create_v1_attn_metadata(
     return attn_metadata_dict
 
 
+# ---------------------------------------------------------------------------
+# Sphere projection utilities  (experimental)
+# ---------------------------------------------------------------------------
+
+def project_to_sphere(v: torch.Tensor) -> torch.Tensor:
+    """Normalize [..., dim] vectors to the unit sphere (L2 norm = 1)."""
+    return v / (v.norm(dim=-1, keepdim=True) + 1e-8)
+
+
+def _halton_on_sphere(n_points: int, dim: int) -> torch.Tensor:
+    """Return n_points deterministic, low-discrepancy unit vectors on S^(dim-1).
+
+    Uses the Halton sequence (base-prime per dimension) mapped to the sphere
+    via the logit transform.  No randomness — identical output for any call
+    with the same (n_points, dim).
+    """
+    _PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53]
+    coords: list[list[float]] = []
+    for d in range(dim):
+        base = _PRIMES[d % len(_PRIMES)]
+        col: list[float] = []
+        for i in range(1, n_points + 1):
+            f, r = 1.0, 0.0
+            j = i
+            while j > 0:
+                f /= base
+                r += f * (j % base)
+                j //= base
+            col.append(r)
+        coords.append(col)
+
+    # [n_points, dim] in (0, 1)^dim  →  logit  →  R^dim  →  sphere
+    raw = torch.tensor(coords, dtype=torch.float32).T.clamp(0.01, 0.99)
+    pts = torch.log(raw / (1.0 - raw)) # logit: roughly normal spread
+    return project_to_sphere(pts)
+
+
+def build_equidistant_codebook(
+    n_points: int,
+    dim: int,
+    n_steps: int = 500,
+    lr: float = 0.05,
+) -> torch.Tensor:
+    """Build a codebook of approximately equidistant points on S^(dim-1).
+
+    Solves the Thomson problem: minimize the electrostatic repulsion energy
+    (sum of 1/distance for all pairs) so points spread as uniformly as
+    possible over the sphere.
+
+    Initialisation is deterministic (Halton sequence) — no randomness.
+    The result is cached in _SPHERE_CODEBOOK at module load time.
+
+    Args:
+        n_points: number of points  → SPHERE_POINTS
+        dim: sphere dimension  → SPHERE_DIM
+        n_steps: gradient-descent steps (more = closer to optimum)
+        lr: Adam learning rate
+
+    Returns:
+        float32 unit vectors [n_points, dim]
+    """
+    with torch.inference_mode(mode=False):
+        pts = _halton_on_sphere(n_points, dim).clone().requires_grad_(True)
+        opt = torch.optim.Adam([pts], lr=lr)
+
+        eye = torch.eye(n_points)
+        for _ in range(n_steps):
+            opt.zero_grad()
+            p = project_to_sphere(pts)
+            diff = p.unsqueeze(0) - p.unsqueeze(1)
+            d2 = (diff * diff).sum(-1)
+            energy = ((1.0 - eye) / (d2 + 1e-8)).sum()
+            energy.backward()
+            opt.step()
+
+        result = project_to_sphere(pts).detach()
+    return result
+
+
+# Built once at module load — reused for every batch.
+_SPHERE_CODEBOOK: torch.Tensor = build_equidistant_codebook(SPHERE_POINTS, SPHERE_DIM)
+
+
+def nearest_sphere_index(
+    query: torch.Tensor,
+    codebook: torch.Tensor,
+) -> torch.Tensor:
+    """Return the index of the nearest codebook point for each query vector.
+
+    Args:
+        query: unit vectors (one per nonce) [batch, dim]
+        codebook: unit vectors from _SPHERE_CODEBOOK [SPHERE_POINTS, dim]
+
+    Returns:
+        index k in [0, SPHERE_POINTS)
+    """
+    sims = query.float() @ codebook.float().T   # [batch, SPHERE_POINTS]
+    return sims.argmax(dim=-1)                  # [batch]
+
+
 @torch.inference_mode()
 def execute_poc_batch(
     model_runner,
@@ -166,6 +274,10 @@ def execute_poc_batch(
         model_runner._poc_layer_hooks = cached_hooks
         logger.debug(f"PoC: Registered {cached_hooks.num_layers} layer hooks for block_hash={block_hash[:16]}...")
 
+    poc_decode = first_poc.poc_decode
+    max_tokens = first_poc.max_tokens
+    debug = first_poc.debug
+
     if tp_group.world_size > 1:
         # Rendezvous: ensure all TP ranks have entered before broadcast
         dist.barrier(group=tp_group.cpu_group)
@@ -178,6 +290,8 @@ def execute_poc_batch(
                 "hidden_size": hidden_size,
                 "nonces": nonces,
                 "k_dim": k_dim,
+                "poc_decode": 1 if poc_decode else 0,
+                "max_tokens": max_tokens,
             }, src=0)
         else:
             broadcast_data = broadcast_tensor_dict(src=0)
@@ -186,6 +300,8 @@ def execute_poc_batch(
             nonces = list(broadcast_data["nonces"])
             k_dim = int(broadcast_data["k_dim"])
             batch_size = len(nonces)
+            poc_decode = bool(broadcast_data["poc_decode"])
+            max_tokens = int(broadcast_data["max_tokens"])
     
     pp_group = get_pp_group()
 
@@ -255,7 +371,7 @@ def execute_poc_batch(
         return hidden_states
     
     # =========================================================================
-    # TIMING: Phase 3 - Post-processing
+    # TIMING: Phase 3 - Post-processing (prefill)
     # =========================================================================
     t_post_start = time.perf_counter()
     
@@ -278,16 +394,165 @@ def execute_poc_batch(
     # Convert to FP16 for artifact encoding
     vectors_f16 = yk.half().cpu().numpy()
 
+    # Pick SPHERE_DIM dimensions from the hidden state and project to sphere.
+    sphere_indices = random_pick_indices(
+        block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device
+    )
+    xk_sphere = project_to_sphere(
+        torch.gather(last_hidden, 1, sphere_indices)
+    )
+
+    codebook = _SPHERE_CODEBOOK.to(device=device, dtype=last_hidden.dtype)
+    # k_point ∈ [0, SPHERE_POINTS): index of nearest equidistant codebook point per nonce
+    nearest_k_points = nearest_sphere_index(xk_sphere, codebook)  # [batch]
+    nearest_k_points_list = nearest_k_points.cpu().tolist()
+
+    sph_indices_per_nonce: List[List[List[int]]] = [[] for _ in range(batch_size)]
+    sph_values_per_nonce:  List[List[str]] = [[] for _ in range(batch_size)]
+    last_hidden_cpu = None
+    xk_sphere_cpu = None
+    if debug:
+        sphere_indices_cpu = sphere_indices.cpu().numpy()  # [batch, SPHERE_DIM]
+        xk_sphere_cpu = xk_sphere.float().cpu().numpy()
+        for i in range(batch_size):
+            sph_indices_per_nonce[i].append(sphere_indices_cpu[i].tolist())
+            sph_values_per_nonce[i].append(encode_vector(xk_sphere_cpu[i]))
+        last_hidden_cpu = last_hidden.float().cpu().numpy()
+
     torch.cuda.synchronize()
     t_post_end = time.perf_counter()
+
+    # =========================================================================
+    # TIMING: Phase 4 - Decode loop (poc_decode mode)
+    # =========================================================================
+    # k_points_steps_per_nonce[i]: computed k at each step (index 0 = prefill).
+    k_points_steps_per_nonce: List[List[int]] = [[k] for k in nearest_k_points_list]
+
+    # Per-nonce mismatch counters for validation requests.
+    # -1 means the nonce is an inference (non-validation) request.
+    inf_steps_per_nonce: List[Optional[List[int]]] = [
+        req.poc_params.inference_k_points_steps for req in poc_requests
+    ]
+
+    mismatch_count: List[int] = [
+        0 if s is not None else -1 for s in inf_steps_per_nonce
+    ]
+
+    # Check prefill k against inference reference (step 0).
+    for i, inf_steps in enumerate(inf_steps_per_nonce):
+        if inf_steps is not None and len(inf_steps) > 0:
+            if nearest_k_points_list[i] != inf_steps[0]:
+                mismatch_count[i] += 1
+
+    # Initial prev_k for the decode loop: validation requests use the
+    # inference prefill k so both servers share the same decode trajectory.
+    prev_k: List[int] = [
+        (inf_steps_per_nonce[i][0]
+         if inf_steps_per_nonce[i] is not None and len(inf_steps_per_nonce[i]) > 0
+         else nearest_k_points_list[i])
+        for i in range(batch_size)
+    ]
+
+    t_decode_total = 0.0
+
+    if poc_decode and max_tokens > 0:
+        if pp_group.world_size > 1:
+            logger.warning(
+                "PoC decode loop is not supported with pipeline parallelism "
+                "(pp_group.world_size=%d); skipping decode steps.",
+                pp_group.world_size,
+            )
+        else:
+            for step in range(1, max_tokens + 1):
+                torch.cuda.synchronize()
+                t_dec_step_start = time.perf_counter()
+
+                if tp_group.world_size > 1:
+                    dist.barrier(group=tp_group.cpu_group)
+
+                # Generate decode embedding seeded by prev_k.
+                decode_embeds = generate_decode_inputs(
+                    block_hash, public_key, nonces, prev_k,
+                    step=step, dim=hidden_size,
+                    device=device, dtype=dtype,
+                )  # [batch_size, 1, hidden_size]
+
+                decode_pos = torch.full(
+                    (batch_size,), seq_len + step - 1,
+                    device=device, dtype=torch.long,
+                )
+                decode_attn_meta = _create_v1_attn_metadata(
+                    model_runner, batch_size, 1, device
+                )
+
+                with set_forward_context(decode_attn_meta, vllm_config,
+                                         cudagraph_runtime_mode=CUDAGraphMode.NONE):
+                    with poc_forward_context():
+                        with bypass_torch_compile():
+                            hs_dec = model(
+                                input_ids=None,
+                                positions=decode_pos,
+                                intermediate_tensors=None,
+                                inputs_embeds=decode_embeds.view(-1, hidden_size),
+                            )
+
+                torch.cuda.synchronize()
+
+                hs_dec = hs_dec.view(batch_size, 1, -1)
+                last_hidden_dec = hs_dec[:, 0, :].float()
+                last_hidden_dec = last_hidden_dec / (
+                    last_hidden_dec.norm(dim=-1, keepdim=True) + 1e-8
+                )
+
+                sph_idx_dec = random_pick_indices(
+                    block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device, prev_k
+                )
+                xk_sph_dec = project_to_sphere(
+                    torch.gather(last_hidden_dec, 1, sph_idx_dec)
+                )
+                nearest_k_points_dec = nearest_sphere_index(xk_sph_dec, codebook)
+                step_k_points_list: List[int] = nearest_k_points_dec.cpu().tolist()
+
+                if debug:
+                    sph_idx_dec_cpu = sph_idx_dec.cpu().numpy()  # [batch, SPHERE_DIM]
+                    xk_sph_dec_cpu  = xk_sph_dec.float().cpu().numpy()
+                    for i in range(batch_size):
+                        sph_indices_per_nonce[i].append(sph_idx_dec_cpu[i].tolist())
+                        sph_values_per_nonce[i].append(encode_vector(xk_sph_dec_cpu[i]))
+
+                for i, computed_k in enumerate(step_k_points_list):
+                    k_points_steps_per_nonce[i].append(computed_k)
+
+                # Build prev_k for the next step.  Validation nonces use the
+                # inference reference k so the trajectories stay aligned.
+                new_prev_k: List[int] = []
+                for i, computed_k in enumerate(step_k_points_list):
+                    inf_steps = inf_steps_per_nonce[i]
+                    if inf_steps is not None and step < len(inf_steps):
+                        inf_k = inf_steps[step]
+                        if computed_k != inf_k:
+                            mismatch_count[i] += 1
+                        new_prev_k.append(inf_k)
+                    else:
+                        new_prev_k.append(computed_k)
+                prev_k = new_prev_k
+
+                t_decode_total += time.perf_counter() - t_dec_step_start
+
+            logger.debug(
+                "PoC decode: %d steps completed in %.4fs total",
+                max_tokens, t_decode_total,
+            )
 
     t_input = t_input_end - t_input_start
     t_fwd = t_fwd_end - t_fwd_start
     t_post = t_post_end - t_post_start
-    t_total = t_input + t_fwd + t_post
+    t_total = t_input + t_fwd + t_post + t_decode_total
     logger.info(
-        f"POC Timing: batch={batch_size}, seq_len={seq_len} | "
-        f"input_gen={t_input:.4f}s, model_fwd={t_fwd:.4f}s, postproc={t_post:.4f}s, "
+        f"POC Timing: batch={batch_size}, seq_len={seq_len}, "
+        f"decode_steps={max_tokens if poc_decode else 0} | "
+        f"input_gen={t_input:.4f}s, model_fwd={t_fwd:.4f}s, "
+        f"postproc={t_post:.4f}s, decode={t_decode_total:.4f}s, "
         f"total={t_total:.4f}s"
     )
 
@@ -297,6 +562,13 @@ def execute_poc_batch(
         results.append(PoCOutput(
             nonce=nonce,
             vector_b64=vector_b64,
+            k_points_steps=k_points_steps_per_nonce[i],
+            n_sphere_mismatches=mismatch_count[i],
+            # debug fields
+            hidden_state_b64=encode_vector(last_hidden_cpu[i]) if last_hidden_cpu is not None else None,
+            reduced_hidden_state_b64=encode_vector(xk_sphere_cpu[i]) if xk_sphere_cpu is not None else None,
+            sph_indices_steps=sph_indices_per_nonce[i],
+            sph_values_steps=sph_values_per_nonce[i],
         ))
 
     return results

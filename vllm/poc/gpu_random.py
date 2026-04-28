@@ -90,6 +90,46 @@ def generate_inputs(
     return result
 
 
+def generate_decode_inputs(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    prev_k: List[int],
+    step: int,
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """Generate deterministic decode-step input embedding chained to previous sphere_k point.
+
+    The seed incorporates the nearest sphere_k point chosen in the previous
+    step so that each decode step is deterministically linked to its predecessor.
+
+    Args:
+        block_hash: Block hash for seeding
+        public_key: Public key for seeding
+        nonces: List of nonce values
+        prev_k: Nearest sphere index from the previous step (one per nonce)
+        step: Decode step index (1-based; step 0 is the prefill)
+        dim: Hidden dimension size
+        device: Target device
+        dtype: Output dtype (default float16)
+
+    Returns:
+        Tensor of shape [batch_size, 1, dim]
+    """
+    batch_size = len(nonces)
+    result = torch.empty(batch_size, 1, dim, device=device, dtype=dtype)
+
+    for i, (nonce, k) in enumerate(zip(nonces, prev_k)):
+        seed_str = f"{block_hash}_{public_key}_nonce{nonce}_decode{step}_k{k}"
+        seed = _seed_from_string(seed_str)
+        normal = _normal(seed, dim, device)
+        result[i, 0] = normal.to(dtype)
+
+    return result
+
+
 def generate_target(
     block_hash: str,
     public_key: str,
@@ -161,6 +201,7 @@ def random_pick_indices(
     dim: int,
     k: int,
     device: torch.device,
+    prev_point_ids: List[int] | None = None,
 ) -> torch.Tensor:
     """Pick k dimensions per nonce deterministically (seed-based).
     
@@ -186,9 +227,14 @@ def random_pick_indices(
     all_idx = torch.arange(dim, device=device, dtype=torch.int32)
 
     for i, nonce in enumerate(nonces):
-        seed = _seed_from_string(
-            f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
-        )
+        if prev_point_ids is None:
+            seed = _seed_from_string(
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
+            )
+        else:
+            seed = _seed_from_string(
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_k_{prev_point_ids[i]}"
+            )
         scores = _murmur3_32(all_idx, seed)  # int64
         # Take k smallest scores via topk on the negated values (O(dim log k)).
         _, chosen = torch.topk(-scores, k=k, largest=True, sorted=False)

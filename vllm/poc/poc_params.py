@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 
 @dataclass
@@ -12,6 +13,23 @@ class PoCParams:
     nonce: int
     seq_len: int = 256
     k_dim: int = 12
+    # Decode-mode parameters (enabled by --poc-decode server flag)
+    poc_decode: bool = False   # run decode steps after prefill
+    max_tokens: int = 0        # number of decode steps (0 = prefill-only)
+    # Validation mode: when set, this request tracks deviations from an
+    # inference run instead of freely generating its own k-id sequence.
+    # The list contains sphere_k_steps from the reference inference run
+    # (index 0 = prefill, 1..N = decode steps).  At each step the validation
+    # server computes its own k-id, compares against the reference, and uses
+    # the reference k-id to seed the *next* decode embedding so that both
+    # servers always run the same forward pass regardless of local deviations.
+    inference_k_points_steps: Optional[List[int]] = field(default=None, repr=False)
+    # Debug mode: collect per-step sphere indices and values for mismatch analysis.
+    debug: bool = False
+
+    @property
+    def is_validation(self) -> bool:
+        return self.inference_k_points_steps is not None
 
     def clone(self) -> "PoCParams":
         return PoCParams(
@@ -21,6 +39,13 @@ class PoCParams:
             nonce=self.nonce,
             seq_len=self.seq_len,
             k_dim=self.k_dim,
+            poc_decode=self.poc_decode,
+            max_tokens=self.max_tokens,
+            inference_k_points_steps=(
+                list(self.inference_k_points_steps)
+                if self.inference_k_points_steps is not None else None
+            ),
+            debug=self.debug,
         )
 
     def __post_init__(self):
@@ -28,3 +53,5 @@ class PoCParams:
             raise ValueError(f"seq_len must be positive, got {self.seq_len}")
         if self.k_dim <= 0:
             raise ValueError(f"k_dim must be positive, got {self.k_dim}")
+        if self.max_tokens < 0:
+            raise ValueError(f"max_tokens must be >= 0, got {self.max_tokens}")

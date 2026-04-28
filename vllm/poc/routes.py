@@ -45,12 +45,23 @@ class PoCParamsModel(BaseModel):
     model: str
     seq_len: int
     k_dim: int = 12
+    max_tokens: int = 0   # decode steps after prefill (0 = prefill-only)
 
 
 class ArtifactModel(BaseModel):
     nonce: int
     vector_b64: str
+    k_points_steps: List[int] = []   # k at each step: [prefill, decode1, …]
+    # Validation mode only: steps where locally computed k differed from
+    # the inference reference.  -1 for inference requests.
+    n_sphere_mismatches: int = -1
 
+    # Debug mode only: per-step sphere slice indices and values.
+    # Index 0 = prefill, 1..N = decode steps.
+    sph_indices_steps: List[List[int]] = []
+    sph_values_steps: List[str] = []
+    hidden_state_b64: Optional[str] = None
+    reduced_hidden_state_b64: Optional[str] = None
 
 class ValidationModel(BaseModel):
     artifacts: List[ArtifactModel]
@@ -90,6 +101,13 @@ class PoCGenerateRequest(BaseModel):
     validation: Optional[ValidationModel] = None
     stat_test: Optional[StatTestModel] = None
     blocking: bool = False
+    # Validation-mode sphere k_points tracking.
+    # When the server runs in validation mode: it computes
+    # its own k-ids but uses the reference k-ids to seed each subsequent
+    # decode step, and returns the total mismatch count per nonce.
+    inference_k_points_steps: Optional[Dict[int, List[int]]] = None
+    # Enable per-step sphere index + value collection for mismatch debugging.
+    debug: bool = False
 
 
 # =============================================================================
@@ -193,8 +211,12 @@ async def _compute_nonce_artifacts(
     block_height: int,
     seq_len: int,
     k_dim: int,
+    poc_decode: bool = False,
+    max_tokens: int = 0,
     app=None,
     blocking: bool = False,
+    inference_k_points_steps: Optional[Dict[int, List[int]]] = None,
+    debug: bool = False,
 ) -> List[dict]:
     """Compute artifacts for nonces via the scheduler."""
     exclusive_mode_set = False
@@ -212,6 +234,7 @@ async def _compute_nonce_artifacts(
         logger.info("PoC exclusive mode: rejecting new chat requests")
 
     async def compute_one(nonce: int) -> Optional[dict]:
+        inf_steps = inference_k_points_steps.get(nonce) if inference_k_points_steps else None
         poc_params = PoCParams(
             block_hash=block_hash,
             public_key=public_key,
@@ -219,6 +242,10 @@ async def _compute_nonce_artifacts(
             nonce=nonce,
             seq_len=seq_len,
             k_dim=k_dim,
+            poc_decode=poc_decode,
+            max_tokens=max_tokens,
+            inference_k_points_steps=inf_steps,
+            debug=debug,
         )
         request_id = f"poc-{uuid.uuid4()}"
 
@@ -236,10 +263,24 @@ async def _compute_nonce_artifacts(
                         return {
                             "nonce": poc_out.get("nonce", nonce),
                             "vector_b64": poc_out.get("vector_b64", ""),
+                            "k_points_steps": poc_out.get("k_points_steps", []),
+                            "n_sphere_mismatches": poc_out.get("n_sphere_mismatches", -1),
+                            # debug fields
+                            "hidden_state_b64": poc_out.get("hidden_state_b64"),
+                            "reduced_hidden_state_b64": poc_out.get("reduced_hidden_state_b64"),
+                            "sph_indices_steps": poc_out.get("sph_indices_steps", []),
+                            "sph_values_steps": poc_out.get("sph_values_steps", []),
                         }
                     return {
                         "nonce": poc_out.nonce,
                         "vector_b64": poc_out.vector_b64,
+                        "k_points_steps": getattr(poc_out, "k_points_steps", []),
+                        "n_sphere_mismatches": getattr(poc_out, "n_sphere_mismatches", -1),
+                        # debug fields
+                        "hidden_state_b64": poc_out.hidden_state_b64,
+                        "reduced_hidden_state_b64": poc_out.reduced_hidden_state_b64,
+                        "sph_indices_steps": getattr(poc_out, "sph_indices_steps", []),
+                        "sph_values_steps": getattr(poc_out, "sph_values_steps", []),
                     }
         except Exception as e:
             logger.error(f"Error computing nonce {nonce}: {e}")
@@ -280,6 +321,8 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
         "batch_size": body.batch_size,
         "seq_len": body.params.seq_len,
         "k_dim": body.params.k_dim,
+        "poc_decode": getattr(request.app.state, "poc_decode", False),
+        "max_tokens": body.params.max_tokens,
     }
 
     stats = {"start_time": 0, "total_processed": 0}
@@ -343,6 +386,8 @@ async def _generation_loop(
                 config["block_hash"], config["public_key"],
                 config.get("block_height", 0),
                 config["seq_len"], config["k_dim"],
+                poc_decode=config.get("poc_decode", False),
+                max_tokens=config.get("max_tokens", 0),
                 app=app, blocking=blocking,
             )
             
@@ -377,13 +422,19 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
 
     app_id = id(request.app)
 
+    poc_decode = getattr(request.app.state, "poc_decode", False)
+
     if body.wait:
         # Sync path: compute all nonces and return
         artifacts = await _compute_nonce_artifacts(
             engine_client, body.nonces,
             body.block_hash, body.public_key, body.block_height,
             body.params.seq_len, body.params.k_dim,
+            poc_decode=poc_decode,
+            max_tokens=body.params.max_tokens,
             app=request.app, blocking=body.blocking,
+            inference_k_points_steps=body.inference_k_points_steps,
+            debug=body.debug,
         )
 
         response = {
@@ -453,7 +504,11 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 engine_client, body.nonces,
                 body.block_hash, body.public_key, body.block_height,
                 body.params.seq_len, body.params.k_dim,
+                poc_decode=poc_decode,
+                max_tokens=body.params.max_tokens,
                 app=app, blocking=body.blocking,
+                inference_k_points_steps=body.inference_k_points_steps,
+                debug=body.debug,
             )
             task_state.update({
                 "status": "completed",

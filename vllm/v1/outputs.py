@@ -104,6 +104,22 @@ PoolerOutput = torch.Tensor | list[torch.Tensor]
 class PoCOutput:
     nonce: int
     vector_b64: str
+    # k_points chosen at each step.
+    # Index 0 = prefill, indices 1..N = decode steps.
+    # Empty when poc_decode is disabled.
+    k_points_steps: list[int] = field(default_factory=list)
+    # Validation mode only: number of steps where the locally computed k-id
+    # differed from the reference inference k-id.  -1 for inference requests.
+    n_sphere_mismatches: int = -1
+
+    # Debug mode (debug=True in request): per-step sphere slice indices and
+    # values.  Index 0 = prefill, 1..N = decode steps.
+    # sph_indices_steps[step]: list of SPHERE_DIM int indices into hidden state
+    # sph_values_steps[step]: base64-encoded float16 array of gathered values
+    sph_indices_steps: list[list[int]] = field(default_factory=list)
+    sph_values_steps: list[str] = field(default_factory=list)
+    hidden_state_b64: str | None = None # full normalised last-token hidden state
+    reduced_hidden_state_b64: str | None = None # SPHERE_DIM-D slice on unit sphere (prefill)
 
 
 @dataclass

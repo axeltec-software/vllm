@@ -1003,6 +1003,13 @@ class Scheduler(SchedulerInterface):
                         poc_output = {
                             "nonce": poc_obj.nonce,
                             "vector_b64": poc_obj.vector_b64,
+                            "k_points_steps": getattr(poc_obj, "k_points_steps", []),
+                            "n_sphere_mismatches": getattr(poc_obj, "n_sphere_mismatches", -1),
+                            # debug fields
+                            "hidden_state_b64": poc_obj.hidden_state_b64,
+                            "reduced_hidden_state_b64": poc_obj.reduced_hidden_state_b64,
+                            "sph_indices_steps": getattr(poc_obj, "sph_indices_steps", []),
+                            "sph_values_steps": getattr(poc_obj, "sph_values_steps", []),
                         }
 
                 outputs[request.client_index].append(
