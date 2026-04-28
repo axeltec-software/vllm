@@ -6,7 +6,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING
 
 from vllm._bc_linter import bc_linter_include
-
+from vllm.poc.poc_params import PoCParams
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
     from vllm.lora.request import LoRARequest
     from vllm.multimodal.inputs import MultiModalFeatureSpec
+    
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request
@@ -44,6 +45,7 @@ class NewRequestData:
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
+    poc_params: PoCParams | None = None
 
     @classmethod
     def from_request(
@@ -63,6 +65,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            poc_params=request.poc_params,
         )
 
     def __repr__(self) -> str:
@@ -251,6 +254,12 @@ class SchedulerOutput:
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
         )
+
+    poc_req_ids: set[str] = None
+    
+    def __post_init__(self):
+        if self.poc_req_ids is None:
+            self.poc_req_ids = set()
 
 
 @dataclass

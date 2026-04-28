@@ -540,6 +540,15 @@ def build_app(args: Namespace) -> FastAPI:
 
     app.root_path = args.root_path
 
+    from vllm.poc.routes import router as poc_router
+    app.include_router(poc_router)
+    app.state.poc_enabled = True
+    app.state.poc_decode = getattr(args, "poc_decode", False)
+    if app.state.poc_decode:
+        logger.info("PoC (Proof of Compute) API enabled [decode mode ON]")
+    else:
+        logger.info("PoC (Proof of Compute) API enabled")
+
     from vllm.entrypoints.pooling import register_pooling_api_routers
 
     register_pooling_api_routers(app)
@@ -832,8 +841,10 @@ async def init_app_state(
 
     await init_pooling_state(engine_client, state, args)
 
-    state.enable_server_load_tracking = args.enable_server_load_tracking
+    # Auto-enable when PoC is enabled (for blocking mode support)
+    state.enable_server_load_tracking = args.enable_server_load_tracking or getattr(state, 'poc_enabled', False)
     state.server_load_metrics = 0
+    state.poc_exclusive_mode = False
 
 
 def create_server_socket(addr: tuple[str, int]) -> socket.socket:

@@ -182,6 +182,11 @@ class FrontendArgs:
     """If set to True, enable prompt_tokens_details in usage."""
     enable_server_load_tracking: bool = False
     """If set to True, enable tracking server_load_metrics in the app state."""
+    poc_decode: bool = False
+    """If set to True, enable PoC decode mode: after each prefill the runner
+    executes additional decode steps (controlled per-request via max_tokens)
+    whose sphere_k is chained to the previous step's k value and collected
+    into sphere_k_steps for analysis."""
     enable_force_include_usage: bool = False
     """If set to True, including usage on every request."""
     enable_tokenizer_info_endpoint: bool = False

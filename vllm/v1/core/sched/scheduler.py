@@ -31,10 +31,11 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsReader,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.v1.engine import FinishReason
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
-    compute_encoder_budget,
+    compute_encoder_budget
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -343,6 +344,17 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            
+            # PoC: Handle PoC requests specially
+            if request.poc_params is not None:
+                # PoC is prefill-only, always finish after one step
+                num_new_tokens = request.poc_params.seq_len
+                if num_new_tokens <= token_budget:
+                    scheduled_running_reqs.append(request)
+                    num_scheduled_tokens[request.request_id] = num_new_tokens
+                    token_budget -= num_new_tokens
+                req_index += 1
+                continue
 
             # do not schedule another step for the same request while it still has
             # output placeholders for PP.
@@ -540,6 +552,28 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = self.waiting.peek_request()
+                
+                # PoC: Handle PoC requests
+                if request.poc_params is not None:
+                    num_new_tokens = request.poc_params.seq_len
+                    if num_new_tokens <= token_budget:
+                        self.waiting.pop_request()
+                        self.running.append(request)
+                        request.status = RequestStatus.RUNNING
+
+                        scheduled_new_reqs.append(request)
+                        num_scheduled_tokens[request.request_id] = num_new_tokens
+                        req_to_new_blocks[request.request_id] = KVCacheBlocks(
+                            blocks=tuple([] for _ in range(self.kv_cache_manager.num_kv_cache_groups))
+                        )
+                        token_budget -= num_new_tokens
+
+                        if self.log_stats:
+                            request.record_event(
+                                EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+                    else:
+                        break
+                    continue
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -866,6 +900,9 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            poc_req_ids={req.request_id for req in 
+                        itertools.chain(scheduled_new_reqs, scheduled_running_reqs)
+                        if req.poc_params is not None},
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1274,6 +1311,52 @@ class Scheduler(SchedulerInterface):
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism).
+                continue
+            
+            # PoC: Handle PoC requests - they finish immediately after prefill
+            if request.poc_params is not None:
+                # PoC requests are prefill-only, mark as finished
+                request.status = RequestStatus.FINISHED_STOPPED
+                request.num_computed_tokens += num_tokens_scheduled
+                
+                # Free the request (no KV cache to free, but clean up)
+                self._free_request(request)
+                stopped_running_reqs.add(request)
+                
+                # PoC outputs will be in model_runner_output.poc_outputs
+                # and will be handled by the output processor
+                poc_output = None
+                if hasattr(model_runner_output, 'poc_outputs') and model_runner_output.poc_outputs:
+                    poc_obj = model_runner_output.poc_outputs.get(req_id)
+                    if poc_obj is not None:
+                        poc_output = {
+                            "nonce": poc_obj.nonce,
+                            "vector_b64": poc_obj.vector_b64,
+                            "hidden_state_b64": poc_obj.hidden_state_b64,
+                            "reduced_hidden_state_b64": poc_obj.reduced_hidden_state_b64,
+                            "reduced_hidden_state_decode_b64": getattr(poc_obj, "reduced_hidden_state_decode_b64", []),
+                            "sphere_k": getattr(poc_obj, "sphere_k", -1),
+                            "sphere_k_steps": getattr(poc_obj, "sphere_k_steps", []),
+                            "n_sphere_mismatches": getattr(poc_obj, "n_sphere_mismatches", -1),
+                            "sph_indices_steps": getattr(poc_obj, "sph_indices_steps", []),
+                            "sph_values_steps": getattr(poc_obj, "sph_values_steps", []),
+                        }
+
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=req_id,
+                        new_token_ids=[],  # PoC doesn't generate tokens
+                        finish_reason=FinishReason.STOP,
+                        new_logprobs=None,
+                        new_prompt_logprobs_tensors=None,
+                        pooling_output=None,
+                        stop_reason=None,
+                        events=request.take_events(),
+                        kv_transfer_params=None,
+                        trace_headers=request.trace_headers,
+                        num_cached_tokens=0,
+                        poc_output=poc_output,  # NEW: PoC-specific output
+                    ))
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
