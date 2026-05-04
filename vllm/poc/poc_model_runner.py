@@ -19,14 +19,95 @@ from vllm.logger import init_logger
 from .gpu_random import (
     generate_inputs,
     generate_inputs_concat_murmur,
+    generate_decode_inputs,
     random_pick_indices,
     apply_haar_rotation,
 )
+from .data import encode_vector
 from .layer_hooks import LayerHouseholderHook, poc_forward_context
 
 logger = init_logger(__name__)
 
 DEFAULT_K_DIM = 12
+
+# SPHERE_DIM: dimension of the hidden-state slice projected onto the sphere.
+# SPHERE_POINTS: number of equidistant codebook points on that sphere.
+SPHERE_DIM = 256
+SPHERE_POINTS = 16
+
+
+def project_to_sphere(v: torch.Tensor) -> torch.Tensor:
+    """Normalize [..., dim] vectors to the unit sphere (L2 norm = 1)."""
+    return v / (v.norm(dim=-1, keepdim=True) + 1e-8)
+
+
+def _halton_on_sphere(n_points: int, dim: int) -> torch.Tensor:
+    """Return n_points deterministic, low-discrepancy unit vectors on S^(dim-1).
+
+    Uses the Halton sequence (base-prime per dimension) mapped to the sphere
+    via the logit transform. Identical output for any call with the same args.
+    """
+    _PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53]
+    coords: list[list[float]] = []
+    for d in range(dim):
+        base = _PRIMES[d % len(_PRIMES)]
+        col: list[float] = []
+        for i in range(1, n_points + 1):
+            f, r = 1.0, 0.0
+            j = i
+            while j > 0:
+                f /= base
+                r += f * (j % base)
+                j //= base
+            col.append(r)
+        coords.append(col)
+    raw = torch.tensor(coords, dtype=torch.float32).T.clamp(0.01, 0.99)
+    pts = torch.log(raw / (1.0 - raw))
+    return project_to_sphere(pts)
+
+
+def build_equidistant_codebook(
+    n_points: int,
+    dim: int,
+    n_steps: int = 500,
+    lr: float = 0.05,
+) -> torch.Tensor:
+    """Build approximately equidistant points on S^(dim-1) via Thomson problem.
+
+    Minimizes electrostatic repulsion energy so points spread uniformly.
+    Deterministic initialisation (Halton sequence). Result is cached in
+    _SPHERE_CODEBOOK at module load time.
+    """
+    with torch.inference_mode(mode=False):
+        pts = _halton_on_sphere(n_points, dim).clone().requires_grad_(True)
+        opt = torch.optim.Adam([pts], lr=lr)
+        eye = torch.eye(n_points)
+        for _ in range(n_steps):
+            opt.zero_grad()
+            p = project_to_sphere(pts)
+            diff = p.unsqueeze(0) - p.unsqueeze(1)
+            d2 = (diff * diff).sum(-1)
+            energy = ((1.0 - eye) / (d2 + 1e-8)).sum()
+            energy.backward()
+            opt.step()
+        result = project_to_sphere(pts).detach()
+    return result
+
+
+_SPHERE_CODEBOOK: torch.Tensor = build_equidistant_codebook(SPHERE_POINTS, SPHERE_DIM)
+
+
+def nearest_sphere_index(query: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
+    """Return the index of the nearest codebook point for each query vector.
+
+    Args:
+        query: unit vectors [batch, dim]
+        codebook: unit vectors [SPHERE_POINTS, dim]
+    Returns:
+        index tensor [batch] with values in [0, SPHERE_POINTS)
+    """
+    sims = query.float() @ codebook.float().T
+    return sims.argmax(dim=-1)
 
 # NOTE: attention metadata must NOT be cached across PoC calls.
 # The metadata builder's internal state (workspace buffers, page-table
@@ -147,10 +228,16 @@ def execute_poc_forward(
     hidden_size: int,
     k_dim: int = DEFAULT_K_DIM,
     poc_stronger_rng: bool = False,
+    poc_decode: bool = False,
+    max_tokens: int = 0,
+    inference_k_points_steps_per_nonce: Optional[List[Optional[List[int]]]] = None,
+    debug: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Execute batched PoC forward pass on a V1 worker.
 
     Processes all nonces in a single forward call for maximum throughput.
+    When poc_decode=True and max_tokens > 0, runs additional decode steps
+    after prefill, chaining each step's sphere_k into the next step's seed.
     """
     device = worker.device
     dtype = worker.model_config.dtype
@@ -172,6 +259,8 @@ def execute_poc_forward(
                 "nonces": nonces,
                 "k_dim": k_dim,
                 "poc_stronger_rng": poc_stronger_rng,
+                "poc_decode": 1 if poc_decode else 0,
+                "max_tokens": max_tokens,
             }, src=0)
         else:
             broadcast_data = broadcast_tensor_dict(src=0)
@@ -181,6 +270,8 @@ def execute_poc_forward(
             k_dim = int(broadcast_data["k_dim"])
             batch_size = len(nonces)
             poc_stronger_rng = bool(broadcast_data["poc_stronger_rng"])
+            poc_decode = bool(broadcast_data["poc_decode"])
+            max_tokens = int(broadcast_data["max_tokens"])
 
     pp_group = get_pp_group()
 
@@ -299,9 +390,147 @@ def execute_poc_forward(
         clean = ~nan_out
         vectors_f16 = vectors_f16[clean]
         nonces = [n for n, c in zip(nonces, clean) if c]
+        if inference_k_points_steps_per_nonce is not None:
+            inference_k_points_steps_per_nonce = [
+                s for s, c in zip(inference_k_points_steps_per_nonce, clean) if c
+            ]
+        batch_size = len(nonces)
         logger.warning("NaN in FP16 output — %d nonces filtered", nan_out.sum())
+
+    # -------------------------------------------------------------------------
+    # Sphere projection (prefill)
+    # -------------------------------------------------------------------------
+    codebook = _SPHERE_CODEBOOK.to(device=device, dtype=last_hidden.dtype)
+    sphere_indices = random_pick_indices(
+        block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device
+    )
+    xk_sphere = project_to_sphere(torch.gather(last_hidden, 1, sphere_indices))
+    nearest_k_points = nearest_sphere_index(xk_sphere, codebook)
+    nearest_k_points_list: List[int] = nearest_k_points.cpu().tolist()
+
+    # Per-nonce: sphere_k history (index 0 = prefill)
+    k_points_steps_per_nonce: List[List[int]] = [[k] for k in nearest_k_points_list]
+
+    # Mismatch counters: -1 means inference (non-validation) nonce
+    if inference_k_points_steps_per_nonce is None:
+        mismatch_count: List[int] = [-1] * batch_size
+    else:
+        mismatch_count = [
+            0 if steps is not None else -1
+            for steps in inference_k_points_steps_per_nonce
+        ]
+        for i, steps in enumerate(inference_k_points_steps_per_nonce):
+            if steps is not None and len(steps) > 0:
+                if nearest_k_points_list[i] != steps[0]:
+                    mismatch_count[i] += 1
+
+    # prev_k for decode: validation nonces use inference prefill k to keep trajectories aligned
+    prev_k: List[int] = []
+    for i in range(batch_size):
+        steps = (inference_k_points_steps_per_nonce or [None] * batch_size)[i]
+        if steps is not None and len(steps) > 0:
+            prev_k.append(steps[0])
+        else:
+            prev_k.append(nearest_k_points_list[i])
+
+    # Debug buffers
+    sph_indices_per_nonce: List[List[List[int]]] = [[] for _ in range(batch_size)]
+    sph_values_per_nonce: List[List[str]] = [[] for _ in range(batch_size)]
+    if debug:
+        sphere_indices_cpu = sphere_indices.cpu().numpy()
+        xk_sphere_cpu = xk_sphere.float().cpu().numpy()
+        for i in range(batch_size):
+            sph_indices_per_nonce[i].append(sphere_indices_cpu[i].tolist())
+            sph_values_per_nonce[i].append(encode_vector(xk_sphere_cpu[i]))
+
+    # -------------------------------------------------------------------------
+    # Decode loop
+    # -------------------------------------------------------------------------
+    if poc_decode and max_tokens > 0:
+        if pp_group.world_size > 1:
+            logger.warning(
+                "PoC decode loop not supported with pipeline parallelism "
+                "(pp_group.world_size=%d); skipping decode steps.",
+                pp_group.world_size,
+            )
+        else:
+            for step in range(1, max_tokens + 1):
+                if tp_group.world_size > 1:
+                    dist.barrier(group=tp_group.cpu_group)
+                    if is_tp_driver:
+                        broadcast_tensor_dict({"prev_k": prev_k}, src=0)
+                    else:
+                        prev_k = list(broadcast_tensor_dict(src=0)["prev_k"])
+
+                decode_embeds = generate_decode_inputs(
+                    block_hash, public_key, nonces, prev_k,
+                    step=step, dim=hidden_size, device=device, dtype=dtype,
+                )
+
+                decode_pos = torch.full(
+                    (batch_size,), seq_len + step - 1,
+                    device=device, dtype=torch.long,
+                )
+                dec_attn, dec_slot = _create_v1_attn_metadata(
+                    batch_size, 1, block_size, device, worker
+                )
+
+                with set_forward_context(
+                    dec_attn, vllm_config,
+                    num_tokens=batch_size,
+                    slot_mapping=dec_slot,
+                    skip_compiled=True,
+                ):
+                    with poc_forward_context():
+                        hs_dec = model(
+                            input_ids=None,
+                            positions=decode_pos,
+                            intermediate_tensors=None,
+                            inputs_embeds=decode_embeds.view(-1, hidden_size),
+                        )
+
+                if isinstance(hs_dec, tuple):
+                    hs_dec = hs_dec[0]
+                last_hidden_dec = hs_dec.view(batch_size, 1, -1)[:, 0, :].float()
+                last_hidden_dec = last_hidden_dec / (
+                    last_hidden_dec.norm(dim=-1, keepdim=True) + 1e-8
+                )
+
+                sph_idx_dec = random_pick_indices(
+                    block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device,
+                    prev_point_ids=prev_k,
+                )
+                xk_sph_dec = project_to_sphere(torch.gather(last_hidden_dec, 1, sph_idx_dec))
+                step_k_points = nearest_sphere_index(xk_sph_dec, codebook).cpu().tolist()
+
+                if debug:
+                    sph_idx_dec_cpu = sph_idx_dec.cpu().numpy()
+                    xk_sph_dec_cpu = xk_sph_dec.float().cpu().numpy()
+                    for i in range(batch_size):
+                        sph_indices_per_nonce[i].append(sph_idx_dec_cpu[i].tolist())
+                        sph_values_per_nonce[i].append(encode_vector(xk_sph_dec_cpu[i]))
+
+                for i, computed_k in enumerate(step_k_points):
+                    k_points_steps_per_nonce[i].append(computed_k)
+
+                new_prev_k: List[int] = []
+                for i, computed_k in enumerate(step_k_points):
+                    steps = (inference_k_points_steps_per_nonce or [None] * batch_size)[i]
+                    if steps is not None and step < len(steps):
+                        inf_k = steps[step]
+                        if computed_k != inf_k:
+                            mismatch_count[i] += 1
+                        new_prev_k.append(inf_k)
+                    else:
+                        new_prev_k.append(computed_k)
+                prev_k = new_prev_k
 
     return {
         "nonces": nonces,
         "vectors": vectors_f16,
+        "sphere_k_list": nearest_k_points_list,
+        "k_points_steps_list": k_points_steps_per_nonce,
+        "mismatch_count": mismatch_count,
+        "sph_indices_steps": sph_indices_per_nonce,
+        "sph_values_steps": sph_values_per_nonce,
     }

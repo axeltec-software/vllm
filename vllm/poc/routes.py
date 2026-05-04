@@ -87,6 +87,11 @@ class NonceIterator:
 class ArtifactModel(BaseModel):
     nonce: int
     vector_b64: str
+    sphere_k: Optional[int] = None
+    k_points_steps: Optional[List[int]] = None
+    n_sphere_mismatches: Optional[int] = None
+    sph_indices_steps: Optional[List[List[int]]] = None
+    sph_values_steps: Optional[List[str]] = None
 
 
 class ValidationModel(BaseModel):
@@ -113,6 +118,9 @@ class PoCGenerateRequest(BaseModel):
     validation: Optional[ValidationModel] = None
     stat_test: Optional[StatTestModel] = None
     poc_stronger_rng: bool = False
+    max_tokens: int = 0
+    inference_k_points_steps: Optional[Dict[int, List[int]]] = None
+    debug: bool = False
 
 
 # =============================================================================
@@ -232,16 +240,20 @@ async def _compute_artifacts_chunk(
     seq_len: int,
     k_dim: int,
     poc_stronger_rng: bool = False,
+    poc_decode: bool = False,
+    max_tokens: int = 0,
+    inference_k_points_steps: Optional[Dict[int, List[int]]] = None,
+    debug: bool = False,
     timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
     check_cancelled: Optional[callable] = None,
 ) -> List[Dict]:
     """Compute artifacts for a chunk with backoff on skip."""
     chunk_start_time = time.time()
-    
+
     while True:
         if check_cancelled and check_cancelled():
             raise RuntimeError("Cancelled")
-        
+
         result = await engine_client.poc_request("generate_artifacts", {
             "nonces": nonces,
             "block_hash": block_hash,
@@ -249,15 +261,19 @@ async def _compute_artifacts_chunk(
             "seq_len": seq_len,
             "k_dim": k_dim,
             "poc_stronger_rng": poc_stronger_rng,
+            "poc_decode": poc_decode,
+            "max_tokens": max_tokens,
+            "inference_k_points_steps": inference_k_points_steps,
+            "debug": debug,
         })
-        
+
         if not result.get("skipped"):
             return result.get("artifacts", [])
-        
+
         elapsed = time.time() - chunk_start_time
         if elapsed >= timeout_sec:
             raise RuntimeError(f"Timeout after {elapsed:.1f}s")
-        
+
         await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
 
 
@@ -496,22 +512,33 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     
     start_time = time.time()
     computed_artifacts = []
-    
+    poc_decode = getattr(request.app.state, "poc_decode", False)
+
     for i in range(0, total_nonces, body.batch_size):
         chunk = body.nonces[i:i + body.batch_size]
         chunk_idx = i // body.batch_size
-        
+
         def check_cancelled():
             return False
-        
+
         while _is_generation_active(app_id):
             await asyncio.sleep(0.1)
-        
+
+        chunk_inference_steps = None
+        if body.inference_k_points_steps:
+            chunk_inference_steps = {n: body.inference_k_points_steps[n]
+                                     for n in chunk if n in body.inference_k_points_steps}
+
         try:
             artifacts = await _compute_artifacts_chunk(
                 engine_client, chunk, body.block_hash, body.public_key,
                 body.params.seq_len, body.params.k_dim, body.poc_stronger_rng,
-                POC_GENERATE_CHUNK_TIMEOUT_SEC, check_cancelled
+                poc_decode=poc_decode,
+                max_tokens=body.max_tokens,
+                inference_k_points_steps=chunk_inference_steps,
+                debug=body.debug,
+                timeout_sec=POC_GENERATE_CHUNK_TIMEOUT_SEC,
+                check_cancelled=check_cancelled,
             )
             computed_artifacts.extend(artifacts)
             logger.debug(f"PoC /generate: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")

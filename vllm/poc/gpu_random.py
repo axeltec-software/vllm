@@ -7,7 +7,7 @@ OPTIMIZED: Serial Python loops replaced with batched GPU operations.
 """
 import hashlib
 import math
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -209,6 +209,34 @@ def apply_householder(
     return x - 2 * dot * v
 
 
+def generate_decode_inputs(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    prev_k: List[int],
+    step: int,
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """Generate deterministic decode-step embedding chained to the previous sphere_k.
+
+    The seed incorporates prev_k so each decode step is deterministically
+    linked to its predecessor.
+
+    Returns:
+        Tensor of shape [batch_size, 1, dim]
+    """
+    batch_size = len(nonces)
+    result = torch.empty(batch_size, 1, dim, device=device, dtype=dtype)
+    for i, (nonce, k) in enumerate(zip(nonces, prev_k)):
+        seed_str = f"{block_hash}_{public_key}_nonce{nonce}_decode{step}_k{k}"
+        seed = _seed_from_string(seed_str)
+        normal = _normal(seed, dim, device)
+        result[i, 0] = normal.to(dtype)
+    return result
+
+
 def random_pick_indices(
     block_hash: str,
     public_key: str,
@@ -216,18 +244,28 @@ def random_pick_indices(
     dim: int,
     k: int,
     device: torch.device,
+    prev_point_ids: Optional[List[int]] = None,
 ) -> torch.Tensor:
-    """Pick k dimensions per nonce deterministically (vectorized)."""
+    """Pick k dimensions per nonce deterministically (vectorized).
+
+    When prev_point_ids is provided the seed is mixed with the previous
+    sphere index so decode steps pick a different subset than prefill.
+    """
     if k <= 0 or k > dim:
         raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
 
     batch_size = len(nonces)
 
     seeds = []
-    for nonce in nonces:
-        seeds.append(_seed_from_string(
-            f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
-        ))
+    for i, nonce in enumerate(nonces):
+        if prev_point_ids is None:
+            seeds.append(_seed_from_string(
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
+            ))
+        else:
+            seeds.append(_seed_from_string(
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_k_{prev_point_ids[i]}"
+            ))
 
     all_idx = torch.arange(dim, device=device, dtype=torch.int32).unsqueeze(0).expand(batch_size, -1)
     seed_tensor = torch.tensor(seeds, dtype=torch.int64, device=device).unsqueeze(1)

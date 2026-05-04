@@ -12,10 +12,8 @@ from .data import (
     is_mismatch,
     fraud_test,
     compare_artifacts,
-    pad_nonces,
-    filter_artifacts,
 )
-from .manager import PoCManager, PoCStats
+from .manager import PoCManager
 from .routes import router as poc_router
 from .layer_hooks import LayerHouseholderHook
 from .poc_params import PoCParams
@@ -34,10 +32,7 @@ __all__ = [
     "is_mismatch",
     "fraud_test",
     "compare_artifacts",
-    "pad_nonces",
-    "filter_artifacts",
     "PoCManager",
-    "PoCStats",
     "LayerHouseholderHook",
     "poc_router",
 ]

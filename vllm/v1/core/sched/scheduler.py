@@ -1336,7 +1336,7 @@ class Scheduler(SchedulerInterface):
                             "reduced_hidden_state_b64": poc_obj.reduced_hidden_state_b64,
                             "reduced_hidden_state_decode_b64": getattr(poc_obj, "reduced_hidden_state_decode_b64", []),
                             "sphere_k": getattr(poc_obj, "sphere_k", -1),
-                            "sphere_k_steps": getattr(poc_obj, "sphere_k_steps", []),
+                            "k_points_steps": getattr(poc_obj, "k_points_steps", []),
                             "n_sphere_mismatches": getattr(poc_obj, "n_sphere_mismatches", -1),
                             "sph_indices_steps": getattr(poc_obj, "sph_indices_steps", []),
                             "sph_values_steps": getattr(poc_obj, "sph_values_steps", []),

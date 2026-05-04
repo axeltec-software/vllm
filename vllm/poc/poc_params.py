@@ -18,18 +18,18 @@ class PoCParams:
     max_tokens: int = 0        # number of decode steps (0 = prefill-only)
     # Validation mode: when set, this request tracks deviations from an
     # inference run instead of freely generating its own k-id sequence.
-    # The list contains sphere_k_steps from the reference inference run
+    # The list contains k_points_steps from the reference inference run
     # (index 0 = prefill, 1..N = decode steps).  At each step the validation
     # server computes its own k-id, compares against the reference, and uses
     # the reference k-id to seed the *next* decode embedding so that both
     # servers always run the same forward pass regardless of local deviations.
-    inference_sphere_k_steps: Optional[List[int]] = field(default=None, repr=False)
+    inference_k_points_steps: Optional[List[int]] = field(default=None, repr=False)
     # Debug mode: collect per-step sphere indices and values for mismatch analysis.
     debug: bool = False
 
     @property
     def is_validation(self) -> bool:
-        return self.inference_sphere_k_steps is not None
+        return self.inference_k_points_steps is not None
 
     def clone(self) -> "PoCParams":
         return PoCParams(
@@ -41,9 +41,9 @@ class PoCParams:
             k_dim=self.k_dim,
             poc_decode=self.poc_decode,
             max_tokens=self.max_tokens,
-            inference_sphere_k_steps=(
-                list(self.inference_sphere_k_steps)
-                if self.inference_sphere_k_steps is not None else None
+            inference_k_points_steps=(
+                list(self.inference_k_points_steps)
+                if self.inference_k_points_steps is not None else None
             ),
             debug=self.debug,
         )

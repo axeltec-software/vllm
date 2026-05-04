@@ -20,7 +20,7 @@ Usage:
     Import this module early in the application startup to apply the patch.
 """
 import asyncio
-from typing import Dict, Any, Optional, TYPE_CHECKING
+
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -67,7 +67,16 @@ async def poc_request(self, action: str, payload: dict, timeout_ms: int = 60000)
     seq_len = payload.get("seq_len", 256)
     k_dim = payload.get("k_dim", 12)
     poc_stronger_rng = payload.get("poc_stronger_rng", False)
-    
+    poc_decode = payload.get("poc_decode", False)
+    max_tokens = payload.get("max_tokens", 0)
+    debug = payload.get("debug", False)
+
+    # inference_k_points_steps: dict {nonce -> list[int]} → per-nonce list aligned to nonces order
+    raw_steps = payload.get("inference_k_points_steps") or {}
+    inference_k_points_steps_per_nonce = [
+        raw_steps.get(nonce) for nonce in nonces
+    ] if raw_steps else None
+
     if not nonces:
         return {"artifacts": []}
     
@@ -114,24 +123,45 @@ async def poc_request(self, action: str, payload: dict, timeout_ms: int = 60000)
                 hidden_size,
                 k_dim,
                 poc_stronger_rng,
+                poc_decode,
+                max_tokens,
+                inference_k_points_steps_per_nonce,
+                debug,
             ),
         )
-        
+
         # Only the last PP rank returns a result
         result = next((r for r in results if r is not None), None)
-        
+
         if result is None:
             return {"artifacts": [], "skipped": True}
-        
+
         # Convert result to artifact format
         vectors = result.get("vectors")  # FP16 numpy array
         result_nonces = result.get("nonces", nonces)
-        
+        sphere_k_list = result.get("sphere_k_list", [])
+        k_points_steps_list = result.get("k_points_steps_list", [])
+        mismatch_count = result.get("mismatch_count", [])
+        sph_indices_steps = result.get("sph_indices_steps", [])
+        sph_values_steps = result.get("sph_values_steps", [])
+
         artifacts = []
         for i, nonce in enumerate(result_nonces):
-            vector_b64 = encode_vector(vectors[i])
-            artifacts.append({"nonce": nonce, "vector_b64": vector_b64})
-        
+            artifact: dict = {
+                "nonce": nonce,
+                "vector_b64": encode_vector(vectors[i]),
+            }
+            if sphere_k_list:
+                artifact["sphere_k"] = sphere_k_list[i]
+            if k_points_steps_list:
+                artifact["k_points_steps"] = k_points_steps_list[i]
+            if mismatch_count:
+                artifact["n_sphere_mismatches"] = mismatch_count[i]
+            if debug and sph_indices_steps:
+                artifact["sph_indices_steps"] = sph_indices_steps[i]
+                artifact["sph_values_steps"] = sph_values_steps[i]
+            artifacts.append(artifact)
+
         return {"artifacts": artifacts}
         
     except asyncio.TimeoutError:
@@ -176,5 +206,3 @@ def apply_patch():
             raise
 
 
-# Auto-apply patch when module is imported
-apply_patch()

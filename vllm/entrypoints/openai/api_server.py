@@ -548,6 +548,8 @@ def build_app(args: Namespace) -> FastAPI:
         logger.info("PoC (Proof of Compute) API enabled [decode mode ON]")
     else:
         logger.info("PoC (Proof of Compute) API enabled")
+    from vllm.poc.engine_patch import apply_patch as _poc_apply_patch
+    _poc_apply_patch()
 
     from vllm.entrypoints.pooling import register_pooling_api_routers
 
