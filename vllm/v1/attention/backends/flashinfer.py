@@ -63,7 +63,7 @@ from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.attention.utils.fa_utils import get_flash_attn_version
+from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 
