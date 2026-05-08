@@ -245,6 +245,7 @@ def random_pick_indices(
     k: int,
     device: torch.device,
     prev_point_ids: Optional[List[int]] = None,
+    step: int = 0,
 ) -> torch.Tensor:
     """Pick k dimensions per nonce deterministically (vectorized).
 
@@ -260,11 +261,11 @@ def random_pick_indices(
     for i, nonce in enumerate(nonces):
         if prev_point_ids is None:
             seeds.append(_seed_from_string(
-                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}"
             ))
         else:
             seeds.append(_seed_from_string(
-                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_k_{prev_point_ids[i]}"
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}_k_{prev_point_ids[i]}"
             ))
 
     all_idx = torch.arange(dim, device=device, dtype=torch.int32).unsqueeze(0).expand(batch_size, -1)

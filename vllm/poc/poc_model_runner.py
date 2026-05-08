@@ -499,6 +499,7 @@ def execute_poc_forward(
                 sph_idx_dec = random_pick_indices(
                     block_hash, public_key, nonces, hidden_size, SPHERE_DIM, device,
                     prev_point_ids=prev_k,
+                    step=step,
                 )
                 xk_sph_dec = project_to_sphere(torch.gather(last_hidden_dec, 1, sph_idx_dec))
                 step_k_points = nearest_sphere_index(xk_sph_dec, codebook).cpu().tolist()
