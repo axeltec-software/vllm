@@ -213,6 +213,113 @@ def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker):
     return attn_metadata_dict, slot_mapping_dict
 
 
+def _create_decode_attn_metadata_with_history(
+    batch_size,
+    prefill_seq_len,
+    step,
+    block_size,
+    device,
+    worker,
+    prefill_blocks_per_seq,
+    max_decode_blocks_per_seq,
+    decode_block_start,
+):
+    """Create attention metadata for a single decode step with full context history.
+
+    One new token per sequence (the query) attends to all prefill_seq_len + step
+    tokens in the KV cache.  Physical block layout must be consistent with what
+    _create_v1_attn_metadata wrote during the prefill phase:
+      - seq i prefill blocks: i*prefill_blocks_per_seq .. (i+1)*prefill_blocks_per_seq - 1
+      - seq i decode blocks:  decode_block_start + i*max_decode_blocks_per_seq + j
+    """
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    new_pos = prefill_seq_len + step - 1
+    block_in_seq = new_pos // block_size
+    slot_in_block = new_pos % block_size
+    context_len = prefill_seq_len + step
+    total_blocks_for_context = math.ceil(context_len / block_size)
+
+    slot_mapping_list = []
+    block_table_rows = []
+
+    for seq_idx in range(batch_size):
+        if block_in_seq < prefill_blocks_per_seq:
+            phys_block = seq_idx * prefill_blocks_per_seq + block_in_seq
+        else:
+            decode_blk_idx = block_in_seq - prefill_blocks_per_seq
+            phys_block = (
+                decode_block_start
+                + seq_idx * max_decode_blocks_per_seq
+                + decode_blk_idx
+            )
+        slot_mapping_list.append(phys_block * block_size + slot_in_block)
+
+        row = []
+        for blk_in_seq in range(total_blocks_for_context):
+            if blk_in_seq < prefill_blocks_per_seq:
+                row.append(seq_idx * prefill_blocks_per_seq + blk_in_seq)
+            else:
+                decode_blk_idx = blk_in_seq - prefill_blocks_per_seq
+                row.append(
+                    decode_block_start
+                    + seq_idx * max_decode_blocks_per_seq
+                    + decode_blk_idx
+                )
+        block_table_rows.append(row)
+
+    slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.long, device=device)
+    block_table = torch.tensor(block_table_rows, dtype=torch.int32, device=device)
+
+    query_start_loc_gpu = torch.arange(
+        batch_size + 1, dtype=torch.int32, device=device
+    )
+    query_start_loc_cpu = torch.arange(
+        batch_size + 1, dtype=torch.int32, device="cpu"
+    )
+    seq_lens_gpu = torch.full(
+        (batch_size,), context_len, dtype=torch.int32, device=device
+    )
+    seq_lens_cpu = torch.full(
+        (batch_size,), context_len, dtype=torch.int32, device="cpu"
+    )
+
+    common_attn_metadata = CommonAttentionMetadata(
+        query_start_loc=query_start_loc_gpu,
+        query_start_loc_cpu=query_start_loc_cpu,
+        seq_lens=seq_lens_gpu,
+        num_reqs=batch_size,
+        num_actual_tokens=batch_size,
+        max_query_len=1,
+        max_seq_len=context_len,
+        block_table_tensor=block_table,
+        slot_mapping=slot_mapping,
+        causal=True,
+        _seq_lens_cpu=seq_lens_cpu,
+        _num_computed_tokens_cpu=torch.full(
+            (batch_size,), prefill_seq_len + step - 1,
+            dtype=torch.int32, device="cpu",
+        ),
+    )
+
+    model_runner = worker.model_runner
+    attn_metadata_dict = {}
+    slot_mapping_dict = {}
+
+    for kv_cache_group_attn_groups in model_runner.attn_groups:
+        for attn_group in kv_cache_group_attn_groups:
+            builder = attn_group.get_metadata_builder(0)
+            metadata = builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+            )
+            for layer_name in attn_group.layer_names:
+                attn_metadata_dict[layer_name] = metadata
+                slot_mapping_dict[layer_name] = slot_mapping
+
+    return attn_metadata_dict, slot_mapping_dict
+
+
 def _get_or_create_attn_metadata(batch_size, seq_len, block_size, device, worker):
     """Create fresh attention metadata for the given parameters."""
     return _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker)
@@ -454,6 +561,14 @@ def execute_poc_forward(
                 pp_group.world_size,
             )
         else:
+            prefill_blocks_per_seq = math.ceil(seq_len / block_size)
+            decode_block_start = batch_size * prefill_blocks_per_seq
+            max_decode_blocks_per_seq = (
+                math.ceil((seq_len + max_tokens) / block_size)
+                - prefill_blocks_per_seq
+                + 1
+            )
+
             for step in range(1, max_tokens + 1):
                 if tp_group.world_size > 1:
                     dist.barrier(group=tp_group.cpu_group)
@@ -471,8 +586,10 @@ def execute_poc_forward(
                     (batch_size,), seq_len + step - 1,
                     device=device, dtype=torch.long,
                 )
-                dec_attn, dec_slot = _create_v1_attn_metadata(
-                    batch_size, 1, block_size, device, worker
+                dec_attn, dec_slot = _create_decode_attn_metadata_with_history(
+                    batch_size, seq_len, step, block_size, device, worker,
+                    prefill_blocks_per_seq, max_decode_blocks_per_seq,
+                    decode_block_start,
                 )
 
                 with set_forward_context(
