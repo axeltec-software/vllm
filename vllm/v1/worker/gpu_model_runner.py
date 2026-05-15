@@ -185,6 +185,9 @@ from .utils import (
     sanity_check_mm_encoder_outputs,
 )
 
+from vllm.poc.layer_hooks import poc_forward_context_with_mask, LayerHouseholderHook
+from vllm.poc.poc_model_runner import bypass_torch_compile
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -4061,13 +4064,11 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        from vllm.poc.layer_hooks import (
-            poc_forward_context_with_mask,
-            LayerHouseholderHook,
-        )
-        from vllm.poc.poc_model_runner import bypass_torch_compile
         from contextlib import nullcontext
 
+        if poc_position_mask is None and hasattr(self, '_poc_layer_hooks'):
+            self._poc_layer_hooks.detach()
+            self._poc_layer_hooks = None
 
         if poc_position_mask is not None and poc_metadata:
             first_poc_params = poc_metadata[0]['poc_params']

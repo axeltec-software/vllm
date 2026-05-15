@@ -5,6 +5,7 @@ Uses actual KV cache blocks for attention to work correctly.
 Batched forward pass — processes all nonces in a single forward call.
 """
 import math
+from contextlib import contextmanager
 import torch
 import torch.distributed as dist
 import numpy as np
@@ -27,6 +28,24 @@ from .data import encode_vector
 from .layer_hooks import LayerHouseholderHook, poc_forward_context
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def bypass_torch_compile():
+    """Temporarily bypass torch.compile for PoC forward passes.
+
+    PoC uses inputs_embeds instead of input_ids. If the model was traced
+    by dynamo with input_ids as a tensor, calling it with input_ids=None
+    causes a guard failure. Setting _is_compiling_flag=True makes
+    @support_torch_compile decorated models skip the compiled path and use
+    the raw forward() directly.
+    """
+    old_flag = getattr(torch.compiler, '_is_compiling_flag', False)
+    torch.compiler._is_compiling_flag = True
+    try:
+        yield
+    finally:
+        torch.compiler._is_compiling_flag = old_flag
 
 DEFAULT_K_DIM = 12
 
