@@ -3,6 +3,7 @@
 """Attention layer with FlashInfer."""
 
 from dataclasses import dataclass
+import os
 from typing import ClassVar
 
 import numpy as np
@@ -396,6 +397,9 @@ class FIDecode:
     """Metadata for the native FlashInfer decode pathway (non-TRTLLM)."""
 
     wrapper: BatchDecodeWithPagedKVCacheWrapper
+    _dbg_indptr: torch.Tensor
+    _dbg_indices: torch.Tensor
+    _dbg_last_len: torch.Tensor
 
 
 @dataclass
@@ -1120,7 +1124,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
                 )
-                attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
+
+                #   attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
+                attn_metadata.decode = FIDecode(
+                    wrapper=decode_wrapper,
+                    _dbg_indptr=self.paged_kv_indptr.cpu[: num_input_tokens + 1].clone(),
+                    _dbg_indices=paged_kv_indices.cpu().clone(),
+                    _dbg_last_len=self.paged_kv_last_page_len.cpu[:num_input_tokens].clone(),
+                )
+
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -1132,6 +1144,68 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # return use_cascade_attention(*args, **kwargs)
         return False
 
+dump_counter = 0
+
+def dump_kv_cache_to_file(
+    kv_cache: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,        # CPU int32, shape [num_reqs + 1]
+    paged_kv_indices: torch.Tensor,       # CPU int32, shape [num_active_pages]
+    paged_kv_last_page_len: torch.Tensor, # CPU int32, shape [num_reqs]
+    page_size: int,
+    filepath: str,
+    layout: str = "NHD",  # or "HND"
+) -> None:
+    """Dump active KV cache blocks for the current decode batch to a text file.
+
+    kv_cache layout NHD: [num_blocks, 2, page_size, num_kv_heads, head_size]
+    kv_cache layout HND: [num_blocks, 2, num_kv_heads, page_size, head_size]
+    dim-1 index 0 = K, index 1 = V.
+
+    Where to call this in flashinfer.py:
+        FlashInferImpl.forward(), right before decode_wrapper.run(), once
+        paged_kv_indptr / paged_kv_indices / paged_kv_last_page_len are
+        reachable (e.g. stored on FIDecode during build()).
+    """
+    kv_cpu  = kv_cache.float().cpu()
+    indptr  = paged_kv_indptr.cpu().tolist()
+    indices = paged_kv_indices.cpu().tolist()
+    last_len = paged_kv_last_page_len.cpu().tolist()
+    num_reqs = len(indptr) - 1
+
+    with open(filepath, "w") as f:
+        for req in range(num_reqs):
+            blk_start = indptr[req]
+            blk_end   = indptr[req + 1]
+            num_pages = blk_end - blk_start
+            last_page_toks = last_len[req] - 1
+            seq_len = max(0, (num_pages - 1) * page_size + last_page_toks)
+
+            f.write(f"=== request {req}  seq_len={seq_len}  pages={num_pages} ===\n")
+
+            tok_abs = 0
+            for page_pos in range(num_pages):
+                block_id = indices[blk_start + page_pos]
+                toks = last_page_toks if page_pos == num_pages - 1 else page_size
+
+                if layout == "NHD":
+                    # [page_size, num_kv_heads, head_size]
+                    k_page = kv_cpu[block_id, 0, :toks]
+                    v_page = kv_cpu[block_id, 1, :toks]
+                else:  # HND
+                    # [num_kv_heads, page_size, head_size] -> [page_size, ...]
+                    k_page = kv_cpu[block_id, 0, :, :toks].permute(1, 0, 2)
+                    v_page = kv_cpu[block_id, 1, :, :toks].permute(1, 0, 2)
+
+                f.write(f"Shape of k-page: {k_page.shape}\n")
+                for t in range(len(k_page)): #range(toks):
+                    # k_page[t] / v_page[t] shape: [num_kv_heads, head_size]
+                    #f.write(f"  tok {tok_abs:5d}  block={block_id}\n")
+                    #f.write(f"    K {k_page[t].shape}\n")
+                    #f.write(f"    V {v_page[t].shape}\n")
+                    tok_abs += 1
+                
+            f.write(f"Number of tokens: {tok_abs}\n")
+            f.write("\n")
 
 class FlashInferImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
@@ -1238,6 +1312,19 @@ class FlashInferImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
         assert output is not None, "Output tensor must be provided."
+        global dump_counter
+
+        if attn_metadata is not None and isinstance(attn_metadata.decode, FIDecode):  
+            dump_kv_cache_to_file(
+                kv_cache=kv_cache,
+                paged_kv_indptr=attn_metadata.decode._dbg_indptr,
+                paged_kv_indices=attn_metadata.decode._dbg_indices,
+                paged_kv_last_page_len=attn_metadata.decode._dbg_last_len,
+                page_size=self.head_size,   # replace with actual page_size
+                filepath=f"kv_dump_{dump_counter}.txt", #os.environ["VLLM_DUMP_KV_CACHE"],
+                layout=get_kv_cache_layout(),
+            )
+            dump_counter += 1
 
         if attn_metadata is None:
             # Profiling run.

@@ -4,6 +4,7 @@ Full model forward pass with proper V1 attention metadata.
 Uses actual KV cache blocks for attention to work correctly.
 Batched forward pass — processes all nonces in a single forward call.
 """
+import time
 import math
 import torch
 import torch.distributed as dist
@@ -553,6 +554,7 @@ def execute_poc_forward(
     # -------------------------------------------------------------------------
     # Decode loop
     # -------------------------------------------------------------------------
+    t_decode_total = 0.0
     if poc_decode and max_tokens > 0:
         if pp_group.world_size > 1:
             logger.warning(
@@ -570,6 +572,8 @@ def execute_poc_forward(
             )
 
             for step in range(1, max_tokens + 1):
+                torch.cuda.synchronize()
+                t_dec_step_start = time.perf_counter()
                 if tp_group.world_size > 1:
                     dist.barrier(group=tp_group.cpu_group)
                     if is_tp_driver:
@@ -642,6 +646,13 @@ def execute_poc_forward(
                     else:
                         new_prev_k.append(computed_k)
                 prev_k = new_prev_k
+                torch.cuda.synchronize()
+                t_decode_total += time.perf_counter() - t_dec_step_start
+            
+        logger.info(
+            f"POC Timing: batch={batch_size}, seq_len={seq_len}, "
+            f"decode_steps={max_tokens if poc_decode else 0} | decode={t_decode_total:.4f}s"
+    )
 
     return {
         "nonces": nonces,
