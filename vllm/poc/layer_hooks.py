@@ -49,8 +49,44 @@ class LayerHouseholderHook:
         hidden_size: int,
     ):
         self.hooks: List = []
-        self.reflection_vectors: List[torch.Tensor] = []
         self.block_hash = block_hash
+        layers = self._find_layers(model)
+        # One pre-allocated buffer per layer. GPU address is fixed for
+        # the lifetime of this object; only the contents change.
+        self.reflection_vectors: List[torch.Tensor] = [
+            torch.empty(hidden_size, dtype=torch.float32, device=device)
+            for _ in layers
+        ]
+        self._fill_reflection_vectors(block_hash, hidden_size, device)
+
+    def _fill_reflection_vectors(
+        self,
+        block_hash: str,
+        hidden_size: int,
+        device: torch.device,
+    ) -> None:
+        """Rewrite reflection vector contents in-place for a new block_hash.
+
+        GPU addresses of self.reflection_vectors do not change, so any
+        CUDAGraphWrapper graph that reads these tensors remains valid.
+        """
+        for i, buf in enumerate(self.reflection_vectors):
+            seed_str = f"{block_hash}_layer_{i}_householder"
+            v = generate_householder_vector(seed_str, hidden_size, device)
+            buf.copy_(v.to(buf.dtype))   # in-place; same data_ptr()
+        self.block_hash = block_hash
+
+    def update_block_hash(
+        self,
+        block_hash: str,
+        hidden_size: int,
+        device: torch.device,
+    ) -> None:
+        """Refresh reflection vectors for a new block_hash without re-registering hooks.
+
+        Safe to call while piecewise CUDA graphs are live — no re-capture needed.
+        """
+        self._fill_reflection_vectors(block_hash, hidden_size, device)
 
     def _find_layers(self, model: torch.nn.Module) -> List[torch.nn.Module]:
         """Find transformer layers in a model-agnostic way."""
@@ -69,48 +105,35 @@ class LayerHouseholderHook:
         device: torch.device,
         hidden_size: int,
     ):
-        """Setup hooks on all transformer layers."""
+        """Register forward hooks on all transformer layers.
+
+        Reflection vectors must be allocated before calling (done in __init__).
+        """
         layers = self._find_layers(model)
         self.num_total_layers = len(layers)
 
         for i in range(len(layers)):
-            seed_str = f"{block_hash}_layer_{i}_householder"
-            v = generate_householder_vector(seed_str, hidden_size, device)
-            self.reflection_vectors.append(v)
-
             hook = layers[i].register_forward_hook(self._create_hook(i))
             self.hooks.append(hook)
 
     def _create_hook(self, layer_idx: int):
-        """Create a forward hook that applies Householder reflection.
-
-        Hook only transforms when poc_forward_context is active.
-        Uses simple global bool check instead of ContextVar for dynamo compat.
-        """
         def hook(module, input, output):
             if not is_poc_forward_active():
-                return output
+                return
 
             v = self.reflection_vectors[layer_idx]
 
-            def transform(x):
-                return apply_householder(x, v.to(x.dtype))
-
             if isinstance(output, tuple):
+                hidden = output[0]
+                hidden.copy_(apply_householder(hidden, v.to(hidden.dtype)))
                 if len(output) >= 2:
-                    hidden = output[0]
                     residual = output[1]
-                    rest = output[2:] if len(output) > 2 else ()
-                    transformed_hidden = transform(hidden)
-                    transformed_residual = transform(residual)
-                    return (transformed_hidden, transformed_residual) + rest
-                else:
-                    hidden = output[0]
-                    transformed = transform(hidden)
-                    return (transformed,)
+                    if residual is not None:
+                        residual.copy_(apply_householder(residual, v.to(residual.dtype)))
+                return output
             else:
-                transformed = transform(output)
-                return transformed
+                output.copy_(apply_householder(output, v.to(output.dtype)))
+                return output
 
         return hook
 
