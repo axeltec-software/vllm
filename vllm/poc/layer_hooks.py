@@ -104,9 +104,42 @@ class LayerHouseholderHook:
         hidden_size: int,
     ):
         self.hooks: List = []
-        self.reflection_vectors: List[torch.Tensor] = []
         self.block_hash = block_hash
-        self._setup(model, block_hash, device, hidden_size)
+        layers = self._find_layers(model)
+
+        # Allocate once. GPU addresses are fixed for this object's lifetime.
+        # Contents are updated in-place by _fill_reflection_vectors / update_block_hash.
+        self.reflection_vectors: List[torch.Tensor] = [
+            torch.empty(hidden_size, dtype=torch.float32, device=device)
+            for _ in layers
+        ]
+        self._fill_reflection_vectors(block_hash, hidden_size, device)
+
+    def _fill_reflection_vectors(
+        self,
+        block_hash: str,
+        hidden_size: int,
+        device: torch.device,
+    ) -> None:
+        """Write new values into the pre-allocated reflection vector buffers.
+
+        GPU addresses of self.reflection_vectors do not change, so any
+        CUDA graph that has recorded ops reading these tensors remains valid.
+        """
+        for i, buf in enumerate(self.reflection_vectors):
+            seed_str = f"{block_hash}_layer_{i}_householder"
+            v = generate_householder_vector(seed_str, hidden_size, device)
+            buf.copy_(v.to(buf.dtype))
+        self.block_hash = block_hash
+
+    def update_block_hash(
+        self,
+        block_hash: str,
+        hidden_size: int,
+        device: torch.device,
+    ) -> None:
+        """Refresh for a new block_hash without detaching hooks or re-capturing graphs."""
+        self._fill_reflection_vectors(block_hash, hidden_size, device)
 
     def _find_layers(self, model: torch.nn.Module) -> List[torch.nn.Module]:
         """Find transformer layers in a model-agnostic way."""
@@ -125,33 +158,26 @@ class LayerHouseholderHook:
         device: torch.device,
         hidden_size: int,
     ):
-        """Setup hooks on all transformer layers."""
+        """Register forward hooks. Reflection vectors must already be allocated."""
         layers = self._find_layers(model)
         self.num_total_layers = len(layers)
 
         for i in range(len(layers)):
-            seed_str = f"{block_hash}_layer_{i}_householder"
-            v = generate_householder_vector(seed_str, hidden_size, device)
-            self.reflection_vectors.append(v)
-
             hook = layers[i].register_forward_hook(self._create_hook(i))
             self.hooks.append(hook)
 
     def _create_hook(self, layer_idx: int):
-        """Create a forward hook that applies Householder reflection.
+        """Apply Householder reflection in binary or mask mode.
 
-        Supports two modes:
-        1. Binary mode: Transform ALL positions when poc_forward_context() active
-        2. Mask mode: Transform only PoC positions when poc_forward_context_with_mask() active
-
-        vLLM decoder layers typically return (hidden_states, residual).
-        We must transform BOTH to prevent residual connections from
-        preserving untransformed values.
+            Binary mode (poc_forward_context active): in-place, CUDA-graph safe.
+            Mask mode (poc_forward_context_with_mask active): returns new tensors,
+            NOT compatible with CUDA graphs. Do not capture while mask is set.
         """
         def hook(module, input, output):
             poc_mask = get_poc_position_mask()
 
             if poc_mask is not None:
+                # Mask mode: eager only. Do not trigger during graph capture/replay.
                 v = self.reflection_vectors[layer_idx]
                 return self._apply_selective_transform(output, poc_mask, v)
 
@@ -160,25 +186,18 @@ class LayerHouseholderHook:
 
             v = self.reflection_vectors[layer_idx]
 
-            def transform(x):
-                return apply_householder(x, v.to(x.dtype))
-
             if isinstance(output, tuple):
+                hidden = output[0]
+                hidden.copy_(apply_householder(hidden, v.to(hidden.dtype)))
                 if len(output) >= 2:
-                    hidden = output[0]
                     residual = output[1]
-                    rest = output[2:] if len(output) > 2 else ()
-                    transformed_hidden = transform(hidden)
-                    transformed_residual = transform(residual)
-                    return (transformed_hidden, transformed_residual) + rest
-                else:
-                    hidden = output[0]
-                    transformed = transform(hidden)
-                    return (transformed,)
+                    if residual is not None:
+                        residual.copy_(apply_householder(residual, v.to(residual.dtype)))
+                return output    # same tuple object, tensors updated in-place
             else:
-                transformed = transform(output)
-                return transformed
-
+                output.copy_(apply_householder(output, v.to(output.dtype)))
+                return output
+ 
         return hook
 
     def _apply_selective_transform(
@@ -237,11 +256,11 @@ class LayerHouseholderHook:
             return selective_transform(output)
 
     def detach(self):
-        """Remove all hooks."""
+        """Remove forward hook handles. Reflection vector buffers are retained."""
         for hook in self.hooks:
             hook.remove()
         self.hooks = []
-        self.reflection_vectors = []
+        # Do NOT clear self.reflection_vectors — the CUDA graph still references them.
 
     @property
     def num_layers(self) -> int:
