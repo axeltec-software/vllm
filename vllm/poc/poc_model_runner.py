@@ -393,14 +393,15 @@ def _get_or_capture_poc_graph(
     attn_metadata, slot_mapping_dict,
     embeds_buf, positions_buf,
 ):
-    """Return (graph, captured_hidden) for the given prefill shape.
+    """Return (graph, hidden) for the given prefill shape.
 
     First call for a new (batch_size, seq_len):
-      1. Warmup: compiles JIT kernels; FlashInfer plan() sets up GPU workspace
-         at stable addresses used by all future replays.
-      2. Capture: records all CUDA kernels (linear ops, attention, hooks) into
-         a torch.cuda.CUDAGraph.
-    Subsequent calls: returns cached (graph, captured_hidden) immediately.
+      Runs warmup eagerly, clones the output as `warmup_hidden`, then captures
+      the graph. Returns (None, warmup_hidden) — caller must NOT call
+      graph.replay() when graph is None; use the returned hidden directly.
+
+    Subsequent calls: returns (graph, captured_hidden) from cache. Caller
+      calls graph.replay() and then reads from captured_hidden.
 
     Before each replay: update embeds_buf in-place with the new request's
     embeddings. The graph reads from embeds_buf at the same address.
@@ -422,12 +423,19 @@ def _get_or_capture_poc_graph(
         skip_compiled=True,
     ):
         with poc_forward_context():
-            _ = model(
+            warmup_out = model(
                 input_ids=None,
                 positions=positions_buf,
                 inputs_embeds=embeds_buf,
             )
     torch.cuda.synchronize()
+
+    # Clone before the capture run can clobber any shared model-internal buffer.
+    # This tensor is returned as-is for the first call so the caller always
+    # sees a pure eager result on the initial invocation.
+    warmup_hidden = (
+        warmup_out[0] if isinstance(warmup_out, tuple) else warmup_out
+    ).clone()
 
     if not hasattr(worker, "_poc_graph_pool"):
         worker._poc_graph_pool = torch.cuda.graph_pool_handle()
@@ -447,10 +455,10 @@ def _get_or_capture_poc_graph(
                     inputs_embeds=embeds_buf,
                 )
 
-    if isinstance(captured_out, tuple):
-        captured_hidden = captured_out[0]
-    else:
-        captured_hidden = captured_out
+    captured_hidden = (
+        captured_out[0] if isinstance(captured_out, tuple) else captured_out
+    )
+    torch.cuda.synchronize()
 
     cache[key] = (graph, captured_hidden)
     worker._poc_cuda_graphs = cache
@@ -458,7 +466,10 @@ def _get_or_capture_poc_graph(
         "POC prefill graph captured batch_size=%d seq_len=%d (%d tokens)",
         batch_size, seq_len, num_tokens,
     )
-    return graph, captured_hidden
+    # First call: return graph=None so the caller skips graph.replay() and
+    # uses the warmup output directly.  Subsequent calls return the real graph
+    # from cache and the caller drives replay normally.
+    return None, warmup_hidden
 
 def _get_poc_decode_input_buffers(worker, batch_size, hidden_size, device, dtype):
     """Pre-allocated (decode_embeds_buf, decode_pos_buf) for decode with stable addresses.
@@ -513,11 +524,14 @@ def _get_or_capture_poc_decode_graph(
     dec_attn, dec_slot,
     decode_embeds_buf, decode_pos_buf,
 ):
-    """Return (graph, captured_dec_hidden) for the given decode step.
+    """Return (graph, hidden) for the given decode step.
 
-    One graph per (batch_size, seq_len, step). First call warmups and captures;
-    subsequent calls replay. The cached graph processes batch_size tokens
-    (one per sequence) with context_len = seq_len + step.
+    First call for a new (batch_size, seq_len, step): runs warmup eagerly,
+    clones the output, captures the graph, returns (None, warmup_dec_hidden).
+    Caller must NOT call graph.replay() when graph is None.
+
+    Subsequent calls: returns (graph, captured_dec_hidden) from cache. Caller
+    calls graph.replay() then reads from captured_dec_hidden.
 
     Before each replay:
       - decode_embeds_buf.copy_(step_embedding)   → new input embedding
@@ -538,12 +552,16 @@ def _get_or_capture_poc_decode_graph(
         skip_compiled=True,
     ):
         with poc_forward_context():
-            _ = model(
+            warmup_dec_out = model(
                 input_ids=None,
                 positions=decode_pos_buf,
                 inputs_embeds=decode_embeds_buf,
             )
     torch.cuda.synchronize()
+
+    warmup_dec_hidden = (
+        warmup_dec_out[0] if isinstance(warmup_dec_out, tuple) else warmup_dec_out
+    ).clone()
 
     if not hasattr(worker, "_poc_graph_pool"):
         worker._poc_graph_pool = torch.cuda.graph_pool_handle()
@@ -563,10 +581,10 @@ def _get_or_capture_poc_decode_graph(
                     inputs_embeds=decode_embeds_buf,
                 )
 
-    if isinstance(captured_dec_out, tuple):
-        captured_dec_hidden = captured_dec_out[0]
-    else:
-        captured_dec_hidden = captured_dec_out
+    captured_dec_hidden = (
+        captured_dec_out[0] if isinstance(captured_dec_out, tuple) else captured_dec_out
+    )
+    torch.cuda.synchronize()
 
     cache[key] = (graph, captured_dec_hidden)
     worker._poc_decode_cuda_graphs = cache
@@ -574,7 +592,7 @@ def _get_or_capture_poc_decode_graph(
         "POC decode graph captured batch_size=%d seq_len=%d step=%d",
         batch_size, seq_len, step,
     )
-    return graph, captured_dec_hidden
+    return None, warmup_dec_hidden
 
 
 @torch.inference_mode()
@@ -677,22 +695,23 @@ def execute_poc_forward(
             )
             embeds_buf.copy_(raw.view(-1, hidden_size))
 
-        graph, captured_hidden = _get_or_capture_poc_graph(
+        graph, poc_hidden = _get_or_capture_poc_graph(
             worker,
             batch_size, seq_len, hidden_size,
             device, dtype, vllm_config,
             attn_metadata, slot_mapping_dict,
             embeds_buf, positions_buf,
         )
-        with set_forward_context(
-            attn_metadata, vllm_config,
-            num_tokens=batch_size * seq_len,
-            slot_mapping=slot_mapping_dict,
-            skip_compiled=True,
-        ):
-            with poc_forward_context():
-                graph.replay()
-        hidden_states = captured_hidden
+        if graph is not None:
+            with set_forward_context(
+                attn_metadata, vllm_config,
+                num_tokens=batch_size * seq_len,
+                slot_mapping=slot_mapping_dict,
+                skip_compiled=True,
+            ):
+                with poc_forward_context():
+                    graph.replay()
+        hidden_states = poc_hidden
     else:
         intermediate_tensors = IntermediateTensors(
             pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
@@ -860,7 +879,7 @@ def execute_poc_forward(
                     decode_block_start, block_size, device,
                 )
 
-                dec_graph, captured_dec_hidden = _get_or_capture_poc_decode_graph(
+                dec_graph, dec_hidden = _get_or_capture_poc_decode_graph(
                     worker,
                     batch_size, seq_len, step, hidden_size,
                     device, dtype, vllm_config,
@@ -868,15 +887,16 @@ def execute_poc_forward(
                     decode_embeds_buf, decode_pos_buf,
                 )
 
-                with set_forward_context(
-                    dec_attn, vllm_config,
-                    num_tokens=batch_size,
-                    slot_mapping=dec_slot,
-                    skip_compiled=True,
-                ):
-                    with poc_forward_context():
-                        dec_graph.replay()
-                hs_dec = captured_dec_hidden
+                if dec_graph is not None:
+                    with set_forward_context(
+                        dec_attn, vllm_config,
+                        num_tokens=batch_size,
+                        slot_mapping=dec_slot,
+                        skip_compiled=True,
+                    ):
+                        with poc_forward_context():
+                            dec_graph.replay()
+                hs_dec = dec_hidden
 
                 if isinstance(hs_dec, tuple):
                     hs_dec = hs_dec[0]
