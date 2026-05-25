@@ -157,6 +157,13 @@ def _get_block_size(worker):
     return worker.cache_config.block_size
 
 
+def _iter_attn_builders(worker):
+    """Yield every FlashInfer metadata builder on the worker."""
+    for kv_groups in worker.model_runner.attn_groups:
+        for attn_group in kv_groups:
+            yield attn_group.get_metadata_builder(0)
+
+
 def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker):
     """Create attention metadata for batch_size sequences.
 
@@ -410,16 +417,50 @@ def _get_or_capture_poc_graph(
     """
     cache = getattr(worker, "_poc_cuda_graphs", {})
     key = (batch_size, seq_len)
+    block_size = _get_block_size(worker)
+    total_blocks = batch_size * math.ceil(seq_len / block_size)
+
     if key in cache:
-        return cache[key]
+        graph, captured_hidden, *_, kv_snapshots = cache[key]
+        # Restore paged_kv_indices in the shared builder buffer.  FlashInfer may
+        # reference these from inside the workspace; the inference engine overwrites
+        # them between POC calls.
+        for builder, saved_kv in zip(_iter_attn_builders(worker), kv_snapshots):
+            builder.paged_kv_indices.gpu[:total_blocks].copy_(saved_kv)
+        return graph, captured_hidden
 
     model = worker.model_runner.model
     num_tokens = batch_size * seq_len
 
+    # Give this POC graph its own workspace so inference-engine plan() calls
+    # between POC requests cannot corrupt it.  Each builder's existing workspace
+    # and prefill wrapper are swapped out before capture and restored after.
+    builders = list(_iter_attn_builders(worker))
+    orig_workspaces = []
+    orig_prefill_wrappers = []
+    poc_workspaces = []
+    for b in builders:
+        orig_workspaces.append(b._get_workspace_buffer())   # lazy-init if needed
+        orig_prefill_wrappers.append(b._prefill_wrapper)
+        poc_ws = torch.zeros_like(b._workspace_buffer)
+        b.set_workspace_buffer(poc_ws)
+        b._prefill_wrapper = None  # force recreation with poc_ws
+        poc_workspaces.append(poc_ws)
+
+    # Create fresh metadata AFTER swapping workspace.
+    # builder.build() → _get_prefill_wrapper() creates a new wrapper backed by
+    # poc_ws → plan() writes POC attention parameters into poc_ws.
+    # The passed-in attn_metadata has a wrapper pointing to the original
+    # workspace (created before the swap) and must NOT be used for capture.
+    poc_attn_meta, poc_slot_map = _create_v1_attn_metadata(
+        batch_size, seq_len, block_size, device, worker
+    )
+    poc_prefill_wrappers = [b._prefill_wrapper for b in builders]
+
     with set_forward_context(
-        attn_metadata, vllm_config,
+        poc_attn_meta, vllm_config,
         num_tokens=num_tokens,
-        slot_mapping=slot_mapping_dict,
+        slot_mapping=poc_slot_map,
         skip_compiled=True,
     ):
         with poc_forward_context():
@@ -442,9 +483,9 @@ def _get_or_capture_poc_graph(
 
     graph = torch.cuda.CUDAGraph()
     with set_forward_context(
-        attn_metadata, vllm_config,
+        poc_attn_meta, vllm_config,
         num_tokens=num_tokens,
-        slot_mapping=slot_mapping_dict,
+        slot_mapping=poc_slot_map,
         skip_compiled=True,
     ):
         with poc_forward_context():
@@ -455,12 +496,26 @@ def _get_or_capture_poc_graph(
                     inputs_embeds=embeds_buf,
                 )
 
+    # Restore inference-engine workspace and wrapper before anything else runs.
+    for b, ows, opw in zip(builders, orig_workspaces, orig_prefill_wrappers):
+        b.set_workspace_buffer(ows)
+        b._prefill_wrapper = opw
+
     captured_hidden = (
         captured_out[0] if isinstance(captured_out, tuple) else captured_out
     )
     torch.cuda.synchronize()
 
-    cache[key] = (graph, captured_hidden)
+    # Snapshot paged_kv_indices so we can restore them before each replay.
+    kv_snapshots = [
+        b.paged_kv_indices.gpu[:total_blocks].clone()
+        for b in builders
+    ]
+
+    # poc_attn_meta keeps the slot_mapping tensors alive (CUDA graph ops
+    # reference their GPU addresses).  poc_workspaces and poc_prefill_wrappers
+    # keep poc_ws alive — the captured CUDA ops read from those addresses.
+    cache[key] = (graph, captured_hidden, poc_attn_meta, poc_slot_map, poc_workspaces, poc_prefill_wrappers, kv_snapshots)
     worker._poc_cuda_graphs = cache
     logger.info(
         "POC prefill graph captured batch_size=%d seq_len=%d (%d tokens)",
@@ -499,11 +554,14 @@ def _get_static_decode_attn_metadata(
     """Cached decode attention metadata for (batch_size, seq_len, step).
 
     The block layout is deterministic given (batch_size, seq_len, max_tokens,
-    block_size) — so the cached metadata is valid for all calls with the same
-    batch configuration. Built once per (batch_size, seq_len, step).
+    block_size) — so the cached tensors (slot_mapping etc.) are valid for all
+    calls with the same batch configuration.  Built once per (batch_size,
+    seq_len, step).
 
-    FlashInfer plan() runs during warmup/capture and sets up GPU workspace
-    that stays valid for all subsequent replays of the same step.
+    plan() is re-run on every cache hit to restore the FlashInfer workspace and
+    paged_kv_indices that the inference engine may have overwritten between POC
+    calls.  The returned metadata/slot_mapping tensors are the stable cached
+    ones (same GPU addresses as during graph capture).
     """
     cache = getattr(worker, "_poc_decode_attn_meta_cache", {})
     key = (batch_size, seq_len, step)
@@ -515,6 +573,14 @@ def _get_static_decode_attn_metadata(
         )
         cache[key] = (meta, slot_map)
         worker._poc_decode_attn_meta_cache = cache
+    else:
+        # Re-run plan() to restore workspace and paged_kv_indices overwritten
+        # by inference-engine requests between POC calls.
+        _create_decode_attn_metadata_with_history(
+            batch_size, seq_len, step, block_size, device, worker,
+            prefill_blocks_per_seq, max_decode_blocks_per_seq,
+            decode_block_start,
+        )
     return cache[key]
 
 def _get_or_capture_poc_decode_graph(
