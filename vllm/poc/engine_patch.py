@@ -86,14 +86,14 @@ async def poc_request(self, action: str, payload: dict, timeout_ms: int = 60000)
     # destroyed, permanently corrupting model output.
     # The API-level 503 gating already blocks new requests, so only the
     # first batch will typically find anything to abort.
-    output_processor = getattr(self, 'output_processor', None)
-    if output_processor is not None and output_processor.has_unfinished_requests():
-        request_ids = list(output_processor.request_states.keys())
-        if request_ids:
-            logger.info("PoC aborting %d in-flight inference request(s)",
-                        len(request_ids))
-            await self.abort(request_ids, internal=True)
-            await asyncio.sleep(0.05)
+    # output_processor = getattr(self, 'output_processor', None)
+    # if output_processor is not None and output_processor.has_unfinished_requests():
+    #     request_ids = list(output_processor.request_states.keys())
+    #     if request_ids:
+    #         logger.info("PoC aborting %d in-flight inference request(s)",
+    #                     len(request_ids))
+    #         await self.abort(request_ids, internal=True)
+    #         await asyncio.sleep(0.05)
     
     # Get model config for hidden_size
     # V1 engine stores config differently
