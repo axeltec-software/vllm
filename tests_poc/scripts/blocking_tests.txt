@@ -1,0 +1,184 @@
+# Blocking tests extracted from .buildkite/test_areas (steps without optional/soft_fail flags).
+# Format: LABEL<TAB>COMMAND
+# BUILDKITE_PARALLEL_JOB=0, BUILDKITE_PARALLEL_JOB_COUNT=1 (no sharding locally).
+
+# --- Attention ---
+V1_attention_H100	pytest -v -s v1/attention
+# --- Basic Correctness ---
+Basic_Correctness	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s basic_correctness/test_cumem.py
+Basic_Correctness	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s basic_correctness/test_basic_correctness.py
+Basic_Correctness	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s basic_correctness/test_cpu_offload.py
+# --- Benchmarks ---
+Benchmarks_CLI_Test	pytest -v -s benchmarks/
+# --- CUDA ---
+Platform_Tests_CUDA	pytest -v -s cuda/test_cuda_context.py
+Cudagraph	pytest -v -s v1/cudagraph
+# --- Distributed ---
+Distributed_Comm_Ops	pytest -v -s distributed/test_comm_ops.py
+Distributed_Comm_Ops	pytest -v -s distributed/test_shm_broadcast.py
+Distributed_Comm_Ops	pytest -v -s distributed/test_shm_buffer.py
+Distributed_Comm_Ops	pytest -v -s distributed/test_shm_storage.py
+Distributed_2_GPUs	TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_async_llm_dp.py
+Distributed_2_GPUs	TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_eagle_dp.py
+Distributed_2_GPUs	TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_external_lb_dp.py
+Distributed_2_GPUs	DP_SIZE=2 pytest -v -s v1/entrypoints/openai/test_multi_api_servers.py
+Distributed_2_GPUs	pytest -v -s entrypoints/llm/test_collective_rpc.py
+Distributed_2_GPUs	pytest -v -s ./compile/fullgraph/test_basic_correctness.py
+Distributed_2_GPUs	pytest -v -s ./compile/test_wrapper.py
+Distributed_2_GPUs	pytest -v -s distributed/test_sequence_parallel.py
+Distributed_2_GPUs	CUDA_VISIBLE_DEVICES=0,1 pytest -v -s v1/shutdown
+Distributed_2_GPUs	pytest -v -s v1/worker/test_worker_memory_snapshot.py
+Distributed_Tests_4_GPUs	python3 ../examples/offline_inference/data_parallel.py --enforce-eager
+Distributed_Tests_4_GPUs	TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_async_llm_dp.py
+Distributed_Tests_4_GPUs	TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_eagle_dp.py
+Distributed_Tests_4_GPUs	TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_external_lb_dp.py
+Distributed_Tests_4_GPUs	TP_SIZE=1 DP_SIZE=4 pytest -v -s v1/distributed/test_internal_lb_dp.py
+Distributed_Tests_4_GPUs	TP_SIZE=1 DP_SIZE=4 pytest -v -s v1/distributed/test_hybrid_lb_dp.py
+Distributed_Tests_4_GPUs	pytest -v -s v1/engine/test_engine_core_client.py::test_kv_cache_events_dp
+Distributed_Tests_4_GPUs	pytest -v -s distributed/test_utils.py
+Distributed_Tests_4_GPUs	pytest -v -s compile/fullgraph/test_basic_correctness.py
+Distributed_Tests_4_GPUs	pytest -v -s distributed/test_pynccl.py
+Distributed_Tests_4_GPUs	pytest -v -s distributed/test_events.py
+Distributed_Tests_4_GPUs	pytest -v -s distributed/test_symm_mem_allreduce.py
+Distributed_Tests_4_GPUs	VLLM_ALLOW_INSECURE_SERIALIZATION=1 python3 rlhf.py
+Distributed_Tests_4_GPUs	VLLM_ALLOW_INSECURE_SERIALIZATION=1 RAY_DEDUP_LOGS=0 python3 rlhf_colocate.py
+Pipeline_Context_Parallelism_4_GPUs	pytest -v -s distributed/test_pp_cudagraph.py
+Pipeline_Context_Parallelism_4_GPUs	pytest -v -s distributed/test_pipeline_parallel.py
+# --- Engine ---
+Engine	pytest -v -s engine test_sequence.py test_config.py test_logger.py test_vllm_port.py
+V1_e2e_engine	pytest -v -s v1/e2e
+V1_e2e_engine	pytest -v -s v1/engine
+# --- Entrypoints ---
+Entrypoints_Unit_Tests	pytest -v -s entrypoints/openai/tool_parsers
+Entrypoints_Unit_Tests	pytest -v -s entrypoints/ --ignore=entrypoints/llm --ignore=entrypoints/rpc --ignore=entrypoints/sleep --ignore=entrypoints/instrumentator --ignore=entrypoints/openai --ignore=entrypoints/offline_mode --ignore=entrypoints/test_chat_utils.py  --ignore=entrypoints/pooling
+Entrypoints_Integration_LLM	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s entrypoints/llm --ignore=entrypoints/llm/test_generate.py --ignore=entrypoints/llm/test_collective_rpc.py
+Entrypoints_Integration_LLM	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s entrypoints/llm/test_generate.py
+Entrypoints_Integration_LLM	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s entrypoints/offline_mode
+Entrypoints_Integration_API_Server_1	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s entrypoints/openai --ignore=entrypoints/openai/test_chat_with_tool_reasoning.py --ignore=entrypoints/openai/test_oot_registration.py --ignore=entrypoints/openai/test_tensorizer_entrypoint.py --ignore=entrypoints/openai/correctness/  --ignore=entrypoints/openai/tool_parsers/ --ignore=entrypoints/openai/responses
+Entrypoints_Integration_API_Server_1	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s entrypoints/test_chat_utils.py
+Entrypoints_Integration_API_Server_2	VLLM_WORKER_MULTIPROC_METHOD=spawn PYTHONPATH=/vllm-workspace pytest -v -s entrypoints/rpc
+Entrypoints_Integration_API_Server_2	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s entrypoints/instrumentator
+Entrypoints_Integration_API_Server_2	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s entrypoints/sleep
+Entrypoints_Integration_API_Server_2	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s tool_use
+Entrypoints_Integration_Pooling	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s entrypoints/pooling
+Entrypoints_Integration_Responses_API	pytest -v -s entrypoints/openai/responses
+Entrypoints_V1	pytest -v -s v1/entrypoints
+OpenAI_API_Correctness	pytest -s entrypoints/openai/correctness/
+# --- Expert Parallelism ---
+EPLB_Algorithm	pytest -v -s distributed/test_eplb_algo.py
+EPLB_Execution	pytest -v -s distributed/test_eplb_execute.py
+EPLB_Execution	pytest -v -s distributed/test_eplb_spec_decode.py
+# --- Kernels ---
+Kernels_Core_Operation_Test	pytest -v -s kernels/core kernels/test_top_k_per_row.py
+Kernels_Attention_Test_N	pytest -v -s kernels/attention --shard-id=0 --num-shards=1
+Kernels_Quantization_Test_N	pytest -v -s kernels/quantization --shard-id=0 --num-shards=1
+Kernels_MoE_Test_N	pytest -v -s kernels/moe --shard-id=0 --num-shards=1
+Kernels_Mamba_Test	pytest -v -s kernels/mamba
+Kernels_DeepGEMM_Test_H100	pytest -v -s kernels/quantization/test_block_fp8.py -k deep_gemm
+Kernels_DeepGEMM_Test_H100	pytest -v -s kernels/moe/test_deepgemm.py
+Kernels_DeepGEMM_Test_H100	pytest -v -s kernels/moe/test_batched_deepgemm.py
+Kernels_DeepGEMM_Test_H100	pytest -v -s kernels/attention/test_deepgemm_attention.py
+# --- LM Eval ---
+LM_Eval_Small_Models	pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-small.txt
+# --- LoRA ---
+LoRA_N	pytest -v -s lora --shard-id=0 --num-shards=1 --ignore=lora/test_chatglm3_tp.py --ignore=lora/test_llama_tp.py --ignore=lora/test_llm_with_multi_loras.py --ignore=lora/test_olmoe_tp.py --ignore=lora/test_deepseekv2_tp.py --ignore=lora/test_gptoss_tp.py --ignore=lora/test_qwen3moe_tp.py
+LoRA_TP_Distributed	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s -x lora/test_chatglm3_tp.py
+LoRA_TP_Distributed	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s -x lora/test_llama_tp.py
+LoRA_TP_Distributed	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s -x lora/test_llm_with_multi_loras.py
+LoRA_TP_Distributed	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s -x lora/test_olmoe_tp.py
+LoRA_TP_Distributed	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s -x lora/test_gptoss_tp.py
+# --- Miscellaneous ---
+V1_Others	pytest -v -s -m 'not cpu_test' v1/core
+V1_Others	pytest -v -s v1/executor
+V1_Others	pytest -v -s v1/kv_offload
+V1_Others	pytest -v -s v1/sample
+V1_Others	pytest -v -s v1/logits_processors
+V1_Others	pytest -v -s v1/worker
+V1_Others	pytest -v -s v1/spec_decode
+V1_Others	pytest -v -s -m 'not cpu_test' v1/kv_connector/unit
+V1_Others	pytest -v -s -m 'not cpu_test' v1/metrics
+V1_Others	pytest -v -s v1/test_oracle.py
+V1_Others	pytest -v -s v1/test_request.py
+V1_Others	pytest -v -s v1/test_outputs.py
+V1_Others	pytest -v -s entrypoints/openai/correctness/test_lmeval.py::test_lm_eval_accuracy_v1_engine
+V1_Others_CPU	pytest -v -s -m 'cpu_test' v1/core
+V1_Others_CPU	pytest -v -s v1/structured_output
+V1_Others_CPU	pytest -v -s v1/test_serial_utils.py
+V1_Others_CPU	pytest -v -s -m 'cpu_test' v1/kv_connector/unit
+V1_Others_CPU	pytest -v -s -m 'cpu_test' v1/metrics
+Regression	pytest -v -s test_regression.py
+Examples	python3 offline_inference/basic/chat.py
+Examples	python3 offline_inference/basic/generate.py --model facebook/opt-125m
+Examples	python3 offline_inference/basic/generate.py --model meta-llama/Llama-2-13b-chat-hf --cpu-offload-gb 10
+Examples	python3 offline_inference/basic/classify.py
+Examples	python3 offline_inference/basic/embed.py
+Examples	python3 offline_inference/basic/score.py
+Examples	python3 offline_inference/audio_language.py --seed 0
+Examples	python3 offline_inference/vision_language.py --seed 0
+Examples	python3 offline_inference/vision_language_multi_image.py --seed 0
+Examples	python3 offline_inference/encoder_decoder_multimodal.py --model-type whisper --seed 0
+Examples	python3 pooling/pooling/vision_language_pooling.py --seed 0
+Examples	python3 offline_inference/prefix_caching.py
+Examples	python3 offline_inference/llm_engine_example.py
+Examples	python3 others/tensorize_vllm_model.py --model facebook/opt-125m serialize --serialized-directory /tmp/ --suffix v1 && python3 others/tensorize_vllm_model.py --model facebook/opt-125m deserialize --path-to-tensors /tmp/vllm/facebook/opt-125m/v1/model.tensors
+Examples	python3 offline_inference/spec_decode.py --test --method eagle --num_spec_tokens 3 --dataset-name hf --dataset-path philschmid/mt-bench --num-prompts 80 --temp 0 --top-p 1.0 --top-k -1 --tp 1 --enable-chunked-prefill --max-model-len 2048
+Examples	python3 offline_inference/spec_decode.py --test --method eagle3 --num_spec_tokens 3 --dataset-name hf --dataset-path philschmid/mt-bench --num-prompts 80 --temp 0 --top-p 1.0 --top-k -1 --tp 1 --enable-chunked-prefill --max-model-len 1536
+Metrics_Tracing_2_GPUs	pytest -v -s v1/tracing
+Async_Engine_Inputs_Utils_Worker	pytest -v -s -m 'not cpu_test' multimodal
+Async_Engine_Inputs_Utils_Worker	pytest -v -s utils_
+Async_Engine_Inputs_Utils_Worker_Config_CPU	python3 standalone_tests/lazy_imports.py
+Async_Engine_Inputs_Utils_Worker_Config_CPU	pytest -v -s test_inputs.py
+Async_Engine_Inputs_Utils_Worker_Config_CPU	pytest -v -s test_outputs.py
+Async_Engine_Inputs_Utils_Worker_Config_CPU	pytest -v -s -m 'cpu_test' multimodal
+Async_Engine_Inputs_Utils_Worker_Config_CPU	pytest -v -s renderers
+Async_Engine_Inputs_Utils_Worker_Config_CPU	pytest -v -s tokenizers_
+Async_Engine_Inputs_Utils_Worker_Config_CPU	pytest -v -s tool_parsers
+Async_Engine_Inputs_Utils_Worker_Config_CPU	pytest -v -s transformers_utils
+Async_Engine_Inputs_Utils_Worker_Config_CPU	pytest -v -s config
+Batch_Invariance_H100	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s v1/determinism/test_batch_invariance.py
+Batch_Invariance_H100	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
+# --- Model Executor ---
+Model_Executor	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s model_executor
+Model_Executor	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s entrypoints/openai/test_tensorizer_entrypoint.py
+# --- Models - Basic ---
+Basic_Models_Tests_Initialization	pytest -v -s models/test_initialization.py::test_can_initialize_small_subset
+Basic_Models_Tests_Extra_Initialization_N	pytest -v -s models/test_initialization.py -k 'not test_can_initialize_small_subset' --num-shards=1 --shard-id=0
+Basic_Models_Tests_Other	pytest -v -s models/test_transformers.py models/test_registry.py
+Basic_Models_Test_Other_CPU	pytest -v -s models/test_utils.py models/test_vision.py
+# --- Models - Distributed ---
+Distributed_Model_Tests_2_GPUs	TARGET_TEST_SUITE=L4 pytest basic_correctness/ -v -s -m 'distributed(num_gpus=2)'
+Distributed_Model_Tests_2_GPUs	CUDA_VISIBLE_DEVICES=0,1 pytest -v -s model_executor/model_loader/test_sharded_state_loader.py
+Distributed_Model_Tests_2_GPUs	pytest models/test_transformers.py -v -s -m 'distributed(num_gpus=2)'
+Distributed_Model_Tests_2_GPUs	pytest models/language -v -s -m 'distributed(num_gpus=2)'
+Distributed_Model_Tests_2_GPUs	pytest models/multimodal -v -s -m 'distributed(num_gpus=2)' --ignore models/multimodal/generation/test_whisper.py
+Distributed_Model_Tests_2_GPUs	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest models/multimodal/generation/test_whisper.py -v -s -m 'distributed(num_gpus=2)'
+# --- Models - Language ---
+Language_Models_Tests_Standard	pytest -v -s models/language -m 'core_model and (not slow_test)'
+Language_Models_Tests_Extra_Standard_N	pytest -v -s models/language -m 'core_model and slow_test' --num-shards=1 --shard-id=0
+Language_Models_Tests_Hybrid_N	pytest -v -s models/language/generation -m hybrid_model --num-shards=1 --shard-id=0
+# --- Models - Multimodal ---
+Multi_Modal_Models_Standard	pytest -v -s models/multimodal -m core_model --ignore models/multimodal/generation/test_whisper.py --ignore models/multimodal/processing
+Multi_Modal_Models_Standard	VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s models/multimodal/generation/test_whisper.py -m core_model
+Multi_Modal_Processor_Test_CPU	pytest -v -s models/multimodal/processing --ignore models/multimodal/processing/test_tensor_schema.py
+Multi_Modal_Processor	pytest -v -s models/multimodal/processing/test_tensor_schema.py
+Multi_Modal_Accuracy_Eval_Small_Models	pytest -s -v test_lm_eval_correctness.py --config-list-file=configs/models-mm-small.txt --tp-size=1
+# --- Plugins ---
+Plugin_Tests_2_GPUs	pytest -v -s plugins_tests/test_platform_plugins.py
+Plugin_Tests_2_GPUs	pytest -v -s plugins_tests/test_io_processor_plugins.py
+Plugin_Tests_2_GPUs	pytest -v -s plugins_tests/test_stats_logger_plugins.py
+Plugin_Tests_2_GPUs	pytest -v -s plugins_tests/test_scheduler_plugins.py
+Plugin_Tests_2_GPUs	pytest -v -s distributed/test_distributed_oot.py
+Plugin_Tests_2_GPUs	pytest -v -s entrypoints/openai/test_oot_registration.py
+Plugin_Tests_2_GPUs	pytest -v -s models/test_oot_registration.py
+Plugin_Tests_2_GPUs	pytest -v -s plugins/lora_resolvers
+# --- PyTorch ---
+PyTorch_Compilation_Unit_Tests	find compile/ -maxdepth 1 -name 'test_*.py' -print0 | xargs -0 -n1 -I{} pytest -s -v '{}'
+PyTorch_Fullgraph_Smoke_Test	find compile/fullgraph/ -name 'test_*.py' -not -name 'test_full_graph.py' -exec pytest -s -v {} \;
+PyTorch_Fullgraph	pytest -v -s compile/fullgraph/test_full_graph.py -k 'not test_fp8_kv_scale_compile'
+PyTorch_Fullgraph	pytest -v -s compile/distributed/test_fusions_e2e.py -k 'TRITON and not +quant_fp8 and not Llama-4'
+# --- Quantization ---
+Quantization	VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py
+Quantized_Models_Test	pytest -v -s models/quantization
+# --- Samplers ---
+Samplers_Test	pytest -v -s samplers
+Samplers_Test	VLLM_USE_FLASHINFER_SAMPLER=1 pytest -v -s samplers
