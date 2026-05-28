@@ -551,7 +551,7 @@ class EngineArgs:
     )
     model_impl: str = ModelConfig.model_impl
     override_attention_dtype: str = ModelConfig.override_attention_dtype
-    attention_backend: AttentionBackendEnum | None = AttentionBackendEnum.FLASHINFER
+    attention_backend: AttentionBackendEnum | None = None
 
     calculate_kv_scales: bool = CacheConfig.calculate_kv_scales
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
@@ -1721,7 +1721,6 @@ class EngineArgs:
                 ]
             else:
                 attention_config.backend = self.attention_backend
-
         load_config = self.create_load_config()
 
         # Pass reasoning_parser into StructuredOutputsConfig
