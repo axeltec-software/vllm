@@ -142,19 +142,27 @@ def _ensure_layer_hooks(worker, block_hash, hidden_size):
     model_runner = getattr(worker, "model_runner", worker)
     model = model_runner.model
     device = worker.device
-    existing_hook = getattr(worker, "_poc_layer_hooks", None)
-    if existing_hook is not None:
-        if existing_hook.block_hash == block_hash:
-            return
-        existing_hook.detach()
-    hook = LayerHouseholderHook(model, block_hash, device, hidden_size)
-    hook._setup(model, block_hash, device, hidden_size)
-    worker._poc_layer_hooks = hook
+    existing = getattr(worker, "_poc_layer_hooks", None)
+    if existing is None:
+        hook = LayerHouseholderHook(model, block_hash, device, hidden_size)
+        hook._setup(model, block_hash, device, hidden_size)
+        worker._poc_layer_hooks = hook
+    elif existing.block_hash != block_hash:
+        # Update vector contents in-place. Hooks remain registered.
+        # Existing CUDA graphs remain valid — same GPU addresses, new data.
+        existing.update_block_hash(block_hash, hidden_size, device)
 
 
 def _get_block_size(worker):
     """Get the KV cache block size from the worker config."""
     return worker.cache_config.block_size
+
+
+def _iter_attn_builders(worker):
+    """Yield every FlashInfer metadata builder on the worker."""
+    for kv_groups in worker.model_runner.attn_groups:
+        for attn_group in kv_groups:
+            yield attn_group.get_metadata_builder(0)
 
 
 def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker):
@@ -344,6 +352,315 @@ def _get_or_create_attn_metadata(batch_size, seq_len, block_size, device, worker
     """Create fresh attention metadata for the given parameters."""
     return _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker)
 
+def _get_poc_input_buffers(worker, batch_size, seq_len, hidden_size, device, dtype):
+    """Pre-allocated (embeds_buf, positions_buf) for prefill with stable GPU addresses.
+
+    Allocated once per (batch_size, seq_len). Positions are fixed content
+    (arange(seq_len).repeat(batch_size)) and never need updating.
+    embeds_buf is updated in-place with fresh embeddings before each replay.
+    """
+    cache = getattr(worker, "_poc_input_bufs", {})
+    key = (batch_size, seq_len)
+    if key not in cache:
+        embeds_buf = torch.zeros(
+            batch_size * seq_len, hidden_size, device=device, dtype=dtype
+        )
+        positions_buf = (
+            torch.arange(seq_len, device=device, dtype=torch.long)
+            .repeat(batch_size)
+        )
+        cache[key] = (embeds_buf, positions_buf)
+        worker._poc_input_bufs = cache
+    return cache[key]
+
+def _get_static_attn_metadata(worker, batch_size, seq_len, block_size, device):
+    """Cached prefill attention metadata with stable tensor addresses.
+
+    Built once per (batch_size, seq_len). FlashInfer plan() runs during
+    warmup/capture using this metadata; the GPU workspace it sets up remains
+    valid for all subsequent graph replays of the same shape.
+
+    Trade-off vs NOTE at module top: POC forward runs via collective_rpc
+    between engine scheduling ticks, so the metadata builder workspace is
+    idle when POC executes.
+    """
+    cache = getattr(worker, "_poc_attn_meta_cache", {})
+    key = (batch_size, seq_len)
+    if key not in cache:
+        meta, slot_map = _create_v1_attn_metadata(
+            batch_size, seq_len, block_size, device, worker
+        )
+        cache[key] = (meta, slot_map)
+        worker._poc_attn_meta_cache = cache
+    return cache[key]
+
+def _get_or_capture_poc_graph(
+    worker,
+    batch_size, seq_len, hidden_size,
+    device, dtype, vllm_config,
+    attn_metadata, slot_mapping_dict,
+    embeds_buf, positions_buf,
+):
+    """Return (graph, hidden) for the given prefill shape.
+
+    First call for a new (batch_size, seq_len):
+      Runs warmup eagerly, clones the output as `warmup_hidden`, then captures
+      the graph. Returns (None, warmup_hidden) — caller must NOT call
+      graph.replay() when graph is None; use the returned hidden directly.
+
+    Subsequent calls: returns (graph, captured_hidden) from cache. Caller
+      calls graph.replay() and then reads from captured_hidden.
+
+    Before each replay: update embeds_buf in-place with the new request's
+    embeddings. The graph reads from embeds_buf at the same address.
+    On block_hash change: call update_block_hash() to refresh reflection
+    vector contents in-place — no re-capture needed.
+    """
+    cache = getattr(worker, "_poc_cuda_graphs", {})
+    key = (batch_size, seq_len)
+    block_size = _get_block_size(worker)
+    total_blocks = batch_size * math.ceil(seq_len / block_size)
+
+    if key in cache:
+        graph, captured_hidden, *_, kv_snapshots = cache[key]
+        # Restore paged_kv_indices in the shared builder buffer.  FlashInfer may
+        # reference these from inside the workspace; the inference engine overwrites
+        # them between POC calls.
+        for builder, saved_kv in zip(_iter_attn_builders(worker), kv_snapshots):
+            builder.paged_kv_indices.gpu[:total_blocks].copy_(saved_kv)
+        return graph, captured_hidden
+
+    model = worker.model_runner.model
+    num_tokens = batch_size * seq_len
+
+    # Give this POC graph its own workspace so inference-engine plan() calls
+    # between POC requests cannot corrupt it.  Each builder's existing workspace
+    # and prefill wrapper are swapped out before capture and restored after.
+    builders = list(_iter_attn_builders(worker))
+    orig_workspaces = []
+    orig_prefill_wrappers = []
+    poc_workspaces = []
+    for b in builders:
+        orig_workspaces.append(b._get_workspace_buffer())   # lazy-init if needed
+        orig_prefill_wrappers.append(b._prefill_wrapper)
+        poc_ws = torch.zeros_like(b._workspace_buffer)
+        b.set_workspace_buffer(poc_ws)
+        b._prefill_wrapper = None  # force recreation with poc_ws
+        poc_workspaces.append(poc_ws)
+
+    # Create fresh metadata AFTER swapping workspace.
+    # builder.build() → _get_prefill_wrapper() creates a new wrapper backed by
+    # poc_ws → plan() writes POC attention parameters into poc_ws.
+    # The passed-in attn_metadata has a wrapper pointing to the original
+    # workspace (created before the swap) and must NOT be used for capture.
+    poc_attn_meta, poc_slot_map = _create_v1_attn_metadata(
+        batch_size, seq_len, block_size, device, worker
+    )
+    poc_prefill_wrappers = [b._prefill_wrapper for b in builders]
+
+    with set_forward_context(
+        poc_attn_meta, vllm_config,
+        num_tokens=num_tokens,
+        slot_mapping=poc_slot_map,
+        skip_compiled=True,
+    ):
+        with poc_forward_context():
+            warmup_out = model(
+                input_ids=None,
+                positions=positions_buf,
+                inputs_embeds=embeds_buf,
+            )
+    torch.cuda.synchronize()
+
+    # Clone before the capture run can clobber any shared model-internal buffer.
+    # This tensor is returned as-is for the first call so the caller always
+    # sees a pure eager result on the initial invocation.
+    warmup_hidden = (
+        warmup_out[0] if isinstance(warmup_out, tuple) else warmup_out
+    ).clone()
+
+    if not hasattr(worker, "_poc_graph_pool"):
+        worker._poc_graph_pool = torch.cuda.graph_pool_handle()
+
+    graph = torch.cuda.CUDAGraph()
+    with set_forward_context(
+        poc_attn_meta, vllm_config,
+        num_tokens=num_tokens,
+        slot_mapping=poc_slot_map,
+        skip_compiled=True,
+    ):
+        with poc_forward_context():
+            with torch.cuda.graph(graph, pool=worker._poc_graph_pool):
+                captured_out = model(
+                    input_ids=None,
+                    positions=positions_buf,
+                    inputs_embeds=embeds_buf,
+                )
+
+    # Restore inference-engine workspace and wrapper before anything else runs.
+    for b, ows, opw in zip(builders, orig_workspaces, orig_prefill_wrappers):
+        b.set_workspace_buffer(ows)
+        b._prefill_wrapper = opw
+
+    captured_hidden = (
+        captured_out[0] if isinstance(captured_out, tuple) else captured_out
+    )
+    torch.cuda.synchronize()
+
+    # Snapshot paged_kv_indices so we can restore them before each replay.
+    kv_snapshots = [
+        b.paged_kv_indices.gpu[:total_blocks].clone()
+        for b in builders
+    ]
+
+    # poc_attn_meta keeps the slot_mapping tensors alive (CUDA graph ops
+    # reference their GPU addresses).  poc_workspaces and poc_prefill_wrappers
+    # keep poc_ws alive — the captured CUDA ops read from those addresses.
+    cache[key] = (graph, captured_hidden, poc_attn_meta, poc_slot_map, poc_workspaces, poc_prefill_wrappers, kv_snapshots)
+    worker._poc_cuda_graphs = cache
+    logger.info(
+        "POC prefill graph captured batch_size=%d seq_len=%d (%d tokens)",
+        batch_size, seq_len, num_tokens,
+    )
+    # First call: return graph=None so the caller skips graph.replay() and
+    # uses the warmup output directly.  Subsequent calls return the real graph
+    # from cache and the caller drives replay normally.
+    return None, warmup_hidden
+
+def _get_poc_decode_input_buffers(worker, batch_size, hidden_size, device, dtype):
+    """Pre-allocated (decode_embeds_buf, decode_pos_buf) for decode with stable addresses.
+
+    Allocated once per batch_size (shape is fixed across all decode steps).
+    decode_embeds_buf: updated in-place with each step's input embedding.
+    decode_pos_buf:    updated in-place with each step's position index.
+    """
+    cache = getattr(worker, "_poc_decode_input_bufs", {})
+    key = batch_size
+    if key not in cache:
+        decode_embeds_buf = torch.zeros(
+            batch_size, hidden_size, device=device, dtype=dtype
+        )
+        decode_pos_buf = torch.zeros(
+            batch_size, device=device, dtype=torch.long
+        )
+        cache[key] = (decode_embeds_buf, decode_pos_buf)
+        worker._poc_decode_input_bufs = cache
+    return cache[key]
+
+def _get_static_decode_attn_metadata(
+    worker, batch_size, seq_len, step,
+    prefill_blocks_per_seq, max_decode_blocks_per_seq,
+    decode_block_start, block_size, device,
+):
+    """Cached decode attention metadata for (batch_size, seq_len, step).
+
+    The block layout is deterministic given (batch_size, seq_len, max_tokens,
+    block_size) — so the cached tensors (slot_mapping etc.) are valid for all
+    calls with the same batch configuration.  Built once per (batch_size,
+    seq_len, step).
+
+    plan() is re-run on every cache hit to restore the FlashInfer workspace and
+    paged_kv_indices that the inference engine may have overwritten between POC
+    calls.  The returned metadata/slot_mapping tensors are the stable cached
+    ones (same GPU addresses as during graph capture).
+    """
+    cache = getattr(worker, "_poc_decode_attn_meta_cache", {})
+    key = (batch_size, seq_len, step)
+    if key not in cache:
+        meta, slot_map = _create_decode_attn_metadata_with_history(
+            batch_size, seq_len, step, block_size, device, worker,
+            prefill_blocks_per_seq, max_decode_blocks_per_seq,
+            decode_block_start,
+        )
+        cache[key] = (meta, slot_map)
+        worker._poc_decode_attn_meta_cache = cache
+    else:
+        # Re-run plan() to restore workspace and paged_kv_indices overwritten
+        # by inference-engine requests between POC calls.
+        _create_decode_attn_metadata_with_history(
+            batch_size, seq_len, step, block_size, device, worker,
+            prefill_blocks_per_seq, max_decode_blocks_per_seq,
+            decode_block_start,
+        )
+    return cache[key]
+
+def _get_or_capture_poc_decode_graph(
+    worker,
+    batch_size, seq_len, step, hidden_size,
+    device, dtype, vllm_config,
+    dec_attn, dec_slot,
+    decode_embeds_buf, decode_pos_buf,
+):
+    """Return (graph, hidden) for the given decode step.
+
+    First call for a new (batch_size, seq_len, step): runs warmup eagerly,
+    clones the output, captures the graph, returns (None, warmup_dec_hidden).
+    Caller must NOT call graph.replay() when graph is None.
+
+    Subsequent calls: returns (graph, captured_dec_hidden) from cache. Caller
+    calls graph.replay() then reads from captured_dec_hidden.
+
+    Before each replay:
+      - decode_embeds_buf.copy_(step_embedding)   → new input embedding
+      - decode_pos_buf.fill_(seq_len + step - 1)  → new position
+    The graph reads from those stable addresses automatically.
+    """
+    cache = getattr(worker, "_poc_decode_cuda_graphs", {})
+    key = (batch_size, seq_len, step)
+    if key in cache:
+        return cache[key]
+
+    model = worker.model_runner.model
+
+    with set_forward_context(
+        dec_attn, vllm_config,
+        num_tokens=batch_size,
+        slot_mapping=dec_slot,
+        skip_compiled=True,
+    ):
+        with poc_forward_context():
+            warmup_dec_out = model(
+                input_ids=None,
+                positions=decode_pos_buf,
+                inputs_embeds=decode_embeds_buf,
+            )
+    torch.cuda.synchronize()
+
+    warmup_dec_hidden = (
+        warmup_dec_out[0] if isinstance(warmup_dec_out, tuple) else warmup_dec_out
+    ).clone()
+
+    if not hasattr(worker, "_poc_graph_pool"):
+        worker._poc_graph_pool = torch.cuda.graph_pool_handle()
+
+    graph = torch.cuda.CUDAGraph()
+    with set_forward_context(
+        dec_attn, vllm_config,
+        num_tokens=batch_size,
+        slot_mapping=dec_slot,
+        skip_compiled=True,
+    ):
+        with poc_forward_context():
+            with torch.cuda.graph(graph, pool=worker._poc_graph_pool):
+                captured_dec_out = model(
+                    input_ids=None,
+                    positions=decode_pos_buf,
+                    inputs_embeds=decode_embeds_buf,
+                )
+
+    captured_dec_hidden = (
+        captured_dec_out[0] if isinstance(captured_dec_out, tuple) else captured_dec_out
+    )
+    torch.cuda.synchronize()
+
+    cache[key] = (graph, captured_dec_hidden)
+    worker._poc_decode_cuda_graphs = cache
+    logger.info(
+        "POC decode graph captured batch_size=%d seq_len=%d step=%d",
+        batch_size, seq_len, step,
+    )
+    return None, warmup_dec_hidden
+
 
 @torch.inference_mode()
 def execute_poc_forward(
@@ -412,16 +729,12 @@ def execute_poc_forward(
 
     # Get block_size and prepare attention metadata (cached, reused)
     block_size = _get_block_size(worker)
-    attn_metadata, slot_mapping_dict = _get_or_create_attn_metadata(
-        batch_size, seq_len, block_size, device, worker
+    attn_metadata, slot_mapping_dict = _get_static_attn_metadata(
+        worker, batch_size, seq_len, block_size, device
     )
-
-    # Positions for the batch
-    positions = torch.arange(seq_len, device=device).repeat(batch_size)
-
-    # Generate inputs for all nonces at once
-    intermediate_tensors = None
-    inputs_embeds = None
+    embeds_buf, positions_buf = _get_poc_input_buffers(
+        worker, batch_size, seq_len, hidden_size, device, dtype
+    )
 
     if pp_group.is_first_rank:
         kv_caches = getattr(model_runner, "kv_caches", [])
@@ -440,32 +753,50 @@ def execute_poc_forward(
                 vals = _normal(seed, seq_len * hidden_size, device)
                 kv_scratch[i].copy_(vals.view(seq_len, hidden_size).to(dtype))
                 del vals
-            inputs_embeds = kv_scratch
+            embeds_buf.copy_(kv_scratch.view(-1, hidden_size))
         else:
             _gen_fn = generate_inputs_concat_murmur if poc_stronger_rng else generate_inputs
-            inputs_embeds = _gen_fn(
+            raw = _gen_fn(
                 block_hash, public_key, nonces,
                 dim=hidden_size, seq_len=seq_len,
                 device=device, dtype=dtype,
             )
+            embeds_buf.copy_(raw.view(-1, hidden_size))
+
+        graph, poc_hidden = _get_or_capture_poc_graph(
+            worker,
+            batch_size, seq_len, hidden_size,
+            device, dtype, vllm_config,
+            attn_metadata, slot_mapping_dict,
+            embeds_buf, positions_buf,
+        )
+        if graph is not None:
+            with set_forward_context(
+                attn_metadata, vllm_config,
+                num_tokens=batch_size * seq_len,
+                slot_mapping=slot_mapping_dict,
+                skip_compiled=True,
+            ):
+                with poc_forward_context():
+                    graph.replay()
+        hidden_states = poc_hidden
     else:
         intermediate_tensors = IntermediateTensors(
             pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
         )
-
-    with set_forward_context(
-        attn_metadata, vllm_config,
-        num_tokens=batch_size * seq_len,
-        slot_mapping=slot_mapping_dict,
-        skip_compiled=True,
-    ):
-        with poc_forward_context():
-            hidden_states = model(
-                input_ids=None,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
-            )
+        with set_forward_context(
+            attn_metadata, vllm_config,
+            num_tokens=batch_size * seq_len,
+            slot_mapping=slot_mapping_dict,
+            skip_compiled=True,
+        ):
+            with poc_forward_context():
+                hidden_states = model(
+                    input_ids=None,
+                    positions=positions_buf,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=None,
+                )
 
     # PP: send to next rank if not last
     if not pp_group.is_last_rank:
@@ -582,6 +913,9 @@ def execute_poc_forward(
                 pp_group.world_size,
             )
         else:
+            decode_embeds_buf, decode_pos_buf = _get_poc_decode_input_buffers(
+                worker, batch_size, hidden_size, device, dtype
+            )
             prefill_blocks_per_seq = math.ceil(seq_len / block_size)
             decode_block_start = batch_size * prefill_blocks_per_seq
             max_decode_blocks_per_seq = (
@@ -598,34 +932,39 @@ def execute_poc_forward(
                     else:
                         prev_k = list(broadcast_tensor_dict(src=0)["prev_k"])
 
+                # Generate step embedding and load into static buffer.
                 decode_embeds = generate_decode_inputs(
                     block_hash, public_key, nonces, prev_k,
                     step=step, dim=hidden_size, device=device, dtype=dtype,
                 )
 
-                decode_pos = torch.full(
-                    (batch_size,), seq_len + step - 1,
-                    device=device, dtype=torch.long,
-                )
-                dec_attn, dec_slot = _create_decode_attn_metadata_with_history(
-                    batch_size, seq_len, step, block_size, device, worker,
+                decode_embeds_buf.copy_(decode_embeds.view(batch_size, hidden_size))
+                decode_pos_buf.fill_(seq_len + step - 1)
+                
+                dec_attn, dec_slot = _get_static_decode_attn_metadata(
+                    worker, batch_size, seq_len, step,
                     prefill_blocks_per_seq, max_decode_blocks_per_seq,
-                    decode_block_start,
+                    decode_block_start, block_size, device,
                 )
 
-                with set_forward_context(
-                    dec_attn, vllm_config,
-                    num_tokens=batch_size,
-                    slot_mapping=dec_slot,
-                    skip_compiled=True,
-                ):
-                    with poc_forward_context():
-                        hs_dec = model(
-                            input_ids=None,
-                            positions=decode_pos,
-                            intermediate_tensors=None,
-                            inputs_embeds=decode_embeds.view(-1, hidden_size),
-                        )
+                dec_graph, dec_hidden = _get_or_capture_poc_decode_graph(
+                    worker,
+                    batch_size, seq_len, step, hidden_size,
+                    device, dtype, vllm_config,
+                    dec_attn, dec_slot,
+                    decode_embeds_buf, decode_pos_buf,
+                )
+
+                if dec_graph is not None:
+                    with set_forward_context(
+                        dec_attn, vllm_config,
+                        num_tokens=batch_size,
+                        slot_mapping=dec_slot,
+                        skip_compiled=True,
+                    ):
+                        with poc_forward_context():
+                            dec_graph.replay()
+                hs_dec = dec_hidden
 
                 if isinstance(hs_dec, tuple):
                     hs_dec = hs_dec[0]
