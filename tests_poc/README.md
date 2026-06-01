@@ -83,6 +83,7 @@ Results and a comparison table are saved to `tests_poc/storage/eval_results/`.
 
 
 ```bash
+uv pip install -r requirements/test.in --no-build-isolation
 bash tests_poc/scripts/run_blocking_tests.sh
 ```
 

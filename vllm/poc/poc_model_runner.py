@@ -139,7 +139,8 @@ def nearest_sphere_index(query: torch.Tensor, codebook: torch.Tensor) -> torch.T
 
 def _ensure_layer_hooks(worker, block_hash, hidden_size):
     """Ensure layer hooks are installed for the given block_hash."""
-    model = worker.model_runner.model
+    model_runner = getattr(worker, "model_runner", worker)
+    model = model_runner.model
     device = worker.device
     existing_hook = getattr(worker, "_poc_layer_hooks", None)
     if existing_hook is not None:
@@ -214,7 +215,7 @@ def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker):
         ),
     )
 
-    model_runner = worker.model_runner
+    model_runner = getattr(worker, "model_runner", worker)
     attn_metadata_dict = {}
     slot_mapping_dict = {}
 
@@ -321,7 +322,7 @@ def _create_decode_attn_metadata_with_history(
         ),
     )
 
-    model_runner = worker.model_runner
+    model_runner = getattr(worker, "model_runner", worker)
     attn_metadata_dict = {}
     slot_mapping_dict = {}
 
@@ -365,9 +366,10 @@ def execute_poc_forward(
     When poc_decode=True and max_tokens > 0, runs additional decode steps
     after prefill, chaining each step's sphere_k into the next step's seed.
     """
+    model_runner = getattr(worker, "model_runner", worker)
     device = worker.device
     dtype = worker.model_config.dtype
-    model = worker.model_runner.model
+    model = model_runner.model
     vllm_config = worker.vllm_config
     batch_size = len(nonces)
 
@@ -422,7 +424,7 @@ def execute_poc_forward(
     inputs_embeds = None
 
     if pp_group.is_first_rank:
-        kv_caches = getattr(worker.model_runner, "kv_caches", [])
+        kv_caches = getattr(model_runner, "kv_caches", [])
         kv_scratch = None
         needed_elems = batch_size * seq_len * hidden_size
         for kv in kv_caches:

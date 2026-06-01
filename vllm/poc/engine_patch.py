@@ -3,18 +3,21 @@
 This module patches the V1 AsyncLLM class to add poc_request support,
 enabling PoC (Proof of Compute) artifact generation.
 
-PoC Priority:
-    PoC has priority over inference. When PoC generation is active, the
-    chat and completion API endpoints reject new requests with 503.
+KV Cache Isolation:
+    PoC's execute_poc_forward writes KV data into blocks starting from
+    block 0 (sequential layout managed by _create_v1_attn_metadata).
 
-    IMPORTANT: PoC's execute_poc_forward reuses KV cache blocks starting
-    from block 0 (both as scratch for inputs_embeds and as the attention
-    slot mapping).  If any inference request still has KV blocks allocated,
-    PoC will overwrite them and permanently corrupt the model output.
+    To prevent corruption when chat inference runs concurrently, the server
+    must be started with POC_RESERVED_BLOCKS set to a value large enough to
+    cover the PoC batch:
 
-    Therefore poc_request aborts all in-flight inference requests before
-    issuing collective_rpc.  The API-level 503 gating prevents new
-    requests from arriving while PoC is active.
+        POC_RESERVED_BLOCKS = max_poc_batch_size
+                              * (ceil((seq_len + max_tokens) / block_size) + 1)
+
+    The BlockPool permanently removes those blocks from the chat scheduler's
+    free pool, so chat requests never receive block IDs in [0, reserved).
+    With this in place, chat and PoC can run truly concurrently without any
+    abort or sequencing.
 
 Usage:
     Import this module early in the application startup to apply the patch.
@@ -30,18 +33,14 @@ _patched = False
 
 async def poc_request(self, action: str, payload: dict, timeout_ms: int = 60000) -> dict:
     """Send a PoC (Proof of Compute) request to the engine.
-    
+
     Only supports 'generate_artifacts' action. All PoC state (generation
     loop, nonce counter, stats) is managed in the API layer.
-    
-    Before issuing the GPU work this method aborts all in-flight inference
-    requests.  This is required because execute_poc_forward writes into
-    KV-cache blocks starting from block 0; if any request still holds
-    those blocks the KV data is corrupted and the model produces garbage
-    for the rest of its lifetime.
-    
-    The API-level 503 gating (chat and completion api_router.py) prevents
-    new requests from arriving while PoC is active.
+
+    KV cache safety is provided by the POC_RESERVED_BLOCKS reservation: the
+    BlockPool permanently keeps blocks [0, poc_reserved_blocks) out of the
+    chat scheduler's free pool, so execute_poc_forward can write into those
+    blocks concurrently with live chat inference without corruption.
     
     Args:
         action: The PoC action to perform (only 'generate_artifacts' supported)
@@ -79,21 +78,6 @@ async def poc_request(self, action: str, payload: dict, timeout_ms: int = 60000)
 
     if not nonces:
         return {"artifacts": []}
-    
-    # Abort all in-flight inference before touching the GPU.
-    # execute_poc_forward reuses KV-cache blocks from block 0, so any
-    # request that still holds allocated blocks would get its KV data
-    # destroyed, permanently corrupting model output.
-    # The API-level 503 gating already blocks new requests, so only the
-    # first batch will typically find anything to abort.
-    # output_processor = getattr(self, 'output_processor', None)
-    # if output_processor is not None and output_processor.has_unfinished_requests():
-    #     request_ids = list(output_processor.request_states.keys())
-    #     if request_ids:
-    #         logger.info("PoC aborting %d in-flight inference request(s)",
-    #                     len(request_ids))
-    #         await self.abort(request_ids, internal=True)
-    #         await asyncio.sleep(0.05)
     
     # Get model config for hidden_size
     # V1 engine stores config differently

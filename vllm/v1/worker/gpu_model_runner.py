@@ -3796,22 +3796,67 @@ class GPUModelRunner(
                 is_pure_poc_batch = False
 
             if is_pure_poc_batch:
-                from vllm.poc.poc_model_runner import execute_poc_batch
-                poc_result = execute_poc_batch(
-                    self, poc_requests, intermediate_tensors
+                from vllm.poc.poc_model_runner import execute_poc_forward
+                from vllm.poc.data import encode_vector
+
+                first_params = poc_requests[0].poc_params
+                nonces = [req.poc_params.nonce for req in poc_requests]
+                inference_steps = [
+                    req.poc_params.inference_k_points_steps
+                    for req in poc_requests
+                ]
+                poc_result = execute_poc_forward(
+                    self,
+                    block_hash=first_params.block_hash,
+                    public_key=first_params.public_key,
+                    nonces=nonces,
+                    seq_len=first_params.seq_len,
+                    hidden_size=self.model_config.get_hidden_size(),
+                    k_dim=first_params.k_dim,
+                    poc_decode=first_params.poc_decode,
+                    max_tokens=first_params.max_tokens,
+                    inference_k_points_steps_per_nonce=(
+                        inference_steps
+                        if any(s is not None for s in inference_steps)
+                        else None
+                    ),
+                    debug=any(req.poc_params.debug for req in poc_requests),
                 )
 
                 if not get_pp_group().is_last_rank:
-                    return poc_result 
+                    return poc_result
 
-                poc_outputs_list = poc_result
+                nonce_to_req_id = {
+                    req.poc_params.nonce: req.req_id for req in poc_requests
+                }
+                sphere_k_list = poc_result.get("sphere_k_list", [])
+                k_points_steps_list = poc_result.get("k_points_steps_list", [])
+                mismatch_count = poc_result.get("mismatch_count", [])
+                vectors = poc_result["vectors"]
+                result_nonces = poc_result["nonces"]
+
                 poc_outputs_dict = {}
-                for i, req in enumerate(poc_requests):
-                    poc_outputs_dict[req.req_id] = poc_outputs_list[i]
+                for j, nonce in enumerate(result_nonces):
+                    req_id = nonce_to_req_id.get(nonce)
+                    if req_id is None:
+                        continue
+                    poc_outputs_dict[req_id] = PoCOutput(
+                        nonce=nonce,
+                        vector_b64=encode_vector(vectors[j]),
+                        sphere_k=sphere_k_list[j] if sphere_k_list else -1,
+                        k_points_steps=(
+                            k_points_steps_list[j] if k_points_steps_list else []
+                        ),
+                        n_sphere_mismatches=(
+                            mismatch_count[j] if mismatch_count else -1
+                        ),
+                    )
 
                 return ModelRunnerOutput(
                     req_ids=list(poc_req_ids),
-                    req_id_to_index={req_id: i for i, req_id in enumerate(poc_req_ids)},
+                    req_id_to_index={
+                        req_id: i for i, req_id in enumerate(poc_req_ids)
+                    },
                     sampled_token_ids=[],
                     logprobs=None,
                     prompt_logprobs_dict={},

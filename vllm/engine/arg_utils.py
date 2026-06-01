@@ -580,6 +580,10 @@ class EngineArgs:
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
     tokens_only: bool = False
 
+    poc_max_batch_size: int = get_field(CacheConfig, "poc_max_batch_size")
+    poc_seq_len: int = get_field(CacheConfig, "poc_seq_len")
+    poc_max_tokens: int = get_field(CacheConfig, "poc_max_tokens")
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -957,6 +961,15 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--poc-max-batch-size", **cache_kwargs["poc_max_batch_size"]
+        )
+        cache_group.add_argument(
+            "--poc-seq-len", **cache_kwargs["poc_seq_len"]
+        )
+        cache_group.add_argument(
+            "--poc-max-tokens", **cache_kwargs["poc_max_tokens"]
         )
 
         # Multimodal related configs
@@ -1437,6 +1450,9 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            poc_max_batch_size=self.poc_max_batch_size,
+            poc_seq_len=self.poc_seq_len,
+            poc_max_tokens=self.poc_max_tokens,
         )
 
         ray_runtime_env = None
