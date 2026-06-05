@@ -444,6 +444,27 @@ def _get_or_capture_poc_graph(
     block_size = _get_block_size(worker)
     total_blocks = batch_size * math.ceil(seq_len / block_size)
 
+    if worker.model_config.enforce_eager:
+        # --enforce-eager: skip graph capture/replay entirely.
+        # Create fresh metadata so inference-engine workspace corruption cannot
+        # affect this call (same reason poc_attn_meta is created in the normal path).
+        eager_meta, eager_slot = _create_v1_attn_metadata(
+            batch_size, seq_len, block_size, device, worker
+        )
+        with set_forward_context(
+            eager_meta, vllm_config,
+            num_tokens=batch_size * seq_len,
+            slot_mapping=eager_slot,
+            skip_compiled=True,
+        ):
+            with poc_forward_context():
+                out = worker.model_runner.model(
+                    input_ids=None,
+                    positions=positions_buf,
+                    inputs_embeds=embeds_buf,
+                )
+        return None, (out[0] if isinstance(out, tuple) else out)
+
     if key in cache:
         graph, captured_hidden, *_, kv_snapshots = cache[key]
         # Restore paged_kv_indices in the shared builder buffer.  FlashInfer may
@@ -630,6 +651,24 @@ def _get_or_capture_poc_decode_graph(
     """
     cache = getattr(worker, "_poc_decode_cuda_graphs", {})
     key = (batch_size, seq_len, step)
+
+    if worker.model_config.enforce_eager:
+        # --enforce-eager: run decode step eagerly without graph capture/replay.
+        # dec_attn already has fresh plan() from _get_static_decode_attn_metadata.
+        with set_forward_context(
+            dec_attn, vllm_config,
+            num_tokens=batch_size,
+            slot_mapping=dec_slot,
+            skip_compiled=True,
+        ):
+            with poc_forward_context():
+                out = worker.model_runner.model(
+                    input_ids=None,
+                    positions=decode_pos_buf,
+                    inputs_embeds=decode_embeds_buf,
+                )
+        return None, (out[0] if isinstance(out, tuple) else out)
+
     if key in cache:
         return cache[key]
 
