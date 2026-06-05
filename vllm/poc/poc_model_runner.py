@@ -336,10 +336,34 @@ def _create_decode_attn_metadata_with_history(
     for kv_cache_group_attn_groups in model_runner.attn_groups:
         for attn_group in kv_cache_group_attn_groups:
             builder = attn_group.get_metadata_builder(0)
-            metadata = builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=common_attn_metadata,
-            )
+
+            # POC decode CUDA graphs require a FlashInfer decode wrapper created
+            # with use_cuda_graph=True (static GPU buffer addresses baked into
+            # the graph).  When the server runs with --enforce-eager,
+            # builder.enable_cuda_graph is False, so build() would create an
+            # eager wrapper with dynamically-allocated buffers instead.
+            # Replaying a CUDA graph that recorded reads from those buffers
+            # causes "illegal memory access" on replay because the buffers are
+            # reallocated on every call.
+            # Fix: temporarily force enable_cuda_graph=True so build() uses the
+            # cudagraph wrapper path, initialising the required attributes if
+            # they were not created (--enforce-eager skips their __init__).
+            orig_enable = builder.enable_cuda_graph
+            if not orig_enable:
+                if not hasattr(builder, '_decode_wrappers_cudagraph'):
+                    builder._decode_wrappers_cudagraph = {}
+                if not hasattr(builder, '_decode_cudagraph_max_bs'):
+                    builder._decode_cudagraph_max_bs = batch_size
+                builder.enable_cuda_graph = True
+
+            try:
+                metadata = builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                )
+            finally:
+                builder.enable_cuda_graph = orig_enable
+
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = metadata
                 slot_mapping_dict[layer_name] = slot_mapping
