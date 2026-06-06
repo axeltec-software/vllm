@@ -60,8 +60,13 @@ async def _poc_sender_loop(
     poc_artifacts: list[dict[str, Any]],
     poc_times: list[float],
     max_tokens: int = 0,
+    nonces_per_request: int = 32,
 ) -> None:
-    """Continuously send PoC requests until *stop_event* is set."""
+    """Continuously send PoC requests until *stop_event* is set.
+
+    Each request carries ``nonces_per_request`` nonces (prod PoC batch = 32),
+    and ``requests_per_interval`` such requests fire concurrently per interval.
+    """
     nonce_counter = 0
     request_count = 0
     print(
@@ -79,8 +84,8 @@ async def _poc_sender_loop(
         batch_start = request_count + 1
         tasks = []
         for _ in range(requests_per_interval):
-            nonces = [nonce_counter]
-            nonce_counter += 1
+            nonces = list(range(nonce_counter, nonce_counter + nonces_per_request))
+            nonce_counter += nonces_per_request
             request_count += 1
             tasks.append((request_count, f"block_{request_count}", nonces))
 
@@ -163,11 +168,15 @@ def _parse_run_stats(stats_file: Path) -> dict[str, Any]:
         model = model.split("/")[-1]
 
     folder = stats_file.parent.name
-    poc_requests = 0
-    if folder.startswith("chat_") and "_poc_" in folder:
-        parts = folder.split("_")
-        if len(parts) >= 4:
-            poc_requests = int(parts[3])
+    # poc_requests/poc_max_tokens come from run_stats.json (robust); fall back to
+    # parsing the folder name (chat_{bs}_poc_{n}_mt_{m}) for older runs.
+    poc_requests = data.get("poc_requests")
+    if poc_requests is None:
+        poc_requests = 0
+        if folder.startswith("chat_") and "_poc_" in folder:
+            parts = folder.split("_")
+            if len(parts) >= 4:
+                poc_requests = int(parts[3])
 
     gsm8k = data.get("gsm8k") or {}
     return {
@@ -233,7 +242,9 @@ async def _run_eval(args: argparse.Namespace) -> int:
     output_path.mkdir(parents=True, exist_ok=True)
 
     poc_requests = 0 if args.disable_poc else args.poc_requests
-    run_name = f"chat_{args.batch_size}_poc_{poc_requests}"
+    poc_max_tokens = 0 if args.disable_poc else args.max_tokens
+    # include max_tokens so decode vs prefill runs (same bs/poc) don't collide
+    run_name = f"chat_{args.batch_size}_poc_{poc_requests}_mt_{poc_max_tokens}"
     run_output_path = output_path / run_name
     run_output_path.mkdir(parents=True, exist_ok=True)
 
@@ -283,6 +294,7 @@ async def _run_eval(args: argparse.Namespace) -> int:
                 poc_artifacts,
                 poc_times,
                 args.max_tokens,
+                args.poc_nonces,
             )
         )
 
@@ -309,6 +321,8 @@ async def _run_eval(args: argparse.Namespace) -> int:
             "elapsed_seconds": elapsed,
             "return_code": return_code,
             "poc_enabled": not args.disable_poc,
+            "poc_requests": 0 if args.disable_poc else args.poc_requests,
+            "poc_nonces": 0 if args.disable_poc else args.poc_nonces,
             "poc_max_tokens": 0 if args.disable_poc else args.max_tokens,
         }
 
@@ -379,7 +393,10 @@ def main() -> int:
     parser.add_argument("--output_path", type=str, default="./eval_results")
     parser.add_argument("--tasks", type=str, default="gsm8k")
     parser.add_argument("--poc_interval", type=float, default=1.0)
-    parser.add_argument("--poc_requests", type=int, default=1)
+    parser.add_argument("--poc_requests", type=int, default=1,
+                        help="Concurrent PoC requests fired per interval.")
+    parser.add_argument("--poc_nonces", type=int, default=32,
+                        help="Nonces per PoC request (prod PoC batch = 32).")
     parser.add_argument(
         "--max_tokens", type=int, default=256,
         help="PoC decode steps during the run (256 = decode PoC, the proposal's "
