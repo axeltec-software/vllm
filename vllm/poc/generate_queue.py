@@ -2,6 +2,7 @@
 import asyncio
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -9,8 +10,83 @@ from vllm.logger import init_logger
 from .validation import run_validation
 from .callbacks import get_callback_queue, clear_callback_queue
 from .data import DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
+from .poc_params import PoCParams
 
 logger = init_logger(__name__)
+
+
+async def compute_nonce_artifacts(
+    engine_client,
+    nonces: List[int],
+    block_hash: str,
+    public_key: str,
+    block_height: int,
+    seq_len: int,
+    k_dim: int,
+    poc_decode: bool = False,
+    max_tokens: int = 0,
+    inference_k_points_steps: Optional[Dict[int, List[int]]] = None,
+    debug: bool = False,
+) -> List[dict]:
+    """Compute PoC artifacts for a set of nonces via the scheduler.
+
+    One PoC request per nonce is submitted through
+    ``engine_client.generate(poc_params=...)`` and gathered concurrently. The
+    scheduler runs pure-PoC batches (KV-bound decode on the reserved blocks,
+    full sphere_k trajectory) or interleaves prefill-only PoC with live chat —
+    PoC and chat co-exist with no collective_rpc and no chat freeze.
+
+    This is the single source of truth for PoC artifact computation; both the
+    /generate endpoint and the queue worker call it.
+    """
+    async def compute_one(nonce: int) -> Optional[dict]:
+        inf_steps = (inference_k_points_steps.get(nonce)
+                     if inference_k_points_steps else None)
+        poc_params = PoCParams(
+            block_hash=block_hash,
+            public_key=public_key,
+            block_height=block_height,
+            nonce=nonce,
+            seq_len=seq_len,
+            k_dim=k_dim,
+            poc_decode=poc_decode,
+            max_tokens=max_tokens,
+            inference_k_points_steps=inf_steps,
+            debug=debug,
+        )
+        request_id = f"poc-{uuid.uuid4()}"
+        try:
+            async for output in engine_client.generate(
+                poc_params=poc_params,
+                request_id=request_id,
+                priority=10,
+            ):
+                if not output.finished:
+                    continue
+                poc_out = output.poc_output
+                if poc_out is None:
+                    return None
+                get = poc_out.get if isinstance(poc_out, dict) else (
+                    lambda k, d=None: getattr(poc_out, k, d))
+                # Same artifact structure as the old engine_patch path:
+                # sph_* debug fields are only included when debug is on.
+                artifact = {
+                    "nonce": get("nonce", nonce),
+                    "vector_b64": get("vector_b64", ""),
+                    "sphere_k": get("sphere_k", -1),
+                    "k_points_steps": get("k_points_steps", []),
+                    "n_sphere_mismatches": get("n_sphere_mismatches", -1),
+                }
+                if debug:
+                    artifact["sph_indices_steps"] = get("sph_indices_steps", [])
+                    artifact["sph_values_steps"] = get("sph_values_steps", [])
+                return artifact
+        except Exception as e:
+            logger.error("Error computing nonce %s: %r", nonce, e, exc_info=True)
+        return None
+
+    results = await asyncio.gather(*[compute_one(n) for n in nonces])
+    return [r for r in results if r is not None]
 
 POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
 POC_CHAT_BUSY_BACKOFF_SEC = 0.05
@@ -34,6 +110,10 @@ class GenerateJob:
     k_dim: int
     batch_size: int
     poc_stronger_rng: bool = False
+    poc_decode: bool = False
+    max_tokens: int = 0
+    inference_k_points_steps: Optional[Dict[int, List[int]]] = None
+    debug: bool = False
     validation_artifacts: Optional[Dict[int, str]] = None
     stat_test_dist_threshold: float = DEFAULT_DIST_THRESHOLD
     stat_test_p_mismatch: float = DEFAULT_P_MISMATCH
@@ -218,45 +298,34 @@ class GenerateQueue:
         for i in range(0, total_nonces, job.batch_size):
             chunk = job.nonces[i:i + job.batch_size]
             chunk_idx = i // job.batch_size
-            chunk_start_time = time.time()
-            
-            while True:
-                if self._stop_event.is_set():
-                    raise RuntimeError("Job cancelled")
-                
-                if self._is_generation_active and self._is_generation_active(job.app_id):
-                    await asyncio.sleep(0.1)
-                    continue
-                
-                try:
-                    result = await asyncio.wait_for(
-                        job.engine_client.poc_request("generate_artifacts", {
-                            "nonces": chunk,
-                            "block_hash": job.block_hash,
-                            "public_key": job.public_key,
-                            "seq_len": job.seq_len,
-                            "k_dim": job.k_dim,
-                            "poc_stronger_rng": job.poc_stronger_rng,
-                        }),
-                        timeout=POC_GENERATE_CHUNK_TIMEOUT_SEC
-                    )
-                except asyncio.CancelledError:
-                    logger.info(f"PoC queue job {job.request_id[:8]}: cancelled during RPC")
-                    raise RuntimeError("Job cancelled")
-                except asyncio.TimeoutError:
-                    raise RuntimeError(f"Timeout waiting for engine RPC: chunk {chunk_idx}")
-                
-                if not result.get("skipped"):
-                    computed_artifacts.extend(result.get("artifacts", []))
-                    logger.debug(f"PoC queue job {job.request_id[:8]}: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
-                    break
-                
-                elapsed = time.time() - chunk_start_time
-                if elapsed >= POC_GENERATE_CHUNK_TIMEOUT_SEC:
-                    raise RuntimeError(f"Timeout waiting for engine: chunk {chunk_idx}")
-                
-                await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
-        
+
+            if self._stop_event.is_set():
+                raise RuntimeError("Job cancelled")
+
+            chunk_inference_steps = None
+            if job.inference_k_points_steps:
+                chunk_inference_steps = {
+                    n: job.inference_k_points_steps[n]
+                    for n in chunk if n in job.inference_k_points_steps
+                }
+
+            try:
+                artifacts = await compute_nonce_artifacts(
+                    job.engine_client, chunk,
+                    job.block_hash, job.public_key, job.block_height,
+                    job.seq_len, job.k_dim,
+                    poc_decode=job.poc_decode,
+                    max_tokens=job.max_tokens,
+                    inference_k_points_steps=chunk_inference_steps,
+                    debug=job.debug,
+                )
+            except asyncio.CancelledError:
+                logger.info(f"PoC queue job {job.request_id[:8]}: cancelled")
+                raise RuntimeError("Job cancelled")
+
+            computed_artifacts.extend(artifacts)
+            logger.debug(f"PoC queue job {job.request_id[:8]}: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
+
         elapsed = time.time() - start_time
         rate = total_nonces / elapsed if elapsed > 0 else 0
         logger.info(f"PoC queue job {job.request_id[:8]} completed: {total_nonces} nonces in {elapsed:.2f}s ({rate:.0f}/s)")

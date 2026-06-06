@@ -75,10 +75,12 @@ class TestLayerHouseholderHookAttachment:
         hooks = LayerHouseholderHook(model, "block_hash", device, hidden_size)
         assert hooks.num_layers == num_layers
         hooks.detach()
-        
+
+        # detach() removes the forward hook handles. Reflection-vector buffers
+        # are intentionally retained (a captured CUDA graph still references
+        # their fixed GPU addresses), so we don't assert they are cleared.
         assert hooks.num_layers == 0
         assert len(hooks.hooks) == 0
-        assert len(hooks.reflection_vectors) == 0
     
     def test_multiple_attach_detach_cycles(self):
         """Verify multiple attach/detach cycles work correctly."""

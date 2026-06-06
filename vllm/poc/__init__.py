@@ -1,5 +1,5 @@
-# Apply PoC engine patch for vLLM 0.15.1 V1 engine
-from . import engine_patch
+# PoC runs through the engine scheduler via generate(poc_params=...).
+# No collective_rpc monkeypatch.
 from .config import PoCConfig, PoCState
 from .data import (
     PoCParams,
@@ -13,7 +13,6 @@ from .data import (
     fraud_test,
     compare_artifacts,
 )
-from .manager import PoCManager
 from .routes import router as poc_router
 from .layer_hooks import LayerHouseholderHook
 from .poc_params import PoCParams
@@ -32,7 +31,6 @@ __all__ = [
     "is_mismatch",
     "fraud_test",
     "compare_artifacts",
-    "PoCManager",
     "LayerHouseholderHook",
     "poc_router",
 ]

@@ -13,8 +13,12 @@ from vllm.logger import init_logger
 from .config import PoCState
 from .data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
 from .callbacks import CallbackSender
-from .generate_queue import GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES
+from .generate_queue import (
+    GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES,
+    compute_nonce_artifacts,
+)
 from .validation import run_validation
+from .reservation import poc_blocks_needed, poc_reserved_blocks
 
 logger = init_logger(__name__)
 
@@ -44,6 +48,7 @@ class PoCParamsModel(BaseModel):
     model: str
     seq_len: int
     k_dim: int = 12
+    max_tokens: int = 0   # decode steps after prefill (0 = prefill-only)
 
 
 class PoCInitGenerateRequest(BaseModel):
@@ -118,7 +123,6 @@ class PoCGenerateRequest(BaseModel):
     validation: Optional[ValidationModel] = None
     stat_test: Optional[StatTestModel] = None
     poc_stronger_rng: bool = False
-    max_tokens: int = 0
     inference_k_points_steps: Optional[Dict[int, List[int]]] = None
     debug: bool = False
 
@@ -148,11 +152,11 @@ def check_params_match(request: Request, params: PoCParamsModel):
                     status_code=409,
                     detail={
                         "error": "params mismatch",
-                        "requested": {"model": params.model, "seq_len": params.seq_len, "k_dim": params.k_dim},
-                        "deployed": {"model": list(valid_models), "seq_len": None, "k_dim": None},
+                        "requested": {"model": params.model, "seq_len": params.seq_len, "k_dim": params.k_dim, "max_tokens": params.max_tokens},
+                        "deployed": {"model": list(valid_models), "seq_len": None, "k_dim": None, "max_tokens": None},
                     }
                 )
-    
+
     deployed = getattr(request.app.state, 'poc_deployed', None)
     if deployed:
         mismatches = []
@@ -162,14 +166,19 @@ def check_params_match(request: Request, params: PoCParamsModel):
             mismatches.append("seq_len")
         if deployed.get("k_dim") and params.k_dim != deployed["k_dim"]:
             mismatches.append("k_dim")
-        
+        # max_tokens defines the decode trajectory length -> artifact-defining,
+        # so it must match the deployed config like seq_len/k_dim. Use "is not
+        # None" since max_tokens=0 (prefill-only) is a valid configured value.
+        if deployed.get("max_tokens") is not None and params.max_tokens != deployed["max_tokens"]:
+            mismatches.append("max_tokens")
+
         if mismatches:
             raise HTTPException(
                 status_code=409,
                 detail={
                     "error": "params mismatch",
                     "fields": mismatches,
-                    "requested": {"model": params.model, "seq_len": params.seq_len, "k_dim": params.k_dim},
+                    "requested": {"model": params.model, "seq_len": params.seq_len, "k_dim": params.k_dim, "max_tokens": params.max_tokens},
                     "deployed": deployed,
                 }
             )
@@ -232,6 +241,42 @@ async def _cancel_poc_tasks(app_id: int):
 
 
 
+def check_reservation_fits(engine_client, body: "PoCGenerateRequest"):
+    """Reject (400) PoC requests that would overflow the KV reservation.
+
+    PoC writes KV into the reserved block range [0, reserved); a request whose
+    footprint exceeds it would land in chat-owned blocks and corrupt output.
+    This gives the client a clear error instead of a 500 from the worker-side
+    guard. Best-effort: if the engine config isn't reachable, the worker-side
+    guard still protects us.
+    """
+    cache_config = getattr(getattr(engine_client, "vllm_config", None),
+                           "cache_config", None)
+    if cache_config is None:
+        return
+    block_size = cache_config.block_size
+    if not block_size:
+        return
+    reserved = poc_reserved_blocks(cache_config, block_size)
+    # Effective per-forward batch is the chunk size, capped by nonce count.
+    batch = min(body.batch_size, len(body.nonces)) if body.nonces else 0
+    needed = poc_blocks_needed(batch, body.params.seq_len, body.params.max_tokens,
+                               block_size)
+    if needed > reserved:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"request exceeds PoC KV reservation: needs {needed} blocks "
+                f"(batch_size={batch}, seq_len={body.params.seq_len}, "
+                f"max_tokens={body.params.max_tokens}) but only {reserved} are reserved "
+                f"(poc_max_batch_size={cache_config.poc_max_batch_size}, "
+                f"poc_seq_len={cache_config.poc_seq_len}, "
+                f"poc_max_tokens={cache_config.poc_max_tokens}); lower the "
+                f"request params or raise the --poc-* server args"
+            ),
+        )
+
+
 async def _compute_artifacts_chunk(
     engine_client,
     nonces: List[int],
@@ -246,35 +291,25 @@ async def _compute_artifacts_chunk(
     debug: bool = False,
     timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
     check_cancelled: Optional[callable] = None,
+    block_height: int = 0,
 ) -> List[Dict]:
-    """Compute artifacts for a chunk with backoff on skip."""
-    chunk_start_time = time.time()
+    """Compute artifacts for a chunk of nonces via the scheduler.
 
-    while True:
-        if check_cancelled and check_cancelled():
-            raise RuntimeError("Cancelled")
-
-        result = await engine_client.poc_request("generate_artifacts", {
-            "nonces": nonces,
-            "block_hash": block_hash,
-            "public_key": public_key,
-            "seq_len": seq_len,
-            "k_dim": k_dim,
-            "poc_stronger_rng": poc_stronger_rng,
-            "poc_decode": poc_decode,
-            "max_tokens": max_tokens,
-            "inference_k_points_steps": inference_k_points_steps,
-            "debug": debug,
-        })
-
-        if not result.get("skipped"):
-            return result.get("artifacts", [])
-
-        elapsed = time.time() - chunk_start_time
-        if elapsed >= timeout_sec:
-            raise RuntimeError(f"Timeout after {elapsed:.1f}s")
-
-        await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
+    Thin wrapper over generate_queue.compute_nonce_artifacts (the single source
+    of truth for PoC artifact computation). ``poc_stronger_rng``/``timeout_sec``
+    are accepted only for call compatibility; ``poc_stronger_rng`` is not a
+    PoCParams field and the scheduler handles queuing/backoff.
+    """
+    if check_cancelled and check_cancelled():
+        raise RuntimeError("Cancelled")
+    return await compute_nonce_artifacts(
+        engine_client, nonces, block_hash, public_key, block_height,
+        seq_len, k_dim,
+        poc_decode=poc_decode,
+        max_tokens=max_tokens,
+        inference_k_points_steps=inference_k_points_steps,
+        debug=debug,
+    )
 
 
 # =============================================================================
@@ -311,39 +346,27 @@ async def _generation_loop(
             nonces = pending_nonces if pending_nonces else nonce_iter.take(batch_size)
             
             try:
-                result = await engine_client.poc_request(
-                    "generate_artifacts",
-                    {
-                        "nonces": nonces,
-                        "block_hash": config["block_hash"],
-                        "public_key": config["public_key"],
-                        "seq_len": config["seq_len"],
-                        "k_dim": config["k_dim"],
-                        "poc_stronger_rng": config["poc_stronger_rng"],
-                    },
-                    timeout_ms=POC_RPC_TIMEOUT_MS
+                # Continuous generation is prefill-only (no decode loop). PoC
+                # rides through the scheduler alongside chat; no collective_rpc.
+                artifacts = await _compute_artifacts_chunk(
+                    engine_client, nonces,
+                    config["block_hash"], config["public_key"],
+                    config["seq_len"], config["k_dim"],
+                    config["poc_stronger_rng"],
+                    block_height=config["block_height"],
                 )
-                timeout_count = 0
-            except TimeoutError:
+            except Exception as e:
                 timeout_count += 1
                 if timeout_count == 1 or timeout_count % 10 == 0:
-                    logger.warning(f"PoC timed out (#{timeout_count}), engine busy")
+                    logger.warning(f"PoC generation error (#{timeout_count}), engine busy: {e}")
                 pending_nonces = nonces
                 await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC * 2)
                 continue
-            
-            if result.get("skipped"):
-                skip_count += 1
-                if skip_count % 100 == 1:
-                    logger.debug(f"PoC yielding to chat (skip #{skip_count})")
-                pending_nonces = nonces
-                await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
-                continue
-            
+
+            timeout_count = 0
             skip_count = 0
             pending_nonces = None
-            artifacts = result.get("artifacts", [])
-            
+
             if artifacts and callback_sender:
                 artifact_objs = [Artifact(nonce=a["nonce"], vector_b64=a["vector_b64"]) for a in artifacts]
                 callback_sender.add_artifacts(artifact_objs, {
@@ -411,9 +434,8 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
         callback_sender = CallbackSender(body.url, stop_event, body.params.k_dim)
         callback_task = asyncio.create_task(callback_sender.run())
     
-    # Set the flag BEFORE creating the task so the chat endpoint starts
-    # rejecting immediately — the drain in poc_request relies on no new
-    # inference arriving while it waits.
+    # Set the flag BEFORE creating the task so the chat endpoint reflects that
+    # continuous PoC generation is active.
     _poc_generation_active = True
 
     gen_task = asyncio.create_task(
@@ -450,9 +472,10 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     logger.info(f"PoC /generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.nonces}, {body.params}, {body.batch_size}, {body.wait}, {body.url}, {body.validation}, {body.stat_test}, {body.poc_stronger_rng}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
-    
+    check_reservation_fits(engine_client, body)
+
     app_id = id(request.app)
-    
+
     if body.validation:
         validation_nonces = set(a.nonce for a in body.validation.artifacts)
         if validation_nonces != set(body.nonces):
@@ -485,6 +508,10 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             k_dim=body.params.k_dim,
             batch_size=body.batch_size,
             poc_stronger_rng=body.poc_stronger_rng,
+            poc_decode=getattr(request.app.state, "poc_decode", False),
+            max_tokens=body.params.max_tokens,
+            inference_k_points_steps=body.inference_k_points_steps,
+            debug=body.debug,
             validation_artifacts=validation_map,
             stat_test_dist_threshold=stat_test.dist_threshold,
             stat_test_p_mismatch=stat_test.p_mismatch,
@@ -534,11 +561,12 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 engine_client, chunk, body.block_hash, body.public_key,
                 body.params.seq_len, body.params.k_dim, body.poc_stronger_rng,
                 poc_decode=poc_decode,
-                max_tokens=body.max_tokens,
+                max_tokens=body.params.max_tokens,
                 inference_k_points_steps=chunk_inference_steps,
                 debug=body.debug,
                 timeout_sec=POC_GENERATE_CHUNK_TIMEOUT_SEC,
                 check_cancelled=check_cancelled,
+                block_height=body.block_height,
             )
             computed_artifacts.extend(artifacts)
             logger.debug(f"PoC /generate: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")

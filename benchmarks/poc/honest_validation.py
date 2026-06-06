@@ -9,11 +9,11 @@ summary table.
 Both servers must already be running. No Docker is started here.
 
 Example:
-    python scripts/test_honest_validation.py \
+    python benchmarks/poc/honest_validation.py \
         --server1 http://127.0.0.1:8000 \
         --server2 http://127.0.0.1:8001 \
         --nonces 20 \
-        --model Qwen/Qwen3-0.6B
+        --model RedHatAI/Qwen2.5-7B-Instruct-quantized.w8a16
 """
 
 import argparse
@@ -87,7 +87,7 @@ def main() -> None:
     parser.add_argument("--server1", required=True, help="URL of first server (e.g. http://127.0.0.1:8000)")
     parser.add_argument("--server2", required=True, help="URL of second server (e.g. http://127.0.0.1:8001)")
     parser.add_argument("--nonces", type=int, default=10, help="Number of nonces to request (default: 10)")
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="Model name")
+    parser.add_argument("--model", default="RedHatAI/Qwen2.5-7B-Instruct-quantized.w8a16", help="Model name")
     parser.add_argument("--seq-len", type=int, default=256, dest="seq_len", help="Sequence length (default: 256)")
     parser.add_argument("--k-dim", type=int, default=12, dest="k_dim", help="K dimension (default: 12)")
     parser.add_argument("--batch-size", type=int, default=16, dest="batch_size", help="Batch size (default: 16)")

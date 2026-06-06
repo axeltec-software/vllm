@@ -308,11 +308,14 @@ class AsyncLLM(EngineClient):
 
         if poc_params is not None:
             from vllm.sampling_params import RequestOutputKind
-            queue = RequestOutputCollector(output_kind=RequestOutputKind.FINAL_ONLY)
+            queue = RequestOutputCollector(
+                output_kind=RequestOutputKind.FINAL_ONLY,
+                request_id=request_id,
+            )
 
             if arrival_time is None:
                 arrival_time = time.time()
-            
+
             request = EngineCoreRequest(
                 request_id=request_id,
                 prompt_token_ids=[],  # Empty for PoC
@@ -326,6 +329,10 @@ class AsyncLLM(EngineClient):
                 data_parallel_rank=data_parallel_rank,
                 priority=priority,
                 poc_params=poc_params,
+                # PoC builds EngineCoreRequest directly (bypassing the input
+                # processor's assign_request_id), so set external_req_id here.
+                # request_id is already a unique poc-<uuid>.
+                external_req_id=request_id,
             )
             
             await self._add_request(request, None, None, 0, queue)

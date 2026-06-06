@@ -544,12 +544,8 @@ def build_app(args: Namespace) -> FastAPI:
     app.include_router(poc_router)
     app.state.poc_enabled = True
     app.state.poc_decode = getattr(args, "poc_decode", False)
-    if app.state.poc_decode:
-        logger.info("PoC (Proof of Compute) API enabled [decode mode ON]")
-    else:
-        logger.info("PoC (Proof of Compute) API enabled")
-    from vllm.poc.engine_patch import apply_patch as _poc_apply_patch
-    _poc_apply_patch()
+    logger.info("PoC (Proof of Compute) API enabled%s",
+                " [decode default ON]" if app.state.poc_decode else "")
 
     from vllm.entrypoints.pooling import register_pooling_api_routers
 

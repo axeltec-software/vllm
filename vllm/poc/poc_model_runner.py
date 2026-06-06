@@ -5,6 +5,7 @@ Uses actual KV cache blocks for attention to work correctly.
 Batched forward pass — processes all nonces in a single forward call.
 """
 import math
+import os
 from contextlib import contextmanager
 import torch
 import torch.distributed as dist
@@ -48,6 +49,13 @@ def bypass_torch_compile():
         torch.compiler._is_compiling_flag = old_flag
 
 DEFAULT_K_DIM = 12
+
+# PoC cudagraph is DISABLED by default — its capture/replay is not yet
+# byte-identical to eager (non-deterministic replay + a workspace/KV state leak
+# that can also corrupt concurrent chat). PoC therefore runs eager (correct +
+# deterministic). Set VLLM_POC_CUDAGRAPH=1 to re-enable once it passes the
+# eager-equivalence gate. See /gonka/docs/poc_consolidation_findings.md.
+_POC_CUDAGRAPH_ENABLED = os.environ.get("VLLM_POC_CUDAGRAPH", "0") == "1"
 
 # SPHERE_DIM: dimension of the hidden-state slice projected onto the sphere.
 # SPHERE_POINTS: number of equidistant codebook points on that sphere.
@@ -139,12 +147,13 @@ def nearest_sphere_index(query: torch.Tensor, codebook: torch.Tensor) -> torch.T
 
 def _ensure_layer_hooks(worker, block_hash, hidden_size):
     """Ensure layer hooks are installed and current for the given block_hash."""
-    model = worker.model_runner.model
+    model = getattr(worker, "model_runner", worker).model
     device = worker.device
     existing = getattr(worker, "_poc_layer_hooks", None)
     if existing is None:
+        # Construction registers the forward hooks (see LayerHouseholderHook
+        # __init__ -> _setup); do not call _setup again or hooks double-register.
         hook = LayerHouseholderHook(model, block_hash, device, hidden_size)
-        hook._setup(model, block_hash, device, hidden_size)
         worker._poc_layer_hooks = hook
     elif existing.block_hash != block_hash:
         # Update vector contents in-place. Hooks remain registered.
@@ -159,7 +168,7 @@ def _get_block_size(worker):
 
 def _iter_attn_builders(worker):
     """Yield every FlashInfer metadata builder on the worker."""
-    for kv_groups in worker.model_runner.attn_groups:
+    for kv_groups in getattr(worker, "model_runner", worker).attn_groups:
         for attn_group in kv_groups:
             yield attn_group.get_metadata_builder(0)
 
@@ -222,7 +231,7 @@ def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker):
         ),
     )
 
-    model_runner = worker.model_runner
+    model_runner = getattr(worker, "model_runner", worker)
     attn_metadata_dict = {}
     slot_mapping_dict = {}
 
@@ -329,7 +338,7 @@ def _create_decode_attn_metadata_with_history(
         ),
     )
 
-    model_runner = worker.model_runner
+    model_runner = getattr(worker, "model_runner", worker)
     attn_metadata_dict = {}
     slot_mapping_dict = {}
 
@@ -403,9 +412,10 @@ def _get_static_attn_metadata(worker, batch_size, seq_len, block_size, device):
     warmup/capture using this metadata; the GPU workspace it sets up remains
     valid for all subsequent graph replays of the same shape.
 
-    Trade-off vs NOTE at module top: POC forward runs via collective_rpc
-    between engine scheduling ticks, so the metadata builder workspace is
-    idle when POC executes.
+    PoC runs through the scheduler as its own batch (pure-PoC), so chat may
+    touch the shared metadata-builder workspace between PoC calls; the capture
+    path swaps in a dedicated PoC workspace to stay isolated (see
+    _get_or_capture_poc_graph).
     """
     cache = getattr(worker, "_poc_attn_meta_cache", {})
     key = (batch_size, seq_len)
@@ -444,7 +454,7 @@ def _get_or_capture_poc_graph(
     block_size = _get_block_size(worker)
     total_blocks = batch_size * math.ceil(seq_len / block_size)
 
-    if worker.model_config.enforce_eager:
+    if not _POC_CUDAGRAPH_ENABLED or worker.model_config.enforce_eager:
         # --enforce-eager: skip graph capture/replay entirely.
         # Create fresh metadata so inference-engine workspace corruption cannot
         # affect this call (same reason poc_attn_meta is created in the normal path).
@@ -458,7 +468,7 @@ def _get_or_capture_poc_graph(
             skip_compiled=True,
         ):
             with poc_forward_context():
-                out = worker.model_runner.model(
+                out = getattr(worker, "model_runner", worker).model(
                     input_ids=None,
                     positions=positions_buf,
                     inputs_embeds=embeds_buf,
@@ -474,7 +484,7 @@ def _get_or_capture_poc_graph(
             builder.paged_kv_indices.gpu[:total_blocks].copy_(saved_kv)
         return graph, captured_hidden
 
-    model = worker.model_runner.model
+    model = getattr(worker, "model_runner", worker).model
     num_tokens = batch_size * seq_len
 
     # Give this POC graph its own workspace so inference-engine plan() calls
@@ -652,7 +662,7 @@ def _get_or_capture_poc_decode_graph(
     cache = getattr(worker, "_poc_decode_cuda_graphs", {})
     key = (batch_size, seq_len, step)
 
-    if worker.model_config.enforce_eager:
+    if not _POC_CUDAGRAPH_ENABLED or worker.model_config.enforce_eager:
         # --enforce-eager: run decode step eagerly without graph capture/replay.
         # dec_attn already has fresh plan() from _get_static_decode_attn_metadata.
         with set_forward_context(
@@ -662,7 +672,7 @@ def _get_or_capture_poc_decode_graph(
             skip_compiled=True,
         ):
             with poc_forward_context():
-                out = worker.model_runner.model(
+                out = getattr(worker, "model_runner", worker).model(
                     input_ids=None,
                     positions=decode_pos_buf,
                     inputs_embeds=decode_embeds_buf,
@@ -672,7 +682,7 @@ def _get_or_capture_poc_decode_graph(
     if key in cache:
         return cache[key]
 
-    model = worker.model_runner.model
+    model = getattr(worker, "model_runner", worker).model
 
     with set_forward_context(
         dec_attn, vllm_config,
@@ -747,7 +757,7 @@ def execute_poc_forward(
     """
     device = worker.device
     dtype = worker.model_config.dtype
-    model = worker.model_runner.model
+    model = getattr(worker, "model_runner", worker).model
     vllm_config = worker.vllm_config
     batch_size = len(nonces)
 
@@ -790,6 +800,30 @@ def execute_poc_forward(
 
     # Get block_size and prepare attention metadata (cached, reused)
     block_size = _get_block_size(worker)
+
+    # Safety guard: PoC writes KV into the reserved block range [0, reserved).
+    # If this request's footprint would exceed the reservation, those writes
+    # would land in chat-owned blocks and silently corrupt model output, so
+    # refuse instead.  This is the last line of defence before the GPU write
+    # and covers every PoC execution path.
+    from vllm.poc.reservation import poc_blocks_needed, poc_reserved_blocks
+    cache_config = vllm_config.cache_config
+    _reserved = poc_reserved_blocks(cache_config, block_size)
+    _needed = poc_blocks_needed(batch_size, seq_len, max_tokens, block_size)
+    if _needed > _reserved:
+        # Refuse the batch GRACEFULLY (return no artifacts) instead of raising —
+        # raising here propagates out of execute_model and kills the whole
+        # EngineCore (taking chat down). The scheduler caps PoC batches to
+        # poc_max_batch_size, so this is a defense-in-depth backstop.
+        logger.error(
+            "PoC batch exceeds the KV reservation: needs %d blocks "
+            "(batch_size=%d, seq_len=%d, max_tokens=%d) but only %d reserved "
+            "(poc_max_batch_size=%d). Refusing the batch (no artifacts).",
+            _needed, batch_size, seq_len, max_tokens, _reserved,
+            cache_config.poc_max_batch_size,
+        )
+        return {"nonces": [], "vectors": np.empty((0, k_dim), dtype=np.float16)}
+
     attn_metadata, slot_mapping_dict = _get_static_attn_metadata(
         worker, batch_size, seq_len, block_size, device
     )
@@ -798,31 +832,24 @@ def execute_poc_forward(
     )
 
     if pp_group.is_first_rank:
-        kv_caches = getattr(worker.model_runner, "kv_caches", [])
-        kv_scratch = None
-        needed_elems = batch_size * seq_len * hidden_size
-        for kv in kv_caches:
-            if kv.numel() >= needed_elems:
-                kv_scratch = kv.flatten()[:needed_elems].view(
-                    batch_size, seq_len, hidden_size)
-                break
-        if kv_scratch is not None:
-            from .gpu_random import _seed_from_string, _normal
-            for i, nonce in enumerate(nonces):
-                seed = _seed_from_string(
-                    f"{block_hash}_{public_key}_nonce{nonce}")
-                vals = _normal(seed, seq_len * hidden_size, device)
-                kv_scratch[i].copy_(vals.view(seq_len, hidden_size).to(dtype))
-                del vals
-            embeds_buf.copy_(kv_scratch.view(-1, hidden_size))
-        else:
-            _gen_fn = generate_inputs_concat_murmur if poc_stronger_rng else generate_inputs
-            raw = _gen_fn(
-                block_hash, public_key, nonces,
-                dim=hidden_size, seq_len=seq_len,
-                device=device, dtype=dtype,
-            )
-            embeds_buf.copy_(raw.view(-1, hidden_size))
+        # Generate PoC input embeddings directly into the dedicated embeds_buf.
+        # IMPORTANT: do NOT borrow the KV cache tensor as scratch here. The old
+        # kv_scratch optimization wrote batch_size*seq_len*hidden_size random
+        # elements over the start of the KV cache, clobbering chat-owned KV
+        # blocks beyond the PoC-reserved range. A fresh-prefill chat rewrites its
+        # KV so was immune, but a chat that READS existing KV (concurrent decode,
+        # or a prefix-cache hit) reads the clobbered values -> corrupted logits /
+        # early EOS. This was masked under collective_rpc (chat frozen during
+        # PoC) and surfaced once PoC runs interleaved through the scheduler.
+        # Generation (seed -> _normal) is unchanged, so artifacts are identical.
+        from .gpu_random import _seed_from_string, _normal
+        embeds_view = embeds_buf.view(batch_size, seq_len, hidden_size)
+        for i, nonce in enumerate(nonces):
+            seed = _seed_from_string(
+                f"{block_hash}_{public_key}_nonce{nonce}")
+            vals = _normal(seed, seq_len * hidden_size, device)
+            embeds_view[i].copy_(vals.view(seq_len, hidden_size).to(dtype))
+            del vals
 
         graph, poc_hidden = _get_or_capture_poc_graph(
             worker,
@@ -964,9 +991,11 @@ def execute_poc_forward(
             sph_values_per_nonce[i].append(encode_vector(xk_sphere_cpu[i]))
 
     # -------------------------------------------------------------------------
-    # Decode loop
+    # Decode loop — gated by max_tokens alone (per request). max_tokens == 0
+    # means prefill-only (decode off); max_tokens > 0 runs that many decode
+    # steps. The legacy poc_decode flag no longer gates this.
     # -------------------------------------------------------------------------
-    if poc_decode and max_tokens > 0:
+    if max_tokens > 0:
         if pp_group.world_size > 1:
             logger.warning(
                 "PoC decode loop not supported with pipeline parallelism "

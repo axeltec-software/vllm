@@ -114,6 +114,11 @@ class LayerHouseholderHook:
             for _ in layers
         ]
         self._fill_reflection_vectors(block_hash, hidden_size, device)
+        # Register forward hooks on construction (reflection buffers already
+        # allocated above). Keeps the constructor's contract: building the hook
+        # attaches it. Buffers stay at fixed GPU addresses for cudagraph safety;
+        # use update_block_hash() to refresh contents without re-capturing.
+        self._setup(model, block_hash, device, hidden_size)
 
     def _fill_reflection_vectors(
         self,
