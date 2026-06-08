@@ -21,6 +21,7 @@ async def _send_poc_request(
     nonces: list[int],
     public_key: str = "test_node",
     max_tokens: int = 0,
+    timeout: int = 600,
 ) -> tuple[dict[str, Any] | None, float]:
     """Send one PoC generate request and return (result, elapsed_seconds).
 
@@ -43,7 +44,7 @@ async def _send_poc_request(
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                url, json=payload, timeout=aiohttp.ClientTimeout(total=60)
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)
             ) as resp:
                 result = await resp.json() if resp.status == 200 else {"error": f"status {resp.status}"}
     except Exception as exc:
@@ -61,6 +62,7 @@ async def _poc_sender_loop(
     poc_times: list[float],
     max_tokens: int = 0,
     nonces_per_request: int = 32,
+    poc_timeout: int = 600,
 ) -> None:
     """Continuously send PoC requests until *stop_event* is set.
 
@@ -92,7 +94,7 @@ async def _poc_sender_loop(
         print(f"[PoC] Sending batch #{batch_start}–{request_count}")
         results = await asyncio.gather(*[
             _send_poc_request(base_url, model, block_hash, nonces,
-                              max_tokens=max_tokens)
+                              max_tokens=max_tokens, timeout=poc_timeout)
             for _, block_hash, nonces in tasks
         ])
 
@@ -265,7 +267,11 @@ async def _run_eval(args: argparse.Namespace) -> int:
     cmd = [
         "lm-eval",
         "--model", "local-chat-completions",
-        "--model_args", f"model={args.model_name},base_url={server_url}/v1/chat/completions,num_concurrent={args.batch_size}",
+        "--model_args", (
+            f"model={args.model_name},base_url={server_url}/v1/chat/completions,"
+            f"num_concurrent={args.batch_size},"
+            f"timeout={args.client_timeout},max_retries={args.max_retries}"
+        ),
         "--tasks", args.tasks,
         "--output_path", str(output_path),
         "--log_samples",
@@ -295,6 +301,7 @@ async def _run_eval(args: argparse.Namespace) -> int:
                 poc_times,
                 args.max_tokens,
                 args.poc_nonces,
+                args.poc_timeout,
             )
         )
 
@@ -405,6 +412,22 @@ def main() -> int:
     parser.add_argument(
         "--limit", type=int, default=None,
         help="Limit gsm8k to first N questions (fast experiments). Omit = full set.",
+    )
+    parser.add_argument(
+        "--client_timeout", type=int, default=1200,
+        help="lm-eval HTTP client timeout (s) per chat request. Bump high so a "
+             "slow/contended server does not close the session (the NA root cause "
+             "in defer mode). Default 1200 (lm-eval's own default is 300).",
+    )
+    parser.add_argument(
+        "--max_retries", type=int, default=5,
+        help="lm-eval HTTP client max retries per chat request (default 5; "
+             "lm-eval's own default is 3).",
+    )
+    parser.add_argument(
+        "--poc_timeout", type=int, default=600,
+        help="Per-PoC-request HTTP timeout (s) in the background load loop. "
+             "Default 600 (was hardcoded 60).",
     )
     parser.add_argument("--disable_poc", action="store_true")
     parser.add_argument(

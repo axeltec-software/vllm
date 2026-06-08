@@ -64,9 +64,9 @@ logger = init_logger(__name__)
 # Phase 2: step-driven mixed decode-PoC. When ON, a decode-PoC request stays
 # running for prefill + max_tokens decode steps (1 decode token/step), mixed with
 # chat in the same forward, instead of running its whole decode loop inside one
-# pure-batch execute_poc_forward call. Default OFF = Phase-1 behavior (decode-PoC
-# pure, chat deferred while it runs). See /gonka/docs/poc_phase2_mixed_decode_design.md
-_POC_MIXED_DECODE = os.environ.get("VLLM_POC_MIXED_DECODE", "0") == "1"
+# pure-batch execute_poc_forward call. Default ON (set VLLM_POC_MIXED_DECODE=0 to
+# disable). OFF = Phase-1 behavior (decode-PoC pure, chat deferred while it runs).
+_POC_MIXED_DECODE = os.environ.get("VLLM_POC_MIXED_DECODE", "1") != "0"
 
 
 class Scheduler(SchedulerInterface):

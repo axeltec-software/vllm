@@ -25,11 +25,14 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Phase 2 master switch. Default OFF = Phase-1 behavior (decode-PoC runs its whole
-# loop in one pure execute_poc_forward step; chat deferred while it runs). ON =
-# step-driven mixed decode (one PoC decode token per scheduler step, mixed with
-# chat). Single source of truth, imported by scheduler.py and gpu_model_runner.py.
-POC_MIXED_DECODE = os.environ.get("VLLM_POC_MIXED_DECODE", "0") == "1"
+# Phase 2 master switch. Default ON = step-driven mixed decode (one PoC decode
+# token per scheduler step, fused with chat in the same forward; chat is never
+# frozen). Set VLLM_POC_MIXED_DECODE=0 to fall back to Phase-1 behavior (decode-PoC
+# runs its whole loop in one pure execute_poc_forward step; chat deferred while it
+# runs — ~6x chat slowdown under load). Default ON is justified by the gsm8k
+# co-existence results (accuracy preserved, chat ~1.5x not ~6x). Single source of
+# truth, imported by scheduler.py and gpu_model_runner.py.
+POC_MIXED_DECODE = os.environ.get("VLLM_POC_MIXED_DECODE", "1") != "0"
 
 
 def poc_per_slot_blocks(poc_seq_len: int, poc_max_tokens: int,
