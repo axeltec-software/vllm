@@ -476,13 +476,30 @@ def _get_or_capture_poc_graph(
         return None, (out[0] if isinstance(out, tuple) else out)
 
     if key in cache:
-        graph, captured_hidden, *_, kv_snapshots = cache[key]
-        # Restore paged_kv_indices in the shared builder buffer.  FlashInfer may
-        # reference these from inside the workspace; the inference engine overwrites
-        # them between POC calls.
-        for builder, saved_kv in zip(_iter_attn_builders(worker), kv_snapshots):
-            builder.paged_kv_indices.gpu[:total_blocks].copy_(saved_kv)
-        return graph, captured_hidden
+        # The prefill CUDA graph has a persistent workspace-state issue: plan()
+        # writes the attention schedule into poc_ws, but run() uses poc_ws for
+        # temporaries and overwrites the schedule.  The capture itself runs with
+        # a stale workspace (post-warmup), so the baked-in kernel sequence is
+        # not reliably replayable with fresh plan data.  Always run eagerly here
+        # — same code as the _POC_CUDAGRAPH_ENABLED=False path — which creates
+        # fresh metadata and a fresh plan() before every forward pass.
+        eager_meta, eager_slot = _create_v1_attn_metadata(
+            batch_size, seq_len, block_size, device, worker
+        )
+        model = getattr(worker, "model_runner", worker).model
+        with set_forward_context(
+            eager_meta, vllm_config,
+            num_tokens=batch_size * seq_len,
+            slot_mapping=eager_slot,
+            skip_compiled=True,
+        ):
+            with poc_forward_context():
+                out = model(
+                    input_ids=None,
+                    positions=positions_buf,
+                    inputs_embeds=embeds_buf,
+                )
+        return None, (out[0] if isinstance(out, tuple) else out)
 
     model = getattr(worker, "model_runner", worker).model
     num_tokens = batch_size * seq_len

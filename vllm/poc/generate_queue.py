@@ -64,7 +64,7 @@ async def compute_nonce_artifacts(
                 if not output.finished:
                     continue
                 poc_out = output.poc_output
-                if poc_out is None:
+                if not poc_out:  # None or empty dict (PoC ran but no artifact)
                     return None
                 get = poc_out.get if isinstance(poc_out, dict) else (
                     lambda k, d=None: getattr(poc_out, k, d))
