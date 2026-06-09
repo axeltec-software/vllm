@@ -713,6 +713,8 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        # Direct output for pure-PoC batches that bypass execute_model_state.
+        self._poc_direct_output: ModelRunnerOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
 
@@ -3575,7 +3577,7 @@ class GPUModelRunner(
                         ),
                     )
 
-                return ModelRunnerOutput(
+                poc_output = ModelRunnerOutput(
                     req_ids=list(poc_req_ids),
                     req_id_to_index={
                         req_id: i for i, req_id in enumerate(poc_req_ids)
@@ -3586,6 +3588,12 @@ class GPUModelRunner(
                     pooler_output=[],
                     poc_outputs=poc_outputs_dict,
                 )
+                # Store so sample_tokens() can return it when called by the
+                # async batch queue (execute_model_state is not set for pure-PoC
+                # batches, so sample_tokens() would otherwise return None and
+                # trigger RuntimeError("unexpected error") in step_with_batch_queue).
+                self._poc_direct_output = poc_output
+                return poc_output
 
             self._mixed_batch_info = {
                 'is_mixed': is_mixed_batch,
@@ -3992,6 +4000,13 @@ class GPUModelRunner(
         self.kv_connector_output = None
 
         if self.execute_model_state is None:
+            # Pure-PoC batch: execute_model() returned the output directly and
+            # stored it here. Return it so step_with_batch_queue gets a non-None
+            # model_output instead of hitting RuntimeError("unexpected error").
+            poc_out = self._poc_direct_output
+            if poc_out is not None:
+                self._poc_direct_output = None
+                return poc_out
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
                 return None  # type: ignore[return-value]

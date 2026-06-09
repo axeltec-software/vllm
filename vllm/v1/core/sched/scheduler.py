@@ -1437,8 +1437,8 @@ class Scheduler(SchedulerInterface):
                 
                 # PoC outputs will be in model_runner_output.poc_outputs
                 # and will be handled by the output processor
-                poc_output = None
-                if hasattr(model_runner_output, 'poc_outputs') and model_runner_output.poc_outputs:
+                poc_output: dict | None = {}  # empty dict = PoC ran but no artifacts
+                if hasattr(model_runner_output, 'poc_outputs') and model_runner_output.poc_outputs is not None:
                     poc_obj = model_runner_output.poc_outputs.get(req_id)
                     if poc_obj is not None:
                         poc_output = {
