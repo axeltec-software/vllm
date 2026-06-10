@@ -476,106 +476,48 @@ def _get_or_capture_poc_graph(
         return None, (out[0] if isinstance(out, tuple) else out)
 
     if key in cache:
-        graph, captured_hidden, poc_attn_meta, poc_slot_map, poc_workspaces, poc_prefill_wrappers, _kv_snap = cache[key]
-        builders = list(_iter_attn_builders(worker))
-
-        # Swap in poc_prefill_wrappers (backed by poc_ws, use_cuda_graph=True) and
-        # re-plan with PoC parameters.  Because the wrappers use use_cuda_graph=True,
-        # plan() copies fresh PoC data into their stable pre-allocated GPU buffers
-        # (same fixed addresses as at capture time), so graph.replay() reads the
-        # correct data from those addresses.
-        # A non-CUDA-graph wrapper would allocate NEW GPU tensors on each plan() call,
-        # and the graph bakes in the capture-time addresses; PyTorch frees those old
-        # tensors and reuses them for other allocations, so replay reads garbage → NaN.
-        orig_workspaces = [b._get_workspace_buffer() for b in builders]
-        orig_prefill_wrappers = [b._prefill_wrapper for b in builders]
-        for b, poc_pw, poc_ws in zip(builders, poc_prefill_wrappers, poc_workspaces):
-            b.set_workspace_buffer(poc_ws)
-            b._prefill_wrapper = poc_pw
-        _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker)
-        for b, ows, opw in zip(builders, orig_workspaces, orig_prefill_wrappers):
-            b.set_workspace_buffer(ows)
-            b._prefill_wrapper = opw
-
-        # FlashInfer plan() issues non-blocking H2D/D2D copies for the stable
-        # paged_kv_indices_buf, paged_kv_indptr_buf, etc.  Even though they're on
-        # the same CUDA stream as graph.replay(), vLLM's multi-stream setup (async
-        # output-copy stream, etc.) can affect stream ordering.  Synchronize to
-        # guarantee all plan copies landed before the graph kernels read those
-        # buffers.
-        torch.cuda.synchronize()
-
-        # Use poc_attn_meta (FIPrefill(wrapper=poc_pw)) as the forward context,
-        # matching the context used during graph capture.
-        with set_forward_context(
-            poc_attn_meta, vllm_config,
-            num_tokens=batch_size * seq_len,
-            slot_mapping=poc_slot_map,
-            skip_compiled=True,
-        ):
-            with poc_forward_context():
-                graph.replay()
-
-        return None, captured_hidden
-
-    # ---- First call: capture the graph ----
-
-    from flashinfer import BatchPrefillWithPagedKVCacheWrapper as _FIPrefillWrapper
-    from vllm.v1.attention.backends.flashinfer import (
-        get_kv_cache_layout as _get_kv_layout,
-        FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT,
-    )
+        graph, captured_hidden, *_, kv_snapshots = cache[key]
+        # Restore paged_kv_indices in the shared builder buffer.  FlashInfer may
+        # reference these from inside the workspace; the inference engine overwrites
+        # them between POC calls.
+        for builder, saved_kv in zip(_iter_attn_builders(worker), kv_snapshots):
+            builder.paged_kv_indices.gpu[:total_blocks].copy_(saved_kv)
+        return graph, captured_hidden
 
     model = getattr(worker, "model_runner", worker).model
     num_tokens = batch_size * seq_len
 
-    # Allocate a dedicated workspace for PoC so inference-engine plan() calls
-    # between PoC requests cannot corrupt it.  Create the prefill wrappers with
-    # use_cuda_graph=True so that plan() copies paged_kv data into stable
-    # pre-allocated GPU buffers (fixed addresses) rather than allocating new
-    # tensors on each call.
+    # Give this POC graph its own workspace so inference-engine plan() calls
+    # between POC requests cannot corrupt it.  Each builder's existing workspace
+    # and prefill wrapper are swapped out before capture and restored after.
+    from vllm.v1.attention.backends.flashinfer import (
+        FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT,
+    )
     builders = list(_iter_attn_builders(worker))
     orig_workspaces = []
     orig_prefill_wrappers = []
     poc_workspaces = []
-    poc_prefill_wrappers = []
     for b in builders:
-        orig_workspaces.append(b._get_workspace_buffer())
+        orig_workspaces.append(b._get_workspace_buffer())   # lazy-init if needed
         orig_prefill_wrappers.append(b._prefill_wrapper)
-        # PoC prefill batches are large (many tokens), so they need more
-        # FlashInfer workspace than the default per-request size.  Use the
-        # "batch invariant" size (2 GiB) that vLLM allocates for fixed-batch
-        # workloads — it's large enough for any realistic PoC configuration.
         poc_ws = torch.zeros(
             FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT,
             dtype=torch.uint8,
             device=device,
         )
         b.set_workspace_buffer(poc_ws)
+        b._prefill_wrapper = None  # force recreation with poc_ws
         poc_workspaces.append(poc_ws)
 
-        # Stable GPU buffers: graph bakes in these addresses; plan() copies into
-        # them instead of allocating new tensors that would be freed and reused.
-        qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-        paged_kv_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-        paged_kv_indices_buf = torch.zeros(total_blocks, dtype=torch.int32, device=device)
-        paged_kv_last_page_len_buf = torch.zeros(batch_size, dtype=torch.int32, device=device)
-        poc_pw = _FIPrefillWrapper(
-            poc_ws, _get_kv_layout(),
-            use_cuda_graph=True,
-            qo_indptr_buf=qo_indptr_buf,
-            paged_kv_indptr_buf=paged_kv_indptr_buf,
-            paged_kv_indices_buf=paged_kv_indices_buf,
-            paged_kv_last_page_len_buf=paged_kv_last_page_len_buf,
-        )
-        b._prefill_wrapper = poc_pw
-        poc_prefill_wrappers.append(poc_pw)
-
-    # First plan(): populates poc_ws, the int workspace, and the stable paged_kv
-    # buffers with PoC attention parameters.
+    # Create fresh metadata AFTER swapping workspace.
+    # builder.build() → _get_prefill_wrapper() creates a new wrapper backed by
+    # poc_ws → plan() writes POC attention parameters into poc_ws.
+    # The passed-in attn_metadata has a wrapper pointing to the original
+    # workspace (created before the swap) and must NOT be used for capture.
     poc_attn_meta, poc_slot_map = _create_v1_attn_metadata(
         batch_size, seq_len, block_size, device, worker
     )
+    poc_prefill_wrappers = [b._prefill_wrapper for b in builders]
 
     with set_forward_context(
         poc_attn_meta, vllm_config,
@@ -591,6 +533,9 @@ def _get_or_capture_poc_graph(
             )
     torch.cuda.synchronize()
 
+    # Clone before the capture run can clobber any shared model-internal buffer.
+    # This tensor is returned as-is for the first call so the caller always
+    # sees a pure eager result on the initial invocation.
     warmup_hidden = (
         warmup_out[0] if isinstance(warmup_out, tuple) else warmup_out
     ).clone()
@@ -603,8 +548,8 @@ def _get_or_capture_poc_graph(
         batch_size, seq_len, block_size, device, worker
     )
 
-    if not hasattr(worker, "_poc_prefill_graph_pool"):
-        worker._poc_prefill_graph_pool = torch.cuda.graph_pool_handle()
+    if not hasattr(worker, "_poc_graph_pool"):
+        worker._poc_graph_pool = torch.cuda.graph_pool_handle()
 
     graph = torch.cuda.CUDAGraph()
     with set_forward_context(
@@ -614,7 +559,7 @@ def _get_or_capture_poc_graph(
         skip_compiled=True,
     ):
         with poc_forward_context():
-            with torch.cuda.graph(graph, pool=worker._poc_prefill_graph_pool):
+            with torch.cuda.graph(graph, pool=worker._poc_graph_pool):
                 captured_out = model(
                     input_ids=None,
                     positions=positions_buf,
@@ -631,21 +576,24 @@ def _get_or_capture_poc_graph(
     )
     torch.cuda.synchronize()
 
+    # Snapshot paged_kv_indices so we can restore them before each replay.
     kv_snapshots = [
         b.paged_kv_indices.gpu[:total_blocks].clone()
         for b in builders
     ]
 
-    # poc_attn_meta keeps slot_mapping tensors alive (CUDA graph ops reference
-    # their GPU addresses).  poc_workspaces and poc_prefill_wrappers keep poc_ws
-    # and the stable paged_kv buffers alive — the captured CUDA ops read from
-    # those fixed addresses on every replay.
+    # poc_attn_meta keeps the slot_mapping tensors alive (CUDA graph ops
+    # reference their GPU addresses).  poc_workspaces and poc_prefill_wrappers
+    # keep poc_ws alive — the captured CUDA ops read from those addresses.
     cache[key] = (graph, captured_hidden, poc_attn_meta, poc_slot_map, poc_workspaces, poc_prefill_wrappers, kv_snapshots)
     worker._poc_cuda_graphs = cache
     logger.info(
         "POC prefill graph captured batch_size=%d seq_len=%d (%d tokens)",
         batch_size, seq_len, num_tokens,
     )
+    # First call: return graph=None so the caller skips graph.replay() and
+    # uses the warmup output directly.  Subsequent calls return the real graph
+    # from cache and the caller drives replay normally.
     return None, warmup_hidden
 
 def _get_poc_decode_input_buffers(worker, batch_size, hidden_size, device, dtype):
