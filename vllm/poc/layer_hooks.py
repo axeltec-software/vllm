@@ -22,6 +22,33 @@ from .gpu_random import generate_householder_vector, apply_householder
 _poc_forward_active_flag: bool = False
 _poc_position_mask_global: Optional[torch.Tensor] = None
 
+# Graph mode: a STABLE position-mask buffer (fixed address) the hook reads on
+# every forward so the where-blend is recorded into the captured graph. Updated
+# in-place: PoC positions True for a mixed batch, all-False for plain chat.
+_poc_stable_mask: Optional[torch.Tensor] = None
+# True ONLY during the manual skip_compiled mixed-graph capture/replay. Gates the
+# stable-mask where-blend so it is NEVER traced by dynamo during chat's compiled
+# forward (where it would crash) — only recorded in the manual eager capture.
+_poc_manual_capture_active: bool = False
+
+
+def set_stable_poc_mask(mask: Optional[torch.Tensor]) -> None:
+    global _poc_stable_mask
+    _poc_stable_mask = mask
+
+
+def get_stable_poc_mask() -> Optional[torch.Tensor]:
+    return _poc_stable_mask
+
+
+def set_manual_capture_active(active: bool) -> None:
+    global _poc_manual_capture_active
+    _poc_manual_capture_active = active
+
+
+def manual_capture_active() -> bool:
+    return _poc_manual_capture_active
+
 
 @contextmanager
 def poc_forward_context():
@@ -175,14 +202,21 @@ class LayerHouseholderHook:
         """Apply Householder reflection in binary or mask mode.
 
             Binary mode (poc_forward_context active): in-place, CUDA-graph safe.
-            Mask mode (poc_forward_context_with_mask active): returns new tensors,
-            NOT compatible with CUDA graphs. Do not capture while mask is set.
+            Mask mode (poc_forward_context_with_mask active): now ALSO in-place +
+            static-shape (masked where-blend), so it is CUDA-graph safe too. PoC
+            rows transform identically to binary mode; chat rows pass through.
         """
         def hook(module, input, output):
             poc_mask = get_poc_position_mask()
+            # Manual mixed-graph capture only: read the stable mask so the
+            # where-blend is recorded into the graph. Gated by the capture flag so
+            # chat's COMPILED forward never traces the where-blend (dynamo crash).
+            if poc_mask is None and manual_capture_active():
+                poc_mask = get_stable_poc_mask()
 
             if poc_mask is not None:
-                # Mask mode: eager only. Do not trigger during graph capture/replay.
+                # Mask mode: in-place + static-shape (where-blend) → CUDA-graph
+                # safe. Transforms PoC positions, passes chat positions through.
                 v = self.reflection_vectors[layer_idx]
                 return self._apply_selective_transform(output, poc_mask, v)
 
@@ -220,45 +254,41 @@ class LayerHouseholderHook:
             poc_mask: Boolean tensor [total_tokens] where True = PoC position
             v: Householder reflection vector
         """
+        # IN-PLACE + STATIC-SHAPE so the masked hook is CUDA-graph safe:
+        #   - transform ALL rows (no data-dependent nonzero → static shape),
+        #   - blend by mask back into the SAME tensor (copy_, no clone → stable
+        #     address).
+        # Householder is per-row independent (x - 2(x·v)v), so transforming the
+        # whole batch then selecting the PoC rows yields BYTE-IDENTICAL values for
+        # the PoC rows vs transforming only those rows; chat rows are written back
+        # unchanged. Net behaviour == the previous clone+scatter, but graph-safe.
         def selective_transform(x):
-            original_shape = x.shape
-            if x.dim() == 3:
-                x = x.view(-1, x.shape[-1])
-
-            mask = poc_mask.to(x.device)
-            if mask.shape[0] != x.shape[0]:
-                if mask.shape[0] < x.shape[0]:
-                    pad_size = x.shape[0] - mask.shape[0]
+            if x is None:
+                return
+            x2 = x.view(-1, x.shape[-1]) if x.dim() == 3 else x
+            mask = poc_mask.to(device=x2.device)
+            if mask.shape[0] != x2.shape[0]:
+                if mask.shape[0] < x2.shape[0]:
                     mask = torch.cat([
                         mask,
-                        torch.zeros(pad_size, dtype=torch.bool, device=x.device)
+                        torch.zeros(x2.shape[0] - mask.shape[0],
+                                    dtype=torch.bool, device=x2.device),
                     ])
                 else:
-                    mask = mask[:x.shape[0]]
-
-            poc_indices = mask.nonzero(as_tuple=True)[0]
-
-            if poc_indices.numel() == 0:
-                return x.view(original_shape) if len(original_shape) == 3 else x
-
-            poc_hidden = x[poc_indices]
-            poc_transformed = apply_householder(poc_hidden, v.to(poc_hidden.dtype))
-
-            result = x.clone()
-            result[poc_indices] = poc_transformed
-
-            return result.view(original_shape) if len(original_shape) == 3 else result
+                    mask = mask[:x2.shape[0]]
+            transformed = apply_householder(x2, v.to(x2.dtype))
+            # PoC rows <- transformed, chat rows <- unchanged (in-place on x2,
+            # which is a view of x → mutates x).
+            x2.copy_(torch.where(mask.unsqueeze(-1), transformed, x2))
 
         if isinstance(output, tuple):
+            selective_transform(output[0])
             if len(output) >= 2:
-                hidden = output[0]
-                residual = output[1]
-                rest = output[2:] if len(output) > 2 else ()
-                return (selective_transform(hidden), selective_transform(residual)) + rest
-            else:
-                return (selective_transform(output[0]),)
+                selective_transform(output[1])
+            return output    # same tuple object, tensors updated in-place
         else:
-            return selective_transform(output)
+            selective_transform(output)
+            return output
 
     def detach(self):
         """Remove forward hook handles. Reflection vector buffers are retained."""

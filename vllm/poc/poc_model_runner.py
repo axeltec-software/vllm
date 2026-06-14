@@ -15,6 +15,7 @@ from typing import List, Optional, Dict, Any
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed.communication_op import broadcast_tensor_dict
 from vllm.forward_context import set_forward_context
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.logger import init_logger
 
@@ -50,12 +51,8 @@ def bypass_torch_compile():
 
 DEFAULT_K_DIM = 12
 
-# PoC cudagraph is DISABLED by default — its capture/replay is not yet
-# byte-identical to eager (non-deterministic replay + a workspace/KV state leak
-# that can also corrupt concurrent chat). PoC therefore runs eager (correct +
-# deterministic). Set VLLM_POC_CUDAGRAPH=1 to re-enable once it passes the
-# eager-equivalence gate. See /gonka/docs/poc_consolidation_findings.md.
-_POC_CUDAGRAPH_ENABLED = os.environ.get("VLLM_POC_CUDAGRAPH", "0") == "1"
+# PoC follows vLLM's own cudagraph setting: it runs graphs when the server is not
+# --enforce-eager, and eager otherwise. No separate PoC cudagraph flag.
 
 # SPHERE_DIM: dimension of the hidden-state slice projected onto the sphere.
 # SPHERE_POINTS: number of equidistant codebook points on that sphere.
@@ -173,31 +170,40 @@ def _iter_attn_builders(worker):
             yield attn_group.get_metadata_builder(0)
 
 
-def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker):
+def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker,
+                             block_bases=None):
     """Create attention metadata for batch_size sequences.
 
     Uses the worker's metadata builders to create the correct metadata
     for whatever attention backend is configured (FlashAttention,
     FlashInfer, etc.).
+
+    block_bases: optional list of per-sequence base block ids. Default None lays
+    each sequence out sequentially from 0 (pure-PoC). The step-driven mixed prefill
+    passes each request's reserved-slot base (slot*per_slot) so the prefill writes
+    KV to the SAME blocks the decode steps read.
     """
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
     blocks_per_seq = math.ceil(seq_len / block_size)
     total_tokens = batch_size * seq_len
+    if block_bases is None:
+        block_bases = [seq_idx * blocks_per_seq for seq_idx in range(batch_size)]
 
     # slot_mapping: each sequence gets its own block range
     all_slots = []
     for seq_idx in range(batch_size):
-        base_block = seq_idx * blocks_per_seq
+        base_block = block_bases[seq_idx]
         for t in range(seq_len):
             block_idx = base_block + t // block_size
             all_slots.append(block_idx * block_size + t % block_size)
     slot_mapping = torch.tensor(all_slots, dtype=torch.long, device=device)
 
     # block_table: [batch_size, blocks_per_seq]
-    block_table = torch.arange(
-        batch_size * blocks_per_seq, dtype=torch.int32, device=device
-    ).view(batch_size, blocks_per_seq)
+    block_table = torch.stack([
+        torch.arange(base, base + blocks_per_seq, dtype=torch.int32, device=device)
+        for base in block_bases
+    ])
 
     # query_start_loc: [0, seq_len, 2*seq_len, ..., batch_size*seq_len]
     query_start_loc_gpu = (
@@ -433,6 +439,8 @@ def _get_or_capture_poc_graph(
     device, dtype, vllm_config,
     attn_metadata, slot_mapping_dict,
     embeds_buf, positions_buf,
+    block_bases=None,
+    dynamic=False,
 ):
     """Return (graph, hidden) for the given prefill shape.
 
@@ -450,16 +458,20 @@ def _get_or_capture_poc_graph(
     vector contents in-place — no re-capture needed.
     """
     cache = getattr(worker, "_poc_cuda_graphs", {})
-    key = (batch_size, seq_len)
+    # Per-layout key: pinned-slot prefill passes block_bases so each reserved slot
+    # gets its OWN fixed-layout graph (≤ poc_max_batch_size of them); the captured
+    # blocks always match that slot on replay, so Irene's _kv_snap stays valid.
+    key = (batch_size, seq_len,
+           "dyn" if dynamic else (tuple(block_bases) if block_bases else None))
     block_size = _get_block_size(worker)
     total_blocks = batch_size * math.ceil(seq_len / block_size)
 
-    if not _POC_CUDAGRAPH_ENABLED or worker.model_config.enforce_eager:
+    if worker.model_config.enforce_eager:
         # --enforce-eager: skip graph capture/replay entirely.
         # Create fresh metadata so inference-engine workspace corruption cannot
         # affect this call (same reason poc_attn_meta is created in the normal path).
         eager_meta, eager_slot = _create_v1_attn_metadata(
-            batch_size, seq_len, block_size, device, worker
+            batch_size, seq_len, block_size, device, worker, block_bases=block_bases
         )
         with set_forward_context(
             eager_meta, vllm_config,
@@ -492,10 +504,28 @@ def _get_or_capture_poc_graph(
         for b, poc_pw, poc_ws in zip(builders, poc_prefill_wrappers, poc_workspaces):
             b.set_workspace_buffer(poc_ws)
             b._prefill_wrapper = poc_pw
-        _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker)
+        _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker,
+                                 block_bases=block_bases)
+        # dynamic (bucketed mixed prefill): the re-plan above used THIS step's slots
+        # (block_bases), so the dedicated buffers + shared builder.paged_kv_indices
+        # already hold current blocks. Refresh the KV-write slot_mapping in-place and
+        # DON'T restore the capture-time snapshot (it would re-stale the read indices).
+        if dynamic:
+            _, cur_slot_map = _create_v1_attn_metadata(
+                batch_size, seq_len, block_size, device, worker,
+                block_bases=block_bases)
+            for ln, t in poc_slot_map.items():
+                t.copy_(cur_slot_map[ln])
         for b, ows, opw in zip(builders, orig_workspaces, orig_prefill_wrappers):
             b.set_workspace_buffer(ows)
             b._prefill_wrapper = opw
+
+        # Chat overwrites the SHARED builder.paged_kv_indices between PoC calls;
+        # the captured graph references it. Restore the capture-time snapshot
+        # (fixed-layout path only; dynamic re-planned current blocks above).
+        if not dynamic:
+            for b, saved in zip(builders, _kv_snap):
+                b.paged_kv_indices.gpu[:saved.shape[0]].copy_(saved)
 
         # FlashInfer plan() issues non-blocking H2D/D2D copies for the stable
         # paged_kv_indices_buf, paged_kv_indptr_buf, etc.  Even though they're on
@@ -539,18 +569,19 @@ def _get_or_capture_poc_graph(
     orig_prefill_wrappers = []
     poc_workspaces = []
     poc_prefill_wrappers = []
-    for b in builders:
+    # ONE dedicated FlashInfer workspace per builder, SHARED across ALL PoC prefill
+    # graphs (they replay sequentially, so the scratch is reusable). Allocating a
+    # fresh 2 GiB workspace per distinct batch size would cost 2 GiB * (#sizes) and
+    # OOM. The "batch invariant" size (2 GiB) is large enough for any PoC config.
+    shared_ws = getattr(worker, "_poc_prefill_workspaces", None)
+    if shared_ws is None or len(shared_ws) != len(builders):
+        shared_ws = [torch.zeros(
+            FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT,
+            dtype=torch.uint8, device=device) for _ in builders]
+        worker._poc_prefill_workspaces = shared_ws
+    for b, poc_ws in zip(builders, shared_ws):
         orig_workspaces.append(b._get_workspace_buffer())
         orig_prefill_wrappers.append(b._prefill_wrapper)
-        # PoC prefill batches are large (many tokens), so they need more
-        # FlashInfer workspace than the default per-request size.  Use the
-        # "batch invariant" size (2 GiB) that vLLM allocates for fixed-batch
-        # workloads — it's large enough for any realistic PoC configuration.
-        poc_ws = torch.zeros(
-            FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT,
-            dtype=torch.uint8,
-            device=device,
-        )
         b.set_workspace_buffer(poc_ws)
         poc_workspaces.append(poc_ws)
 
@@ -574,7 +605,7 @@ def _get_or_capture_poc_graph(
     # First plan(): populates poc_ws, the int workspace, and the stable paged_kv
     # buffers with PoC attention parameters.
     poc_attn_meta, poc_slot_map = _create_v1_attn_metadata(
-        batch_size, seq_len, block_size, device, worker
+        batch_size, seq_len, block_size, device, worker, block_bases=block_bases
     )
 
     with set_forward_context(
@@ -600,7 +631,7 @@ def _get_or_capture_poc_graph(
     # capture must start with these buffers in a valid plan state, not a
     # post-run state.
     poc_attn_meta, poc_slot_map = _create_v1_attn_metadata(
-        batch_size, seq_len, block_size, device, worker
+        batch_size, seq_len, block_size, device, worker, block_bases=block_bases
     )
 
     if not hasattr(worker, "_poc_prefill_graph_pool"):
@@ -620,6 +651,8 @@ def _get_or_capture_poc_graph(
                     positions=positions_buf,
                     inputs_embeds=embeds_buf,
                 )
+    # Proof of graph-mode execution (grep POC_GRAPH): captured once per batch bucket.
+    logger.info("POC_GRAPH prefill captured: batch=%d seq_len=%d", batch_size, seq_len)
 
     # Restore inference-engine workspace and wrapper before anything else runs.
     for b, ows, opw in zip(builders, orig_workspaces, orig_prefill_wrappers):
@@ -647,6 +680,35 @@ def _get_or_capture_poc_graph(
         batch_size, seq_len, num_tokens,
     )
     return None, warmup_hidden
+
+def poc_graphed_prefill_batch(worker, seq_len, max_tokens, inputs_embeds, slots):
+    """Graphed prefill for N step-driven decode-PoC requests on their reserved slots,
+    in ONE forward (parallel prefill — no serialization, no padding).
+
+    One graph per ACTUAL batch size N (keyed (N, seq_len, 'dyn')); dynamic mode
+    re-plans this step's slot block-bases into the dedicated stable buffers each
+    replay, so a cached graph is valid for any slot-set. Reuses Irene's prefill-graph
+    machinery (use_cuda_graph wrappers + dedicated workspace). inputs_embeds are the
+    SAME prefill embeddings the mixed path built (shape [N*seq_len, hidden]), so the
+    sphere_k artifacts are unchanged. Returns prefill hidden [N*seq_len, hidden]."""
+    from vllm.poc.mixed_decode import poc_per_slot_blocks
+    runner = getattr(worker, "model_runner", worker)
+    device, dtype = runner.device, runner.dtype
+    hidden_size = runner.model_config.get_hidden_size()
+    block_size = _get_block_size(worker)
+    n = len(slots)
+    per_slot = poc_per_slot_blocks(seq_len, max_tokens, block_size)
+    block_bases = [s * per_slot for s in slots]
+    embeds_buf, positions_buf = _get_poc_input_buffers(
+        worker, n, seq_len, hidden_size, device, dtype)
+    embeds_buf.copy_(inputs_embeds.reshape(n * seq_len, hidden_size).to(dtype))
+    attn_metadata, slot_mapping_dict = _create_v1_attn_metadata(
+        n, seq_len, block_size, device, worker, block_bases=block_bases)
+    _, hidden = _get_or_capture_poc_graph(
+        worker, n, seq_len, hidden_size, device, dtype, runner.vllm_config,
+        attn_metadata, slot_mapping_dict, embeds_buf, positions_buf,
+        block_bases=block_bases, dynamic=True)
+    return hidden
 
 def _get_poc_decode_input_buffers(worker, batch_size, hidden_size, device, dtype):
     """Pre-allocated (decode_embeds_buf, decode_pos_buf) for decode with stable addresses.
@@ -729,7 +791,7 @@ def _get_or_capture_poc_decode_graph(
     cache = getattr(worker, "_poc_decode_cuda_graphs", {})
     key = (batch_size, seq_len, step)
 
-    if not _POC_CUDAGRAPH_ENABLED or worker.model_config.enforce_eager:
+    if worker.model_config.enforce_eager:
         # --enforce-eager: run decode step eagerly without graph capture/replay.
         # dec_attn already has fresh plan() from _get_static_decode_attn_metadata.
         with set_forward_context(
@@ -790,6 +852,8 @@ def _get_or_capture_poc_decode_graph(
     captured_dec_hidden = (
         captured_dec_out[0] if isinstance(captured_dec_out, tuple) else captured_dec_out
     )
+    if step == 1:  # proof of decode graph-mode (grep POC_GRAPH); per-step graphs follow
+        logger.info("POC_GRAPH decode captured: batch=%d seq_len=%d", batch_size, seq_len)
     torch.cuda.synchronize()
 
     cache[key] = (graph, captured_dec_hidden)
@@ -978,6 +1042,16 @@ def execute_poc_forward(
 
         if clean_idx.numel() == 0:
             logger.error("All %d nonces produced NaN — batch rejected", batch_size)
+            # Chat activity can alias the PoC graph's static buffers/pool, poisoning
+            # it permanently. Drop ALL PoC graph state so the next call recaptures
+            # fresh (new pool + new input buffers).
+            for _a in ("_poc_cuda_graphs", "_poc_input_bufs", "_poc_attn_meta_cache",
+                       "_poc_decode_input_bufs", "_poc_decode_attn_meta_cache",
+                       "_poc_prefill_graph_pool", "_poc_graph_pool",
+                       "_poc_decode_cuda_graphs"):
+                if hasattr(worker, _a):
+                    delattr(worker, _a)
+            logger.warning("PoC graph state reset after NaN; next call recaptures fresh")
             return {"nonces": [], "vectors": np.empty((0, k_dim), dtype=np.float16)}
 
         last_hidden = last_hidden[clean_idx]
@@ -1163,7 +1237,6 @@ def execute_poc_forward(
     return {
         "nonces": nonces,
         "vectors": vectors_f16,
-        "sphere_k_list": nearest_k_points_list,
         "k_points_steps_list": k_points_steps_per_nonce,
         "mismatch_count": mismatch_count,
         "sph_indices_steps": sph_indices_per_nonce,

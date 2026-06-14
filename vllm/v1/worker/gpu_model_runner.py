@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -190,7 +191,9 @@ from vllm.poc.poc_model_runner import bypass_torch_compile
 from vllm.poc import mixed_decode
 from vllm.poc.mixed_decode import (
     POC_MIXED_DECODE,
+    POC_GRAPH_BUCKETS,
     PoCMixedDecodeManager,
+    poc_graph_bucket,
     poc_slot_block_ids,
 )
 
@@ -3505,22 +3508,20 @@ class GPUModelRunner(
                     req.poc_params.inference_k_points_steps
                     for req in poc_requests
                 ]
-                # Pad the PoC batch to a FIXED size (poc_max_batch_size) so the
-                # GEMM/attention kernels are shape-stable. Without this, a nonce
-                # computed in a batch of 3 vs 1 hits a different kernel -> tiny fp
-                # differences -> non-reproducible vectors (breaks honest
-                # validation). Padding nonces are negative (real nonces are >=0,
-                # so they never collide) and are dropped by the nonce->req_id map
-                # below; rows are independent in GEMM/attention so padding does
-                # not affect the real results. (Also makes cudagraph capture a
-                # single shape when re-enabled.)
+                # Pad the PoC batch to the nearest capture bucket (<= reserved
+                # poc_max_batch_size), one cudagraph per bucket. Few buckets keeps the
+                # captured-graph memory bounded; bit-exactness across buckets isn't
+                # required (validation tolerates boundary flips). Padding nonces are
+                # negative (never collide) and dropped by the nonce->req_id map.
                 poc_max_batch = self.cache_config.poc_max_batch_size
-                pad = poc_max_batch - len(nonces)
+                n_real = len(nonces)
+                bucket = poc_graph_bucket(n_real, POC_GRAPH_BUCKETS, poc_max_batch)
+                logger.info("POC_BATCH real=%d bucket=%d", n_real, bucket)  # bucket-tuning stats
+                pad = bucket - n_real
                 if pad > 0:
                     nonces = nonces + [-(i + 1) for i in range(pad)]
                     inference_steps = inference_steps + [None] * pad
-                poc_result = execute_poc_forward(
-                    self,
+                _poc_kwargs = dict(
                     block_hash=first_params.block_hash,
                     public_key=first_params.public_key,
                     nonces=nonces,
@@ -3536,6 +3537,13 @@ class GPUModelRunner(
                     ),
                     debug=any(req.poc_params.debug for req in poc_requests),
                 )
+                poc_result = execute_poc_forward(self, **_poc_kwargs)
+                # If chat aliased the cudagraph and every nonce came back NaN,
+                # execute_poc_forward reset the graph state; retry once so the
+                # client gets a valid result instead of an empty batch.
+                if nonces and not poc_result.get("nonces"):
+                    logger.warning("PoC all-NaN; retrying after graph reset")
+                    poc_result = execute_poc_forward(self, **_poc_kwargs)
 
                 if not get_pp_group().is_last_rank:
                     return poc_result
@@ -3546,7 +3554,6 @@ class GPUModelRunner(
                 nonce_to_req_id = {
                     req.poc_params.nonce: req.req_id for req in poc_requests
                 }
-                sphere_k_list = poc_result.get("sphere_k_list", [])
                 k_points_steps_list = poc_result.get("k_points_steps_list", [])
                 mismatch_count = poc_result.get("mismatch_count", [])
                 sph_indices_steps = poc_result.get("sph_indices_steps", [])
@@ -3562,7 +3569,6 @@ class GPUModelRunner(
                     poc_outputs_dict[req_id] = PoCOutput(
                         nonce=nonce,
                         vector_b64=encode_vector(vectors[j]),
-                        sphere_k=sphere_k_list[j] if sphere_k_list else -1,
                         k_points_steps=(
                             k_points_steps_list[j] if k_points_steps_list else []
                         ),
@@ -3659,6 +3665,26 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            # A uniform 1-token-decode mixed batch is graphable: dropping force_eager
+            # lets vLLM build+re-plan its stable cudagraph decode buffers each step, so
+            # the manual mixed graph reads fresh metadata on replay.
+            mixed_decode_graphable = (
+                (not self.model_config.enforce_eager)
+                and is_mixed_batch
+                and max_num_scheduled_tokens == self.uniform_decode_query_len
+                and num_tokens_unpadded == max_num_scheduled_tokens * num_reqs
+            )
+            # A real chat+PoC batch that is not uniform-decode means a prefill mix
+            # leaked past the scheduler gate (eager fallback). Key on real chat AND
+            # poc presence (is_mixed_batch is also True for step-driven pure-PoC).
+            _chat_and_poc = bool(poc_requests) and bool(chat_requests)
+            if (not self.model_config.enforce_eager) and _chat_and_poc and not mixed_decode_graphable:
+                logger.warning(
+                    "POC_CONTRACT_VIOLATION mixed-eager batch "
+                    "(num_reqs=%d max_query=%d unpadded=%d) — a prefill-mixed "
+                    "batch leaked past the scheduler decode-only gate",
+                    num_reqs, max_num_scheduled_tokens, num_tokens_unpadded)
+
             (
                 cudagraph_mode,
                 batch_desc,
@@ -3671,14 +3697,9 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
-                # PoC unified batches MUST run eager: mask-mode Householder hooks
-                # return fresh tensors and the decode reads reserved-block KV —
-                # neither is cudagraph-safe. Forcing eager HERE (before padding is
-                # decided) keeps the attention metadata unpadded so it matches the
-                # unpadded unified batch built later. Deciding eager after padding
-                # left the decode metadata rounded up to a graph size (e.g. 3 reqs
-                # -> 4) while the eager forward had only 3 rows -> crash.
-                force_eager=is_mixed_batch,
+                # Mixed batches run eager (decided before padding so attn metadata
+                # matches the unpadded batch) UNLESS graphable (see above).
+                force_eager=is_mixed_batch and not mixed_decode_graphable,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
@@ -3808,9 +3829,22 @@ class GPUModelRunner(
 
                 if unified_embeds is not None:
                     input_ids = None
-                    inputs_embeds = unified_embeds
-                    positions = unified_positions
                     num_input_tokens = unified_embeds.shape[0]
+                    if (not self.model_config.enforce_eager):
+                        # Write unified inputs into the persistent (graph-replayed)
+                        # buffers, padded to the graph width with passthrough zeros.
+                        n = num_input_tokens
+                        width = num_tokens_padded
+                        self.inputs_embeds.gpu[:n].copy_(unified_embeds)
+                        self.positions.gpu[:n].copy_(unified_positions)
+                        if width > n:
+                            self.inputs_embeds.gpu[n:width].zero_()
+                            self.positions.gpu[n:width].zero_()
+                        inputs_embeds = self.inputs_embeds.gpu[:width]
+                        positions = self.positions.gpu[:width]
+                    else:
+                        inputs_embeds = unified_embeds
+                        positions = unified_positions
 
                     if poc_position_mask is not None and attn_metadata is not None:
                         mixed_decode.apply_poc_kv_skip(
@@ -3825,7 +3859,7 @@ class GPUModelRunner(
             # metadata is built unpadded). cudagraph_mode is therefore already
             # NONE here for PoC batches; assert rather than override late (a late
             # override leaves the metadata padded to a graph size -> row mismatch).
-            if poc_position_mask is not None:
+            if poc_position_mask is not None and not (not self.model_config.enforce_eager):
                 assert cudagraph_mode == CUDAGraphMode.NONE, (
                     "PoC batch must be eager from _determine "
                     f"(force_eager), got {cudagraph_mode}"
@@ -3856,65 +3890,116 @@ class GPUModelRunner(
         # Use persistent buffers for CUDA graphs.
         from contextlib import nullcontext
 
-        # Tear down PoC layer hooks on a non-PoC (plain chat) forward. Use a
-        # value check, not hasattr: the attribute persists as None after a prior
-        # teardown, and None.detach() would crash the next chat forward.
-        if poc_position_mask is None and getattr(self, '_poc_layer_hooks', None) is not None:
-            self._poc_layer_hooks.detach()
-            self._poc_layer_hooks = None
+        if (not self.model_config.enforce_eager):
+            # Graph mode: the persistent hook stays attached (it is baked into the
+            # captured graph); drive the transform via the stable mask buffer
+            # (all-False = chat, PoC positions = mixed) and refresh the reflection
+            # vectors for this round's block_hash. No context / no compile bypass
+            # (we WANT the graph).
+            if getattr(self, '_poc_stable_mask_buf', None) is None:
+                # Lazy: attach the (flag-gated, chat-safe) persistent hook + stable
+                # mask buffer on the first mixed-cudagraph forward.
+                self._setup_poc_mixed_graph_hooks()
+            buf = self._poc_stable_mask_buf
+            if poc_position_mask is not None and poc_metadata:
+                bh = poc_metadata[0]['poc_params'].block_hash
+                hooks = getattr(self, '_poc_layer_hooks', None)
+                if hooks is not None and hooks.block_hash != bh:
+                    hooks.update_block_hash(
+                        bh, self.model_config.get_hidden_size(), self.device)
+                    hooks.block_hash = bh
+                n = poc_position_mask.shape[0]
+                buf[:n].copy_(poc_position_mask)
+                buf[n:].zero_()
+            else:
+                buf.zero_()
+            poc_context = nullcontext()
+            compile_bypass = nullcontext()
+        else:
+            # Eager mixed path (default). Tear down hooks on a plain-chat forward;
+            # (re)build per block_hash for a PoC forward; drive the transform via
+            # the context mask and bypass torch.compile.
+            if poc_position_mask is None and getattr(self, '_poc_layer_hooks', None) is not None:
+                self._poc_layer_hooks.detach()
+                self._poc_layer_hooks = None
 
-        if poc_position_mask is not None and poc_metadata:
-            first_poc_params = poc_metadata[0]['poc_params']
-            block_hash = first_poc_params.block_hash
-            hidden_size = self.model_config.get_hidden_size()
+            if poc_position_mask is not None and poc_metadata:
+                block_hash = poc_metadata[0]['poc_params'].block_hash
+                hidden_size = self.model_config.get_hidden_size()
+                cached_hooks = getattr(self, '_poc_layer_hooks', None)
+                if cached_hooks is None or cached_hooks.block_hash != block_hash:
+                    if cached_hooks is not None:
+                        cached_hooks.detach()
+                    cached_hooks = LayerHouseholderHook(
+                        self.model, block_hash, self.device, hidden_size
+                    )
+                    self._poc_layer_hooks = cached_hooks
 
-            cached_hooks = getattr(self, '_poc_layer_hooks', None)
-            if cached_hooks is None or cached_hooks.block_hash != block_hash:
-                if cached_hooks is not None:
-                    cached_hooks.detach()
-                cached_hooks = LayerHouseholderHook(
-                    self.model, block_hash, self.device, hidden_size
-                )
-                self._poc_layer_hooks = cached_hooks
-
-        poc_context = (
-            poc_forward_context_with_mask(poc_position_mask)
-            if poc_position_mask is not None
-            else nullcontext()
-        )
-
-        compile_bypass = (
-            bypass_torch_compile()
-            if poc_position_mask is not None
-            else nullcontext()
-        )
+            poc_context = (
+                poc_forward_context_with_mask(poc_position_mask)
+                if poc_position_mask is not None
+                else nullcontext()
+            )
+            compile_bypass = (
+                bypass_torch_compile()
+                if poc_position_mask is not None
+                else nullcontext()
+            )
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            poc_context,
-            compile_bypass,
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+        if (not self.model_config.enforce_eager) and is_mixed_batch and poc_position_mask is not None:
+            # B: fused mixed cudagraph. Manual skip_compiled capture so the
+            # flag-gated Householder where-blend bakes into the graph (no dynamo);
+            # attention reuses vLLM's stable decode buffers. reset+retry on NaN.
+            # Decode mixed batches graph here; a pure-PoC prefill step (scheduler
+            # makes prefill exclusive) is graphed per-N by poc_graphed_prefill_batch.
+            kv_connector_output = None
+            graphable = cudagraph_mode != CUDAGraphMode.NONE
+            poc_meta = (self._mixed_batch_info or {}).get("poc_metadata") or []
+            prefill_metas = [m for m in poc_meta if "decode_step" not in m]
+            if (not graphable) and poc_meta \
+                    and len(prefill_metas) == len(poc_meta) \
+                    and all(m.get("decode_state") is not None for m in prefill_metas) \
+                    and bool(poc_position_mask.all()):
+                from vllm.poc.poc_model_runner import poc_graphed_prefill_batch
+                prefill_metas.sort(key=lambda m: m["start_idx"])
+                pp0 = prefill_metas[0]["poc_params"]
+                slots = [m["decode_state"].slot for m in prefill_metas]
+                model_output = poc_graphed_prefill_batch(
+                    self, pp0.seq_len, pp0.max_tokens,
+                    inputs_embeds[:len(slots) * pp0.seq_len], slots)
+            else:
+                model_output = self._poc_mixed_graph_forward(
+                    inputs_embeds, positions, attn_metadata, slot_mappings,
+                    num_tokens_padded, num_tokens_across_dp,
+                    graphable=graphable,
+                )
+        else:
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=has_encoder_input,
+                ),
+                poc_context,
+                compile_bypass,
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -5450,6 +5535,127 @@ class GPUModelRunner(
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+
+    def _setup_poc_mixed_graph_hooks(self) -> None:
+        # Attach a persistent Householder hook + a stable all-False position-mask
+        # buffer BEFORE capture, so warmup forwards record the where-blend into
+        # the graph (replay can't run Python hooks).
+        from vllm.poc.layer_hooks import set_stable_poc_mask
+        buf = torch.zeros(self.max_num_tokens, dtype=torch.bool, device=self.device)
+        self._poc_stable_mask_buf = buf
+        set_stable_poc_mask(buf)
+        if getattr(self, '_poc_layer_hooks', None) is None:
+            self._poc_layer_hooks = LayerHouseholderHook(
+                self.model, "poc_graph_capture_default",
+                self.device, self.model_config.get_hidden_size())
+
+    def _poc_mixed_graph_forward(self, inputs_embeds, positions, attn_metadata,
+                                 slot_mappings, num_tokens, num_tokens_across_dp,
+                                 graphable=True):
+        """Manual capture/replay of the mixed forward (skip_compiled bakes the mask
+        hook's where-blend). graphable=False (PoC prefill) runs eager, never captured.
+        See wiki: mixed-prefill-cudagraph-illegal-access-only-decode-graphable."""
+        from vllm.poc.layer_hooks import set_manual_capture_active
+        cache = getattr(self, "_poc_mixed_cuda_graphs", {})
+        key = int(num_tokens)
+        model = self.model
+
+        def _ctx():
+            return set_forward_context(
+                attn_metadata, self.vllm_config,
+                num_tokens=num_tokens, num_tokens_across_dp=num_tokens_across_dp,
+                slot_mapping=slot_mappings, skip_compiled=True,
+            )
+
+        def _fwd():
+            return model(input_ids=None, positions=positions,
+                         intermediate_tensors=None, inputs_embeds=inputs_embeds)
+
+        if not graphable:
+            # Non-graphable (PoC prefill): eager, NEVER captured — see docstring.
+            set_manual_capture_active(True)
+            try:
+                with _ctx():
+                    out = _fwd()
+            finally:
+                set_manual_capture_active(False)
+            return out[0] if isinstance(out, tuple) else out
+
+        if key not in cache:
+            # Opt-in graph audit (VLLM_POC_GRAPH_DUMP=<dir>).
+            _dump_dir = os.environ.get("VLLM_POC_GRAPH_DUMP")
+            set_manual_capture_active(True)
+            try:
+                if _dump_dir:
+                    # Profile the warmup forward (the same _fwd() that gets captured,
+                    # so its kernel count == the graph content). Profiling an extra
+                    # replay would double-write KV.
+                    from torch.profiler import profile as _prof, ProfilerActivity as _PA
+                    with _prof(activities=[_PA.CUDA]) as _pr:
+                        with _ctx():
+                            warm = _fwd()
+                        torch.cuda.synchronize()
+                    _hist = defaultdict(int)
+                    for _e in _pr.events():
+                        if str(getattr(_e, "device_type", "")).endswith("CUDA"):
+                            _hist[_e.name] += 1
+                    _k = sum(_hist.values())
+                    # Kernel histogram (count<TAB>name) for benchmarks/poc/graph_report.py.
+                    try:
+                        os.makedirs(_dump_dir, exist_ok=True)
+                        with open(os.path.join(_dump_dir,
+                                  f"mixed_{int(num_tokens)}.kernels.txt"), "w") as _f:
+                            for _name, _c in sorted(_hist.items(), key=lambda kv: -kv[1]):
+                                _f.write(f"{_c}\t{_name}\n")
+                    except Exception as _ex:
+                        logger.warning("POC_GRAPH_AUDIT write failed: %s", _ex)
+                    logger.info("POC_GRAPH_AUDIT mixed_%d: %d kernels, %d distinct "
+                                "(== captured graph content)", int(num_tokens), _k, len(_hist))
+                else:
+                    with _ctx():
+                        warm = _fwd()
+                    torch.cuda.synchronize()
+                warm_hidden = (warm[0] if isinstance(warm, tuple) else warm).clone()
+                if not hasattr(self, "_poc_mixed_graph_pool"):
+                    self._poc_mixed_graph_pool = torch.cuda.graph_pool_handle()
+                g = torch.cuda.CUDAGraph()
+                if _dump_dir:
+                    try:
+                        g.enable_debug_mode()  # required for debug_dump (driver permitting)
+                    except Exception:
+                        pass
+                with _ctx():
+                    with torch.cuda.graph(g, pool=self._poc_mixed_graph_pool):
+                        out = _fwd()
+            finally:
+                set_manual_capture_active(False)
+            captured = out[0] if isinstance(out, tuple) else out
+            cache[key] = (g, captured)
+            self._poc_mixed_cuda_graphs = cache
+            logger.info("POC_GRAPH mixed captured: num_tokens=%d", int(num_tokens))
+            if _dump_dir:
+                # Graphviz DAG (cudaGraphDebugDotPrint); no-op on some drivers.
+                try:
+                    os.makedirs(_dump_dir, exist_ok=True)
+                    path = os.path.join(_dump_dir, f"mixed_{int(num_tokens)}.dot")
+                    g.debug_dump(path)
+                    if os.path.exists(path):
+                        logger.info("POC_GRAPH_DUMP wrote %s", path)
+                except Exception as e:
+                    logger.warning("POC_GRAPH_DUMP failed: %s", e)
+            return warm_hidden  # first call: eager warmup result
+        g, captured = cache[key]
+        with _ctx():
+            g.replay()
+        self._poc_mixed_replays = getattr(self, "_poc_mixed_replays", 0) + 1
+        if self._poc_mixed_replays % 64 == 0:
+            logger.info("POC_GRAPH mixed replays=%d", self._poc_mixed_replays)
+        if torch.isnan(captured).any():
+            # Chat aliased the graph → drop it so the next step recaptures fresh.
+            for _a in ("_poc_mixed_cuda_graphs", "_poc_mixed_graph_pool"):
+                if hasattr(self, _a):
+                    delattr(self, _a)
+        return captured
 
     def capture_model(self) -> int:
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:

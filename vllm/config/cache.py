@@ -184,6 +184,11 @@ class CacheConfig:
     prefill-only. Used to size the reserved KV cache block range so decode
     steps have space without overlapping chat blocks."""
 
+    poc_share: float = Field(default=0.5, ge=0.0, le=1.0)
+    """Fraction of each scheduler step's token budget PoC may consume; chat gets
+    the rest. Explicit knob over the chat<->PoC mix: 1.0 = PoC greedy, 0.0 = chat
+    only (PoC paused), 0.5 = even split. Prevents PoC from starving chat."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -210,6 +215,7 @@ class CacheConfig:
             "poc_max_batch_size",
             "poc_seq_len",
             "poc_max_tokens",
+            "poc_share",
             # Post-init/derived counters
             "num_gpu_blocks",
             "num_cpu_blocks",

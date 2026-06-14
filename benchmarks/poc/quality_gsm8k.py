@@ -64,53 +64,50 @@ async def _poc_sender_loop(
     nonces_per_request: int = 32,
     poc_timeout: int = 600,
 ) -> None:
-    """Continuously send PoC requests until *stop_event* is set.
+    """Maintain *requests_per_interval* PoC requests IN FLIGHT continuously until
+    *stop_event*.
 
-    Each request carries ``nonces_per_request`` nonces (prod PoC batch = 32),
-    and ``requests_per_interval`` such requests fire concurrently per interval.
+    Each of N workers fires a request, records it, and immediately fires the next —
+    so exactly N PoC requests co-exist with gsm8k at all times (no interval gaps, no
+    pile-up). ``interval_seconds`` is kept for signature compatibility but unused.
     """
-    nonce_counter = 0
-    request_count = 0
+    n_inflight = requests_per_interval
+    counters = {"nonce": 0, "req": 0}
     print(
-        f"[PoC] Starting "
-        f"(interval={interval_seconds}s, {requests_per_interval} req/interval)\n"
+        f"[PoC] Continuous load: {n_inflight} requests in flight "
+        f"({nonces_per_request} nonce(s) x {max_tokens} decode steps each)\n"
     )
 
-    while not stop_event.is_set():
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
-            break
-        except asyncio.TimeoutError:
-            pass
-
-        batch_start = request_count + 1
-        tasks = []
-        for _ in range(requests_per_interval):
-            nonces = list(range(nonce_counter, nonce_counter + nonces_per_request))
-            nonce_counter += nonces_per_request
-            request_count += 1
-            tasks.append((request_count, f"block_{request_count}", nonces))
-
-        print(f"[PoC] Sending batch #{batch_start}–{request_count}")
-        results = await asyncio.gather(*[
-            _send_poc_request(base_url, model, block_hash, nonces,
-                              max_tokens=max_tokens, timeout=poc_timeout)
-            for _, block_hash, nonces in tasks
-        ])
-
-        for (req_id, block_hash, nonces), (result, elapsed) in zip(tasks, results):
+    async def worker():
+        while not stop_event.is_set():
+            nonces = list(range(counters["nonce"],
+                                counters["nonce"] + nonces_per_request))
+            counters["nonce"] += nonces_per_request
+            counters["req"] += 1
+            rid = counters["req"]
+            result, elapsed = await _send_poc_request(
+                base_url, model, f"block_{rid}", nonces,
+                max_tokens=max_tokens, timeout=poc_timeout)
+            ok = bool(result) and "error" not in result
             poc_artifacts.append({
-                "request_id": req_id,
+                "request_id": rid,
                 "timestamp": time.time(),
-                "block_hash": block_hash,
+                "block_hash": f"block_{rid}",
                 "nonces": nonces,
                 "result": result,
                 "elapsed_time": elapsed,
+                "ok": ok,
             })
             poc_times.append(elapsed)
+            if len(poc_artifacts) % 16 == 0:
+                done = sum(1 for a in poc_artifacts if a.get("ok"))
+                print(f"[PoC] {len(poc_artifacts)} requests done, {done} OK")
 
-        success = sum(1 for r, _ in results if r and "error" not in r)
-        print(f"[PoC] Batch done: {success}/{len(results)} OK\n")
+    workers = [asyncio.create_task(worker()) for _ in range(n_inflight)]
+    await stop_event.wait()
+    for w in workers:
+        w.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
 
     print(f"[PoC] Stopped: {len(poc_artifacts)} requests sent")
 
@@ -259,7 +256,8 @@ async def _run_eval(args: argparse.Namespace) -> int:
     if args.disable_poc:
         print("PoC       : Disabled")
     else:
-        print(f"PoC       : interval={args.poc_interval}s, {args.poc_requests} req/interval")
+        print(f"PoC       : {args.poc_requests} requests in flight (continuous), "
+              f"{args.poc_nonces} nonce(s) x {args.max_tokens} steps each")
     print(f"Output    : {run_output_path}")
     print("=" * 80)
     print()
@@ -343,19 +341,21 @@ async def _run_eval(args: argparse.Namespace) -> int:
                 print()
 
         if poc_artifacts:
+            n_ok = sum(1 for a in poc_artifacts if a.get("ok"))
+            nonces_done = sum(
+                len(a["nonces"]) for a in poc_artifacts if a.get("ok"))
+            nonces_per_sec = nonces_done / elapsed if elapsed > 0 else 0.0
             run_stats["poc_requests_sent"] = len(poc_artifacts)
-            run_stats["poc_requests_successful"] = sum(
-                1 for a in poc_artifacts if "error" not in a["result"]
-            )
+            run_stats["poc_requests_successful"] = n_ok
+            run_stats["poc_nonces_processed"] = nonces_done
+            run_stats["poc_nonces_per_sec"] = nonces_per_sec
             if poc_times:
                 run_stats["poc_median_time"] = float(np.median(poc_times))
-                run_stats["poc_mean_time"] = float(np.mean(poc_times))
-                run_stats["poc_min_time"] = float(np.min(poc_times))
-                run_stats["poc_max_time"] = float(np.max(poc_times))
-                print(f"PoC sent:        {run_stats['poc_requests_sent']}")
-                print(f"PoC successful:  {run_stats['poc_requests_successful']}")
-                print(f"PoC median time: {run_stats['poc_median_time']:.3f}s")
-                print()
+            print(f"PoC absolute time:   {elapsed:.1f}s")
+            print(f"PoC requests OK:     {n_ok}/{len(poc_artifacts)}")
+            print(f"PoC nonces processed:{nonces_done}")
+            print(f"PoC NONCES/SEC:      {nonces_per_sec:.3f}")
+            print()
 
             artifacts_file = run_output_path / "poc_artifacts.json"
             artifacts_file.write_text(json.dumps(poc_artifacts, indent=2))

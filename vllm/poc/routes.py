@@ -92,7 +92,6 @@ class NonceIterator:
 class ArtifactModel(BaseModel):
     nonce: int
     vector_b64: str
-    sphere_k: Optional[int] = None
     k_points_steps: Optional[List[int]] = None
     n_sphere_mismatches: Optional[int] = None
     sph_indices_steps: Optional[List[List[int]]] = None

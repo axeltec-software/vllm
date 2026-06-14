@@ -130,22 +130,21 @@ def fetch_both(
 
 
 def parse_artifacts(resp: dict) -> Dict[int, int]:
-    """Extract {nonce: sphere_k} from a server response.
+    """Extract {nonce: prefill_k} from a server response.
 
-    sphere_k is returned directly by the server — no client-side
-    vector decoding or geometry is needed.
+    The prefill k is k_points_steps[0] (the scalar sphere_k field was dropped).
     """
     items = resp if isinstance(resp, list) else resp.get("artifacts", resp.get("results", []))
     out: Dict[int, int] = {}
     for item in items:
-        nonce   = item.get("nonce")
-        sphere_k = item.get("sphere_k", -1)
+        nonce = item.get("nonce")
+        steps = item.get("k_points_steps") or []
         if nonce is None:
             continue
-        if sphere_k == -1:
-            print(f"  WARNING: nonce={nonce} has sphere_k=-1 (server may not support it)",
+        if not steps:
+            print(f"  WARNING: nonce={nonce} has no k_points_steps",
                   file=sys.stderr)
-        out[nonce] = sphere_k
+        out[nonce] = steps[0] if steps else -1
     return out
 
 

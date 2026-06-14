@@ -73,7 +73,6 @@ async def compute_nonce_artifacts(
                 artifact = {
                     "nonce": get("nonce", nonce),
                     "vector_b64": get("vector_b64", ""),
-                    "sphere_k": get("sphere_k", -1),
                     "k_points_steps": get("k_points_steps", []),
                     "n_sphere_mismatches": get("n_sphere_mismatches", -1),
                 }

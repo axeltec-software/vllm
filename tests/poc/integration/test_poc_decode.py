@@ -80,25 +80,20 @@ class TestDecodeStepStructure:
                     f"k={k} out of [0, {SPHERE_POINTS})"
                 )
 
-    def test_sphere_k_present_with_decode(self, url):
-        """Prefill sphere_k is present, in range, and equals k_points_steps[0].
+    def test_prefill_k_present_with_decode(self, url):
+        """The prefill k is k_points_steps[0], present and in range.
 
-        The consolidated API exposes both the scalar ``sphere_k`` (prefill
-        codebook index) and the per-step ``k_points_steps``
-        ([prefill_k, decode1_k, ...]). sphere_k is the fundamental decode-PoC
-        artifact and must equal k_points_steps[0].
+        The scalar ``sphere_k`` field was dropped (it was just a redundant copy of
+        k_points_steps[0]); the per-step ``k_points_steps`` ([prefill_k, decode1_k,
+        ...]) is the decode-PoC artifact. Also assert sphere_k is GONE.
         """
         data = _poc_with_decode(url, "0xdecode_sphere_k", [1, 2], max_tokens=3)
         for artifact in data["artifacts"]:
             steps = artifact.get("k_points_steps", [])
             assert steps, f"Artifact nonce={artifact['nonce']} missing k_points_steps"
             assert 0 <= steps[0] < SPHERE_POINTS
-            sphere_k = artifact.get("sphere_k")
-            assert sphere_k is not None, \
-                f"Artifact nonce={artifact['nonce']} missing scalar sphere_k"
-            assert sphere_k == steps[0], (
-                f"sphere_k ({sphere_k}) must equal k_points_steps[0] ({steps[0]})"
-            )
+            assert "sphere_k" not in artifact, \
+                "scalar sphere_k should be dropped from the response"
 
 
 @pytest.mark.integration

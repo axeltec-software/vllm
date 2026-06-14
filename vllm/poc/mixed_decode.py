@@ -34,6 +34,47 @@ logger = init_logger(__name__)
 # truth, imported by scheduler.py and gpu_model_runner.py.
 POC_MIXED_DECODE = os.environ.get("VLLM_POC_MIXED_DECODE", "1") != "0"
 
+# Bound on consecutive chat-prefill defers before a decoding PoC is forced an
+# exclusive step (fairness valve — keeps PoC from starving under chat churn).
+POC_DEFER_LIMIT = 4
+
+# Pure-PoC cudagraph capture buckets: a PoC batch is padded up to the nearest of
+# these (capped at poc_max_batch_size), one cudagraph per bucket. Few buckets keep
+# captured-graph memory bounded. Tune from observed batch sizes (POC_BATCH logs).
+POC_GRAPH_BUCKETS = (8, 16, 32)
+
+
+def poc_graph_bucket(n: int, buckets=POC_GRAPH_BUCKETS, max_batch: int = 32) -> int:
+    """Smallest capture bucket >= n (capped at max_batch). Pure — unit-tested."""
+    return min(next((b for b in buckets if b >= n), max_batch), max_batch)
+
+
+def decode_only_mixing_gate(
+    *,
+    mixed_cudagraph: bool,
+    poc_decode_pending: bool,
+    poc_will_prefill: bool,
+    chat_will_prefill: bool,
+    consecutive_defers: int,
+    defer_limit: int = POC_DEFER_LIMIT,
+) -> tuple[bool, bool, int]:
+    """Decide (defer_chat, defer_poc, consecutive_defers) so chat and PoC share a
+    forward only when both decode; prefills run isolated. Mutually exclusive defers.
+    Pure (unit-testable). With mixed_cudagraph=False reduces to the original
+    behaviour (defer_chat=poc_decode_pending, defer_poc=False). The valve bounds
+    consecutive chat-prefill defers so chat churn can't starve a decoding PoC.
+    """
+    defer_chat = poc_decode_pending or (mixed_cudagraph and poc_will_prefill)
+    defer_poc = mixed_cudagraph and (not defer_chat) and chat_will_prefill
+    if defer_poc:
+        consecutive_defers += 1
+        if consecutive_defers > defer_limit:
+            # Give the decoding PoC one exclusive (pure-decode, graphable) step.
+            defer_poc, defer_chat, consecutive_defers = False, True, 0
+    else:
+        consecutive_defers = 0
+    return defer_chat, defer_poc, consecutive_defers
+
 
 def poc_per_slot_blocks(poc_seq_len: int, poc_max_tokens: int,
                         block_size: int) -> int:
@@ -141,7 +182,13 @@ def setup_decode_poc(runner, poc_requests) -> bool:
     """
     if not POC_MIXED_DECODE:
         return False
-    decode_reqs = [r for r in poc_requests if r.poc_params.max_tokens > 0]
+    # Exclude VALIDATION recompute requests: the step-driven mixed path does not
+    # consume inference_k_points_steps, so they must fall through to the pure
+    # execute_poc_forward (which computes the real aligned n_sphere_mismatches).
+    # The scheduler already routes them as a pure batch; this guards the
+    # model-runner side so they are never slotted for mixed decode.
+    decode_reqs = [r for r in poc_requests
+                   if r.poc_params.max_tokens > 0 and not r.poc_params.is_validation]
     if not decode_reqs:
         return False
     mgr = get_decode_manager(runner)
@@ -392,7 +439,6 @@ def process_poc_outputs_from_hidden(
                 poc_outputs[meta['req_id']] = PoCOutput(
                     nonce=nonce,
                     vector_b64=st.vector_b64,
-                    sphere_k=st.k_points_steps[0],
                     k_points_steps=st.k_points_steps,
                 )
                 get_decode_manager(runner).free(meta['req_id'])
