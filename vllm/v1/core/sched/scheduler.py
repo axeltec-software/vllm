@@ -418,7 +418,9 @@ class Scheduler(SchedulerInterface):
                 for r in self.running)
             or any(r.poc_params is None for r in self.waiting)
         )
-        from vllm.poc.mixed_decode import decode_only_mixing_gate
+        from vllm.poc.mixed_decode import (
+            decode_only_mixing_gate, poc_step_num_tokens, poc_alloc_footprint,
+        )
         defer_chat, defer_poc, self._poc_consecutive_defers = decode_only_mixing_gate(
             mixed_cudagraph=not self.vllm_config.model_config.enforce_eager,
             poc_decode_pending=poc_decode_pending,
@@ -459,18 +461,8 @@ class Scheduler(SchedulerInterface):
                     req_index += 1
                     continue
                 pp = request.poc_params
-                if pp.max_tokens > 0 and not pp.is_validation:
-                    # Step-driven mixed decode: prefill once (seq_len tokens),
-                    # then ONE decode token per step until seq_len+max_tokens
-                    # tokens are computed. Runs mixed with chat.
-                    # Validation recompute is excluded (runs pure — see above).
-                    num_new_tokens = (
-                        pp.seq_len if request.num_computed_tokens == 0 else 1
-                    )
-                else:
-                    # Prefill-only, or Phase-1 pure decode (whole loop in one
-                    # execute_poc_forward step): a single seq_len step.
-                    num_new_tokens = pp.seq_len
+                num_new_tokens = poc_step_num_tokens(
+                    pp, request.num_computed_tokens)
                 # poc_share cap: defer once PoC has used its slice of the budget.
                 if poc_tokens_scheduled + num_new_tokens > poc_token_budget:
                     req_index += 1
@@ -480,13 +472,8 @@ class Scheduler(SchedulerInterface):
                         # Dynamic KV: allocate real (paged) blocks via the manager,
                         # like chat. None => no free blocks: PoC DEFERS (never
                         # preempts chat); the floor reservation guarantees progress.
-                        # The pure path (validation / phase-1) runs the WHOLE decode
-                        # loop in one step, so allocate its full seq_len+max_tokens
-                        # footprint upfront (vs the step-driven mixed path's 1/step).
-                        _pure = not (pp.max_tokens > 0 and not pp.is_validation)
-                        _alloc = (pp.seq_len + pp.max_tokens) if _pure else num_new_tokens
                         poc_blocks = self.kv_cache_manager.allocate_slots(
-                            request, _alloc,
+                            request, poc_alloc_footprint(pp, num_new_tokens),
                             num_lookahead_tokens=self.num_lookahead_tokens,
                         )
                         if poc_blocks is None:
@@ -737,7 +724,9 @@ class Scheduler(SchedulerInterface):
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
-                    num_new_tokens = request.poc_params.seq_len
+                    _pp = request.poc_params
+                    num_new_tokens = poc_step_num_tokens(
+                        _pp, request.num_computed_tokens)
                     # poc_share cap: defer once PoC has used its slice of the budget.
                     if poc_tokens_scheduled + num_new_tokens > poc_token_budget:
                         self.waiting.pop_request()
@@ -746,14 +735,9 @@ class Scheduler(SchedulerInterface):
                     if num_new_tokens <= token_budget:
                         if poc_dynamic_kv:
                             # Dynamic KV: allocate paged blocks via the manager;
-                            # None => defer (PoC waits, never preempts chat). Pure
-                            # path (validation / phase-1) runs the whole decode loop
-                            # in one step -> allocate full seq_len+max_tokens upfront.
-                            _pp = request.poc_params
-                            _pure = not (_pp.max_tokens > 0 and not _pp.is_validation)
-                            _alloc = (_pp.seq_len + _pp.max_tokens) if _pure else num_new_tokens
+                            # None => defer (PoC waits, never preempts chat).
                             poc_blocks = self.kv_cache_manager.allocate_slots(
-                                request, _alloc,
+                                request, poc_alloc_footprint(_pp, num_new_tokens),
                                 num_lookahead_tokens=self.num_lookahead_tokens,
                             )
                             if poc_blocks is None:
