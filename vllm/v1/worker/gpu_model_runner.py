@@ -190,7 +190,6 @@ from vllm.poc.layer_hooks import poc_forward_context_with_mask, LayerHouseholder
 from vllm.poc.poc_model_runner import bypass_torch_compile
 from vllm.poc import mixed_decode
 from vllm.poc.mixed_decode import (
-    POC_MIXED_DECODE,
     POC_GRAPH_BUCKETS,
     PoCMixedDecodeManager,
     poc_graph_bucket,

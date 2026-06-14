@@ -2,11 +2,11 @@
 must run a PoC decode concurrently with SUSTAINED chat (>=N_CHATS) WITHOUT hanging
 and WITHOUT corrupting the PoC computation.
 
-This is the test that was MISSING when Path B was wrongly called "validated":
-- test_mixed_decode_concurrent_chat.py only sets VLLM_POC_MIXED_DECODE (eager mixed),
-  never the CUDAGRAPH flag, and uses 3 nonces / 4 fire-once chats — too light.
+This is the test that was MISSING when the fused mixed cudagraph was wrongly
+called "validated":
+- test_mixed_decode_concurrent_chat.py uses 3 nonces / 4 fire-once chats — too light.
 - The cudagraph path captured against step-0 attention metadata and never re-planned
-  (force_eager was True even under the flag), so it went stale every step ->
+  (force_eager was True), so it went stale every step ->
   recapture-each-step -> CUDA capture DEADLOCK under concurrency (n>=16) -> the PoC
   forward never returns (HANG). Fix: graphable uniform-decode mixed batches drop
   force_eager so vLLM builds + re-plans the STABLE cudagraph decode buffers per step.
@@ -55,7 +55,7 @@ def graph_server():
     """Mixed decode WITH the fused cudagraph flag ON — the path under test."""
     with PoCTestServer(
         MODEL, BASE_ARGS,
-        env_dict={"VLLM_POC_MIXED_DECODE": "1"},
+        
     ) as srv:
         yield srv
 

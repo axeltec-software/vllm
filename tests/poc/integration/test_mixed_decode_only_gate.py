@@ -47,7 +47,7 @@ def _poc_body(bh, infk=None):
 def graph_server():
     with PoCTestServer(
         MODEL, BASE_ARGS,
-        env_dict={"VLLM_POC_MIXED_DECODE": "1"},
+        
     ) as srv:
         yield srv
 

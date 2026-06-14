@@ -61,12 +61,10 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
-# Phase 2: step-driven mixed decode-PoC. When ON, a decode-PoC request stays
-# running for prefill + max_tokens decode steps (1 decode token/step), mixed with
-# chat in the same forward, instead of running its whole decode loop inside one
-# pure-batch execute_poc_forward call. Default ON (set VLLM_POC_MIXED_DECODE=0 to
-# disable). OFF = Phase-1 behavior (decode-PoC pure, chat deferred while it runs).
-_POC_MIXED_DECODE = os.environ.get("VLLM_POC_MIXED_DECODE", "1") != "0"
+# Step-driven mixed decode-PoC: a decode-PoC request stays running for prefill +
+# max_tokens decode steps (1 decode token/step), mixed with chat in the same
+# forward. This is the only decode-PoC mode (the old pure-batch whole-loop fallback,
+# which froze chat, was removed). Validation still runs pure (aligned mismatch).
 
 
 class Scheduler(SchedulerInterface):
@@ -382,12 +380,11 @@ class Scheduler(SchedulerInterface):
         # (Phase 2 will make decode-PoC step-driven so it can mix too.)
         def _is_decode_poc(r):
             return r.poc_params is not None and r.poc_params.max_tokens > 0
-        # A decode-PoC runs as a pure (exclusive) batch when mixed decode is OFF, or
-        # for a validation recompute: only the pure path consumes
-        # inference_k_points_steps (the mixed path returns -1 for n_sphere_mismatches).
+        # A decode-PoC runs as a pure (exclusive) batch only for a validation
+        # recompute: only the pure path consumes inference_k_points_steps (the mixed
+        # generation path returns -1 for n_sphere_mismatches).
         def _needs_pure_decode(r):
-            return _is_decode_poc(r) and (
-                not _POC_MIXED_DECODE or r.poc_params.is_validation)
+            return _is_decode_poc(r) and r.poc_params.is_validation
         # Phase 2: mixed-decode GENERATION mixes with chat (no defer). Defer chat
         # only while a decode-PoC that needs a pure batch is pending.
         poc_decode_pending = (
@@ -462,7 +459,7 @@ class Scheduler(SchedulerInterface):
                     req_index += 1
                     continue
                 pp = request.poc_params
-                if _POC_MIXED_DECODE and pp.max_tokens > 0 and not pp.is_validation:
+                if pp.max_tokens > 0 and not pp.is_validation:
                     # Step-driven mixed decode: prefill once (seq_len tokens),
                     # then ONE decode token per step until seq_len+max_tokens
                     # tokens are computed. Runs mixed with chat.
@@ -486,8 +483,7 @@ class Scheduler(SchedulerInterface):
                         # The pure path (validation / phase-1) runs the WHOLE decode
                         # loop in one step, so allocate its full seq_len+max_tokens
                         # footprint upfront (vs the step-driven mixed path's 1/step).
-                        _pure = not (_POC_MIXED_DECODE and pp.max_tokens > 0
-                                     and not pp.is_validation)
+                        _pure = not (pp.max_tokens > 0 and not pp.is_validation)
                         _alloc = (pp.seq_len + pp.max_tokens) if _pure else num_new_tokens
                         poc_blocks = self.kv_cache_manager.allocate_slots(
                             request, _alloc,
@@ -754,8 +750,7 @@ class Scheduler(SchedulerInterface):
                             # path (validation / phase-1) runs the whole decode loop
                             # in one step -> allocate full seq_len+max_tokens upfront.
                             _pp = request.poc_params
-                            _pure = not (_POC_MIXED_DECODE and _pp.max_tokens > 0
-                                         and not _pp.is_validation)
+                            _pure = not (_pp.max_tokens > 0 and not _pp.is_validation)
                             _alloc = (_pp.seq_len + _pp.max_tokens) if _pure else num_new_tokens
                             poc_blocks = self.kv_cache_manager.allocate_slots(
                                 request, _alloc,
@@ -1534,7 +1529,7 @@ class Scheduler(SchedulerInterface):
                 # here. Emit no output on intermediate steps; the model runner
                 # accumulates the sphere_k trajectory and returns the full
                 # PoCOutput only on the final step (handled by the fall-through).
-                if (_POC_MIXED_DECODE and pp.max_tokens > 0
+                if (pp.max_tokens > 0
                         and not pp.is_validation
                         and request.num_computed_tokens
                         < pp.seq_len + pp.max_tokens):

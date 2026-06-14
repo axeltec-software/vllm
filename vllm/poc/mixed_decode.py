@@ -12,27 +12,17 @@ Each PoC request carries a single nonce (routes fan out per-nonce via
 
 The slot/layout helpers at the top are pure (no torch) and unit-tested. The
 model-runner helpers at the bottom (moved out of gpu_model_runner.py to keep the
-core vLLM footprint minimal) take the GPUModelRunner as ``runner``. Step-driven
-mixed decode is only active when ``VLLM_POC_MIXED_DECODE=1``; default-off keeps
-the Phase-1 behavior (decode-PoC runs as a pure batch).
+core vLLM footprint minimal) take the GPUModelRunner as ``runner``. Decode-PoC is
+always step-driven and mixed with chat (one PoC decode token per scheduler step,
+fused into the chat forward — chat is never frozen); validation runs pure.
 """
 import math
-import os
 from dataclasses import dataclass, field
 
 import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
-# Phase 2 master switch. Default ON = step-driven mixed decode (one PoC decode
-# token per scheduler step, fused with chat in the same forward; chat is never
-# frozen). Set VLLM_POC_MIXED_DECODE=0 to fall back to Phase-1 behavior (decode-PoC
-# runs its whole loop in one pure execute_poc_forward step; chat deferred while it
-# runs — ~6x chat slowdown under load). Default ON is justified by the gsm8k
-# co-existence results (accuracy preserved, chat ~1.5x not ~6x). Single source of
-# truth, imported by scheduler.py and gpu_model_runner.py.
-POC_MIXED_DECODE = os.environ.get("VLLM_POC_MIXED_DECODE", "1") != "0"
 
 # Bound on consecutive chat-prefill defers before a decoding PoC is forced an
 # exclusive step (fairness valve — keeps PoC from starving under chat churn).
@@ -187,20 +177,17 @@ def get_decode_manager(runner) -> "PoCMixedDecodeManager":
 
 
 def setup_decode_poc(runner, poc_requests) -> bool:
-    """Phase-2 entry hook (called from gpu_model_runner before _prepare_inputs).
+    """Entry hook (called from gpu_model_runner before _prepare_inputs).
 
-    For each flag-on decode-PoC request (max_tokens>0): grab a stable reserved
-    block slot, point its InputBatch block-table row at those reserved blocks
-    (so _prepare_inputs builds correct reserved-KV attention with NO post-hoc
-    override), and refresh its per-request decode step counter.
+    For each decode-PoC request (max_tokens>0): grab a slot + refresh its
+    per-request decode step counter. Under static KV it also points the InputBatch
+    block-table row at the reserved blocks; under dynamic KV the manager-allocated
+    row already drives decode (see below).
 
     Returns True if any decode-PoC is active this step, signalling the caller to
     route the batch through the unified step-driven path (NOT the monolithic
-    execute_poc_forward). Returns False when the flag is off or there are no
-    decode-PoC requests (Phase-1 behavior unchanged).
+    execute_poc_forward). Returns False when there are no decode-PoC requests.
     """
-    if not POC_MIXED_DECODE:
-        return False
     # Exclude VALIDATION recompute requests: the step-driven mixed path does not
     # consume inference_k_points_steps, so they must fall through to the pure
     # execute_poc_forward (which computes the real aligned n_sphere_mismatches).

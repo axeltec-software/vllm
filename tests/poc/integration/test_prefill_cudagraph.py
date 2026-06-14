@@ -39,8 +39,10 @@ MAX_MISMATCH_FRAC = 0.30            # honest aligned mismatch ~6%; corruption is
 
 @pytest.fixture(scope="module")
 def graph_server():
+    # The per-N reserved-slot prefill graph is STATIC-only (under dynamic KV prefill
+    # runs eager on paged manager blocks), so force static here.
     with PoCTestServer(
-        MODEL, BASE_ARGS, env_dict={"VLLM_POC_MIXED_DECODE": "1"},
+        MODEL, BASE_ARGS + ["--no-poc-dynamic-kv"],
     ) as srv:
         yield srv
 

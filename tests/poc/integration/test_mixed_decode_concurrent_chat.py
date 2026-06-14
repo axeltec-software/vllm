@@ -8,7 +8,7 @@ chat and a KV-bound PoC decode interleave in one forward pass. Invariants:
 2. Chat is not corrupted or frozen — full-length, non-empty response.
 3. A real mixed batch (chat + PoC in one forward) actually ran.
 
-Requires ``VLLM_POC_MIXED_DECODE=1`` and CUDA graphs ON (no ``--enforce-eager``).
+Requires CUDA graphs ON (no ``--enforce-eager``); decode-PoC is always mixed.
 """
 import asyncio
 
@@ -34,7 +34,7 @@ CHAT_MAX_TOKENS = 128
 @pytest.fixture(scope="module")
 def mixed_server():
     with PoCTestServer(
-        MODEL, BASE_ARGS, env_dict={"VLLM_POC_MIXED_DECODE": "1"}
+        MODEL, BASE_ARGS
     ) as srv:
         yield srv
 

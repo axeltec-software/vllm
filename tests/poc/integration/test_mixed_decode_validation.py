@@ -1,5 +1,5 @@
-"""Regression gates: VALIDATION recompute must work even when mixed decode is
-DEFAULT-ON (``VLLM_POC_MIXED_DECODE=1``).
+"""Regression gates: VALIDATION recompute must work while decode-PoC generation
+runs step-driven mixed (the default); validation always runs the pure path.
 
 Bug (root-causes/mixed-decode-skips-validation): a *validation* request — one
 carrying ``inference_k_points_steps`` (``PoCParams.is_validation``) — was routed
@@ -16,8 +16,8 @@ decode-PoC *generation* still mixes with chat.
 Contract asserted (>=2 concurrent nonces, the standing multi-nonce rule):
   1. the validation metric is actually COMPUTED — never the ``-1`` sentinel;
   2. an HONEST self-recompute (same server/model) yields ~0 mismatches;
-  3. this holds with mixed decode ON (the regression case) AND OFF (control) —
-     i.e. the fix makes ON behave like OFF for validation.
+  3. this holds while generation runs mixed (the regression case) — validation
+     stays on the pure path and computes the real aligned count.
 """
 import httpx
 import pytest
@@ -70,22 +70,21 @@ def _validate_roundtrip(url: str) -> dict[int, dict]:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("mixed_flag", ["1", "0"], ids=["mixed_default_on", "mixed_off"])
-def test_validation_computes_real_mismatches(mixed_flag):
+def test_validation_computes_real_mismatches():
     """A validation request returns a REAL n_sphere_mismatches (never -1) and ~0
-    for an honest self-recompute, under both mixed-ON (default, the regression)
-    and mixed-OFF (control), for >=2 nonces."""
-    with PoCTestServer(MODEL, BASE_ARGS,
-                       env_dict={"VLLM_POC_MIXED_DECODE": mixed_flag}) as srv:
+    for an honest self-recompute, for >=2 nonces. Generation runs mixed (default);
+    validation always runs the pure path (the regression: mixed must not swallow
+    inference_k_points_steps)."""
+    with PoCTestServer(MODEL, BASE_ARGS) as srv:
         val = _validate_roundtrip(srv.url_root)
 
     for n in NONCES:
         nsm = val[n].get("n_sphere_mismatches")
         # (1) computed at all — the regression: mixed path left it at the -1 sentinel
         assert nsm is not None and nsm != -1, (
-            f"flag={mixed_flag} nonce {n}: n_sphere_mismatches={nsm} — validation "
-            f"NOT computed (mixed path swallowed inference_k_points_steps)")
+            f"nonce {n}: n_sphere_mismatches={nsm} — validation NOT computed "
+            f"(mixed path swallowed inference_k_points_steps)")
         # (2) honest self-recompute is ~0
         assert 0 <= nsm <= HONEST_TOL, (
-            f"flag={mixed_flag} nonce {n}: honest self-recompute expected ~0 "
+            f"nonce {n}: honest self-recompute expected ~0 "
             f"(<= {HONEST_TOL}) mismatches, got {nsm}")

@@ -46,8 +46,9 @@ def _chat(url: str) -> None:
 def test_poc_cudagraph_survives_chat():
     """With cudagraph ON, PoC stays valid through repeated chat interleaving
     (Path A reset+retry self-heals the chat-induced graph corruption)."""
-    with PoCTestServer(MODEL, BASE_ARGS,
-                       env_dict={"VLLM_POC_MIXED_DECODE": "0"}) as srv:
+    # Irene's pure-PoC cudagraph runs only on the STATIC path (under dynamic KV the
+    # pure path is eager on paged blocks), so force static to exercise it + Path A.
+    with PoCTestServer(MODEL, BASE_ARGS + ["--no-poc-dynamic-kv"]) as srv:
         url = srv.url_root
         assert _poc(url) == len(NONCES), "PoC cudagraph broken in isolation"
         # Interleave chat + PoC; the reset+retry must keep every PoC batch full.

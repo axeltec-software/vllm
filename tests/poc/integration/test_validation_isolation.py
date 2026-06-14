@@ -25,7 +25,7 @@ MAX_MISMATCH_FRAC = 0.30   # honest level; corruption would be far higher
 
 @pytest.fixture(scope="module")
 def server():
-    with PoCTestServer(MODEL, BASE_ARGS, env_dict={"VLLM_POC_MIXED_DECODE": "1"}) as srv:
+    with PoCTestServer(MODEL, BASE_ARGS) as srv:
         yield srv
 
 
