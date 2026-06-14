@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
+import logging
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -154,6 +155,11 @@ class BlockPool:
         poc_reserved_blocks: int = 0,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+        
+        logger = logging.getLogger(__name__)
+        logger.warning(
+        f"poc_reserved_blocks in block_pool.__init__ = {poc_reserved_blocks}"
+    )
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size

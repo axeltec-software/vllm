@@ -74,6 +74,19 @@ class TestChatReproducibility:
             f"After:  {after!r}"
         )
 
+    def test_poc_unchanged_after_single_chat_round(self, client, url):
+        """Response to a PoC request is identical before and after one chat round."""
+        before_poc_data = _poc_round(url, "0xkv_integrity_1", list(range(8)))
+        assert before_poc_data["status"] == "completed"
+        chat_data = _chat(client, DETERMINISTIC_PROMPT)
+        after_poc_data = _poc_round(url, "0xkv_integrity_1", list(range(8)))
+        assert before_poc_data["artifacts"] == after_poc_data["artifacts"], (
+            f"PoC response changed after Chat.\n"
+            f"Before: {before_poc_data!r}\n"
+            f"After:  {after_poc_data!r}"
+        )
+
+
     def test_chat_unchanged_after_multiple_poc_rounds(self, client, url):
         """Response remains identical across 5 PoC rounds."""
         baseline = _chat(client, DETERMINISTIC_PROMPT)

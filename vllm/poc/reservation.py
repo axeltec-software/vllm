@@ -17,6 +17,7 @@ Note: the scheduler computes the reservation with ``scheduler_block_size``
 support context parallelism, so in every supported PoC deployment DCP == PCP == 1
 and the two block sizes are equal.
 """
+import logging
 import math
 
 
@@ -29,9 +30,21 @@ def poc_blocks_needed(
     each of ``batch_size`` sequences gets ``ceil((seq_len + max_tokens)/block) + 1``
     blocks (the ``+1`` is the per-sequence decode slack).
     """
-    return batch_size * (
+    
+    #batch_size=64
+    #seq_len=256
+    #max_tokens=256
+    #block_size=16
+
+    res = batch_size * (
         math.ceil((seq_len + max_tokens) / block_size) + 1
     )
+    logger = logging.getLogger(__name__)
+    logger.warning(
+        f"poc_blocks_needed(batch_size={batch_size}, seq_len={seq_len}, max_tokens={max_tokens}, block_size={block_size}) = {res}"
+    )
+
+    return res
 
 
 def poc_reserved_blocks(cache_config, block_size: int) -> int:

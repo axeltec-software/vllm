@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import logging
 import os
 import time
 from collections import defaultdict, deque
@@ -225,6 +226,12 @@ class Scheduler(SchedulerInterface):
         # Create the KV cache manager.
         from vllm.poc.reservation import poc_reserved_blocks as _poc_reserved_blocks
         poc_reserved_blocks = _poc_reserved_blocks(self.cache_config, self.block_size)
+        
+        logger = logging.getLogger(__name__)
+        logger.warning(
+        f"poc_reserved_blocks in sceduler = {poc_reserved_blocks}"
+        )
+
         # Fail loudly (instead of a bare assert deep in BlockPool) if the
         # reservation would leave the chat scheduler with no usable blocks.
         num_gpu_blocks = self.cache_config.num_gpu_blocks

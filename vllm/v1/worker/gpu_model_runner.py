@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import logging
+import pathlib
 import threading
 import time
 from collections import defaultdict
@@ -204,6 +206,39 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
+
+###########################################################################
+from vllm.poc.reservation import poc_reserved_blocks
+
+def dump_kv_cache(worker, out_dir: str = "/tmp/kv_dump"):
+    pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    model_runner = getattr(worker, "model_runner", worker)
+    block_size   = worker.cache_config.block_size
+    n_reserved   = poc_reserved_blocks(worker.cache_config, block_size)
+
+    for layer_idx, kv in enumerate(model_runner.kv_caches):
+        # kv shape: (2, num_blocks, block_size, num_kv_heads, head_size)  [flash_attn]
+        # or        (num_blocks, 2, ...)                                   [flashinfer]
+        # Normalize to (2, num_blocks, ...) so slicing is the same either way
+        if kv.shape[0] == 2:          # flash_attn layout
+            kv_norm = kv              # (2, num_blocks, block_size, heads, head_dim)
+        else:                         # flashinfer layout  (num_blocks, 2, ...)
+            kv_norm = kv.permute(1, 0, *range(2, kv.dim()))
+
+        reserved = kv_norm[:, :n_reserved].cpu()   # PoC region
+        chat     = kv_norm[:, n_reserved:].cpu()   # chat region
+
+        torch.save(reserved, f"{out_dir}/layer{layer_idx:03d}_reserved.pt")
+        torch.save(chat,     f"{out_dir}/layer{layer_idx:03d}_chat.pt")
+
+    logger = logging.getLogger(__name__)
+    logger.warning(
+        f"Dumped {len(model_runner.kv_caches)} layers "
+          f"({n_reserved} reserved blocks) to {out_dir}/"
+    )
+###########################################################################
+    
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
@@ -882,6 +917,12 @@ class GPUModelRunner(
         new/resumed/paused/finished request in the batch.
         """
         # Remove finished requests from the cached states.
+        # Check which finished requests are PoC BEFORE popping (poc_params is on the object).
+        finished_poc_ids = {
+            req_id for req_id in scheduler_output.finished_req_ids
+            if self.requests.get(req_id) is not None
+            and self.requests[req_id].poc_params is not None
+        }
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
@@ -891,6 +932,10 @@ class GPUModelRunner(
         # then resubmitted with the same ID. In this case, we treat them as two
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
+        finished_chat_ids = scheduler_output.finished_req_ids - finished_poc_ids
+        if finished_chat_ids:
+            torch.cuda.synchronize()
+            dump_kv_cache(self, "./kv_dump/chat")
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
@@ -3593,6 +3638,8 @@ class GPUModelRunner(
                 # batches, so sample_tokens() would otherwise return None and
                 # trigger RuntimeError("unexpected error") in step_with_batch_queue).
                 self._poc_direct_output = poc_output
+                torch.cuda.synchronize()
+                dump_kv_cache(self, "./kv_dump/poc") 
                 return poc_output
 
             self._mixed_batch_info = {

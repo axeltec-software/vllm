@@ -62,6 +62,7 @@ def send_request(
             "max_tokens": max_tokens,
         },
         "wait": True,
+        "blocking": True,
     }
     resp = requests.post(
         f"{url.rstrip('/')}/api/v1/pow/generate",
