@@ -18,10 +18,13 @@ from vllm.poc.reservation import poc_blocks_needed, poc_reserved_blocks
 class _FakeCacheConfig:
     """Minimal duck-typed stand-in for CacheConfig."""
 
-    def __init__(self, batch, seq_len, max_tokens):
+    def __init__(self, batch, seq_len, max_tokens,
+                 poc_dynamic_kv=False, poc_floor=1):
         self.poc_max_batch_size = batch
         self.poc_seq_len = seq_len
         self.poc_max_tokens = max_tokens
+        self.poc_dynamic_kv = poc_dynamic_kv
+        self.poc_floor = poc_floor
 
 
 class TestReservationMath:
@@ -48,6 +51,21 @@ class TestReservationMath:
     def test_reserved_blocks_reads_config(self):
         cfg = _FakeCacheConfig(batch=8, seq_len=128, max_tokens=64)
         assert poc_reserved_blocks(cfg, 16) == poc_blocks_needed(8, 128, 64, 16)
+
+    def test_dynamic_reserves_only_floor(self):
+        # poc_dynamic_kv -> reserve poc_floor slots, not poc_max_batch_size.
+        cfg = _FakeCacheConfig(batch=32, seq_len=256, max_tokens=256,
+                               poc_dynamic_kv=True, poc_floor=1)
+        assert poc_reserved_blocks(cfg, 16) == poc_blocks_needed(1, 256, 256, 16)
+        # floor=0 -> pure-dynamic, no reservation.
+        cfg0 = _FakeCacheConfig(batch=32, seq_len=256, max_tokens=256,
+                                poc_dynamic_kv=True, poc_floor=0)
+        assert poc_reserved_blocks(cfg0, 16) == 0
+
+    def test_static_unchanged_when_dynamic_off(self):
+        cfg = _FakeCacheConfig(batch=32, seq_len=256, max_tokens=256,
+                               poc_dynamic_kv=False, poc_floor=1)
+        assert poc_reserved_blocks(cfg, 16) == poc_blocks_needed(32, 256, 256, 16)
 
 
 # ---------------------------------------------------------------------------

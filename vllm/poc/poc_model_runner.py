@@ -171,39 +171,36 @@ def _iter_attn_builders(worker):
 
 
 def _create_v1_attn_metadata(batch_size, seq_len, block_size, device, worker,
-                             block_bases=None):
+                             block_bases=None, block_ids=None):
     """Create attention metadata for batch_size sequences.
 
     Uses the worker's metadata builders to create the correct metadata
     for whatever attention backend is configured (FlashAttention,
     FlashInfer, etc.).
 
-    block_bases: optional list of per-sequence base block ids. Default None lays
-    each sequence out sequentially from 0 (pure-PoC). The step-driven mixed prefill
-    passes each request's reserved-slot base (slot*per_slot) so the prefill writes
-    KV to the SAME blocks the decode steps read.
+    Block addressing (in precedence order):
+      block_ids: per-request list of physical block ids (paged; may be
+        NON-contiguous, e.g. KVCacheManager-allocated). Each list >= blocks_per_seq.
+      block_bases: per-request scalar base -> a CONTIGUOUS run [base, base+n)
+        (static reserved slot). Expanded to block_ids internally.
+      neither: sequential-from-0 (pure-PoC default).
     """
     from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.poc.mixed_decode import poc_paged_layout
 
     blocks_per_seq = math.ceil(seq_len / block_size)
     total_tokens = batch_size * seq_len
-    if block_bases is None:
-        block_bases = [seq_idx * blocks_per_seq for seq_idx in range(batch_size)]
+    if block_ids is None:
+        if block_bases is None:
+            block_bases = [seq_idx * blocks_per_seq for seq_idx in range(batch_size)]
+        # contiguous shim: scalar base -> contiguous block-id run (byte-identical
+        # to the previous arange-based layout).
+        block_ids = [list(range(b, b + blocks_per_seq)) for b in block_bases]
 
-    # slot_mapping: each sequence gets its own block range
-    all_slots = []
-    for seq_idx in range(batch_size):
-        base_block = block_bases[seq_idx]
-        for t in range(seq_len):
-            block_idx = base_block + t // block_size
-            all_slots.append(block_idx * block_size + t % block_size)
-    slot_mapping = torch.tensor(all_slots, dtype=torch.long, device=device)
-
-    # block_table: [batch_size, blocks_per_seq]
-    block_table = torch.stack([
-        torch.arange(base, base + blocks_per_seq, dtype=torch.int32, device=device)
-        for base in block_bases
-    ])
+    slot_list, block_table_list = poc_paged_layout(block_ids, seq_len, block_size)
+    slot_mapping = torch.tensor(slot_list, dtype=torch.long, device=device)
+    block_table = torch.tensor(
+        block_table_list, dtype=torch.int32, device=device)
 
     # query_start_loc: [0, seq_len, 2*seq_len, ..., batch_size*seq_len]
     query_start_loc_gpu = (
@@ -265,13 +262,18 @@ def _create_decode_attn_metadata_with_history(
     prefill_blocks_per_seq,
     max_decode_blocks_per_seq,
     decode_block_start,
+    block_ids=None,
 ):
     """Create attention metadata for a single decode step with full context history.
 
     One new token per sequence (the query) attends to all prefill_seq_len + step
-    tokens in the KV cache.  Physical block layout must be consistent with what
-    _create_v1_attn_metadata wrote during the prefill phase:
-      - seq i prefill blocks: i*prefill_blocks_per_seq .. (i+1)*prefill_blocks_per_seq - 1
+    tokens in the KV cache.
+
+    block_ids (dynamic KV): per-request FULL physical block list (prefill+decode,
+    paged, possibly non-contiguous, from the KV manager). When given, the token at
+    context position p lives in block_ids[seq][p // block_size]. Default None uses
+    the static contiguous layout written by _create_v1_attn_metadata:
+      - seq i prefill blocks: i*prefill_blocks_per_seq .. +prefill_blocks_per_seq-1
       - seq i decode blocks:  decode_block_start + i*max_decode_blocks_per_seq + j
     """
     from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -282,33 +284,23 @@ def _create_decode_attn_metadata_with_history(
     context_len = prefill_seq_len + step
     total_blocks_for_context = math.ceil(context_len / block_size)
 
+    def _phys_block(seq_idx, blk_in_seq):
+        if block_ids is not None:
+            return block_ids[seq_idx][blk_in_seq]
+        if blk_in_seq < prefill_blocks_per_seq:
+            return seq_idx * prefill_blocks_per_seq + blk_in_seq
+        decode_blk_idx = blk_in_seq - prefill_blocks_per_seq
+        return (decode_block_start
+                + seq_idx * max_decode_blocks_per_seq
+                + decode_blk_idx)
+
     slot_mapping_list = []
     block_table_rows = []
-
     for seq_idx in range(batch_size):
-        if block_in_seq < prefill_blocks_per_seq:
-            phys_block = seq_idx * prefill_blocks_per_seq + block_in_seq
-        else:
-            decode_blk_idx = block_in_seq - prefill_blocks_per_seq
-            phys_block = (
-                decode_block_start
-                + seq_idx * max_decode_blocks_per_seq
-                + decode_blk_idx
-            )
+        phys_block = _phys_block(seq_idx, block_in_seq)
         slot_mapping_list.append(phys_block * block_size + slot_in_block)
-
-        row = []
-        for blk_in_seq in range(total_blocks_for_context):
-            if blk_in_seq < prefill_blocks_per_seq:
-                row.append(seq_idx * prefill_blocks_per_seq + blk_in_seq)
-            else:
-                decode_blk_idx = blk_in_seq - prefill_blocks_per_seq
-                row.append(
-                    decode_block_start
-                    + seq_idx * max_decode_blocks_per_seq
-                    + decode_blk_idx
-                )
-        block_table_rows.append(row)
+        block_table_rows.append(
+            [_phys_block(seq_idx, b) for b in range(total_blocks_for_context)])
 
     slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.long, device=device)
     block_table = torch.tensor(block_table_rows, dtype=torch.int32, device=device)
@@ -879,6 +871,7 @@ def execute_poc_forward(
     max_tokens: int = 0,
     inference_k_points_steps_per_nonce: Optional[List[Optional[List[int]]]] = None,
     debug: bool = False,
+    block_ids: Optional[List[List[int]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Execute batched PoC forward pass on a V1 worker.
 
@@ -899,7 +892,7 @@ def execute_poc_forward(
     if tp_group.world_size > 1:
         dist.barrier(group=tp_group.cpu_group)
         if is_tp_driver:
-            broadcast_tensor_dict({
+            _bd = {
                 "poc_go": True,
                 "seq_len": seq_len,
                 "hidden_size": hidden_size,
@@ -908,7 +901,14 @@ def execute_poc_forward(
                 "poc_stronger_rng": poc_stronger_rng,
                 "poc_decode": 1 if poc_decode else 0,
                 "max_tokens": max_tokens,
-            }, src=0)
+            }
+            # Dynamic KV: the per-request paged manager blocks must reach EVERY TP
+            # rank (each rank writes its KV shard to the same physical blocks), else
+            # non-driver ranks fall to the static path and diverge -> KV corruption.
+            # Rectangular: all PoC reqs in a batch share seq_len+max_tokens.
+            if block_ids is not None:
+                _bd["block_ids"] = torch.tensor(block_ids, dtype=torch.long)
+            broadcast_tensor_dict(_bd, src=0)
         else:
             broadcast_data = broadcast_tensor_dict(src=0)
             seq_len = int(broadcast_data["seq_len"])
@@ -919,6 +919,8 @@ def execute_poc_forward(
             poc_stronger_rng = bool(broadcast_data["poc_stronger_rng"])
             poc_decode = bool(broadcast_data["poc_decode"])
             max_tokens = int(broadcast_data["max_tokens"])
+            _bi = broadcast_data.get("block_ids")
+            block_ids = _bi.tolist() if _bi is not None else None
 
     pp_group = get_pp_group()
 
@@ -941,7 +943,9 @@ def execute_poc_forward(
     cache_config = vllm_config.cache_config
     _reserved = poc_reserved_blocks(cache_config, block_size)
     _needed = poc_blocks_needed(batch_size, seq_len, max_tokens, block_size)
-    if _needed > _reserved:
+    # Dynamic KV (block_ids given): KV comes from the manager (paged), not the
+    # static reserved range, so the reservation guard does not apply.
+    if block_ids is None and _needed > _reserved:
         # Refuse the batch GRACEFULLY (return no artifacts) instead of raising —
         # raising here propagates out of execute_model and kills the whole
         # EngineCore (taking chat down). The scheduler caps PoC batches to
@@ -955,9 +959,14 @@ def execute_poc_forward(
         )
         return {"nonces": [], "vectors": np.empty((0, k_dim), dtype=np.float16)}
 
-    attn_metadata, slot_mapping_dict = _get_static_attn_metadata(
-        worker, batch_size, seq_len, block_size, device
-    )
+    if block_ids is not None:
+        # Dynamic KV: build metadata over the manager-allocated (paged) blocks.
+        attn_metadata, slot_mapping_dict = _create_v1_attn_metadata(
+            batch_size, seq_len, block_size, device, worker, block_ids=block_ids)
+    else:
+        attn_metadata, slot_mapping_dict = _get_static_attn_metadata(
+            worker, batch_size, seq_len, block_size, device
+        )
     embeds_buf, positions_buf = _get_poc_input_buffers(
         worker, batch_size, seq_len, hidden_size, device, dtype
     )
@@ -982,14 +991,9 @@ def execute_poc_forward(
             embeds_view[i].copy_(vals.view(seq_len, hidden_size).to(dtype))
             del vals
 
-        graph, poc_hidden = _get_or_capture_poc_graph(
-            worker,
-            batch_size, seq_len, hidden_size,
-            device, dtype, vllm_config,
-            attn_metadata, slot_mapping_dict,
-            embeds_buf, positions_buf,
-        )
-        if graph is not None:
+        if block_ids is not None:
+            # Dynamic KV: eager prefill on the manager-allocated paged blocks
+            # (the per-N reserved-slot prefill graph is static-only).
             with set_forward_context(
                 attn_metadata, vllm_config,
                 num_tokens=batch_size * seq_len,
@@ -997,8 +1001,27 @@ def execute_poc_forward(
                 skip_compiled=True,
             ):
                 with poc_forward_context():
-                    graph.replay()
-        hidden_states = poc_hidden
+                    _out = model(input_ids=None, positions=positions_buf,
+                                 inputs_embeds=embeds_buf)
+            hidden_states = _out[0] if isinstance(_out, tuple) else _out
+        else:
+            graph, poc_hidden = _get_or_capture_poc_graph(
+                worker,
+                batch_size, seq_len, hidden_size,
+                device, dtype, vllm_config,
+                attn_metadata, slot_mapping_dict,
+                embeds_buf, positions_buf,
+            )
+            if graph is not None:
+                with set_forward_context(
+                    attn_metadata, vllm_config,
+                    num_tokens=batch_size * seq_len,
+                    slot_mapping=slot_mapping_dict,
+                    skip_compiled=True,
+                ):
+                    with poc_forward_context():
+                        graph.replay()
+            hidden_states = poc_hidden
     else:
         intermediate_tensors = IntermediateTensors(
             pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
@@ -1172,21 +1195,16 @@ def execute_poc_forward(
                 decode_embeds_buf.copy_(decode_embeds.view(batch_size, hidden_size))
                 decode_pos_buf.fill_(seq_len + step - 1)
                 
-                dec_attn, dec_slot = _get_static_decode_attn_metadata(
-                    worker, batch_size, seq_len, step,
-                    prefill_blocks_per_seq, max_decode_blocks_per_seq,
-                    decode_block_start, block_size, device,
-                )
-
-                dec_graph, dec_hidden = _get_or_capture_poc_decode_graph(
-                    worker,
-                    batch_size, seq_len, step, hidden_size,
-                    device, dtype, vllm_config,
-                    dec_attn, dec_slot,
-                    decode_embeds_buf, decode_pos_buf,
-                )
-
-                if dec_graph is not None:
+                if block_ids is not None:
+                    # Dynamic KV: eager decode step on the manager-allocated paged
+                    # blocks (per-step decode graphs are static-only — they bake the
+                    # contiguous reserved layout). Build history metadata for THIS
+                    # step's blocks and run eager.
+                    dec_attn, dec_slot = _create_decode_attn_metadata_with_history(
+                        batch_size, seq_len, step, block_size, device, worker,
+                        prefill_blocks_per_seq, max_decode_blocks_per_seq,
+                        decode_block_start, block_ids=block_ids,
+                    )
                     with set_forward_context(
                         dec_attn, vllm_config,
                         num_tokens=batch_size,
@@ -1194,7 +1212,33 @@ def execute_poc_forward(
                         skip_compiled=True,
                     ):
                         with poc_forward_context():
-                            dec_graph.replay()
+                            dec_hidden = model(
+                                input_ids=None, positions=decode_pos_buf,
+                                inputs_embeds=decode_embeds_buf)
+                else:
+                    dec_attn, dec_slot = _get_static_decode_attn_metadata(
+                        worker, batch_size, seq_len, step,
+                        prefill_blocks_per_seq, max_decode_blocks_per_seq,
+                        decode_block_start, block_size, device,
+                    )
+
+                    dec_graph, dec_hidden = _get_or_capture_poc_decode_graph(
+                        worker,
+                        batch_size, seq_len, step, hidden_size,
+                        device, dtype, vllm_config,
+                        dec_attn, dec_slot,
+                        decode_embeds_buf, decode_pos_buf,
+                    )
+
+                    if dec_graph is not None:
+                        with set_forward_context(
+                            dec_attn, vllm_config,
+                            num_tokens=batch_size,
+                            slot_mapping=dec_slot,
+                            skip_compiled=True,
+                        ):
+                            with poc_forward_context():
+                                dec_graph.replay()
                 hs_dec = dec_hidden
 
                 if isinstance(hs_dec, tuple):

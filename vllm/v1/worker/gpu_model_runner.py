@@ -3514,13 +3514,24 @@ class GPUModelRunner(
                 # required (validation tolerates boundary flips). Padding nonces are
                 # negative (never collide) and dropped by the nonce->req_id map.
                 poc_max_batch = self.cache_config.poc_max_batch_size
-                n_real = len(nonces)
-                bucket = poc_graph_bucket(n_real, POC_GRAPH_BUCKETS, poc_max_batch)
-                logger.info("POC_BATCH real=%d bucket=%d", n_real, bucket)  # bucket-tuning stats
-                pad = bucket - n_real
-                if pad > 0:
-                    nonces = nonces + [-(i + 1) for i in range(pad)]
-                    inference_steps = inference_steps + [None] * pad
+                poc_dynamic_kv = getattr(self.cache_config, "poc_dynamic_kv", False)
+                block_ids_arg = None
+                if poc_dynamic_kv:
+                    # Dynamic KV: eager (no per-N cudagraph) -> no bucket padding.
+                    # Pass each request's manager-allocated paged blocks (the
+                    # scheduler allocated the full seq_len+max_tokens footprint).
+                    block_ids_arg = [
+                        list(self.requests[req.req_id].block_ids[0])
+                        for req in poc_requests
+                    ]
+                else:
+                    n_real = len(nonces)
+                    bucket = poc_graph_bucket(n_real, POC_GRAPH_BUCKETS, poc_max_batch)
+                    logger.info("POC_BATCH real=%d bucket=%d", n_real, bucket)  # bucket-tuning stats
+                    pad = bucket - n_real
+                    if pad > 0:
+                        nonces = nonces + [-(i + 1) for i in range(pad)]
+                        inference_steps = inference_steps + [None] * pad
                 _poc_kwargs = dict(
                     block_hash=first_params.block_hash,
                     public_key=first_params.public_key,
@@ -3536,6 +3547,7 @@ class GPUModelRunner(
                         else None
                     ),
                     debug=any(req.poc_params.debug for req in poc_requests),
+                    block_ids=block_ids_arg,
                 )
                 poc_result = execute_poc_forward(self, **_poc_kwargs)
                 # If chat aliased the cudagraph and every nonce came back NaN,
@@ -3958,7 +3970,11 @@ class GPUModelRunner(
             graphable = cudagraph_mode != CUDAGraphMode.NONE
             poc_meta = (self._mixed_batch_info or {}).get("poc_metadata") or []
             prefill_metas = [m for m in poc_meta if "decode_step" not in m]
+            # Dynamic KV: prefill uses manager-allocated (paged) blocks via the
+            # standard metadata, so run it eager (the reserved-slot per-N prefill
+            # graph does not apply). Decode still rides the mixed decode graph.
             if (not graphable) and poc_meta \
+                    and not getattr(self.cache_config, "poc_dynamic_kv", False) \
                     and len(prefill_metas) == len(poc_meta) \
                     and all(m.get("decode_state") is not None for m in prefill_metas) \
                     and bool(poc_position_mask.all()):

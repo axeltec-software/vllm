@@ -256,18 +256,27 @@ def check_reservation_fits(engine_client, body: "PoCGenerateRequest"):
     block_size = cache_config.block_size
     if not block_size:
         return
-    reserved = poc_reserved_blocks(cache_config, block_size)
+    # Limit on a single PoC forward's footprint. Static: the reserved range.
+    # Dynamic: PoC grows into the shared pool up to poc_max_batch_size slots (the
+    # scheduler's concurrency cap), NOT just the floor — so cap there, else any
+    # multi-nonce request would be wrongly rejected against the tiny floor.
+    if getattr(cache_config, "poc_dynamic_kv", False):
+        limit = poc_blocks_needed(cache_config.poc_max_batch_size,
+                                  cache_config.poc_seq_len,
+                                  cache_config.poc_max_tokens, block_size)
+    else:
+        limit = poc_reserved_blocks(cache_config, block_size)
     # Effective per-forward batch is the chunk size, capped by nonce count.
     batch = min(body.batch_size, len(body.nonces)) if body.nonces else 0
     needed = poc_blocks_needed(batch, body.params.seq_len, body.params.max_tokens,
                                block_size)
-    if needed > reserved:
+    if needed > limit:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"request exceeds PoC KV reservation: needs {needed} blocks "
+                f"request exceeds PoC KV capacity: needs {needed} blocks "
                 f"(batch_size={batch}, seq_len={body.params.seq_len}, "
-                f"max_tokens={body.params.max_tokens}) but only {reserved} are reserved "
+                f"max_tokens={body.params.max_tokens}) but only {limit} available "
                 f"(poc_max_batch_size={cache_config.poc_max_batch_size}, "
                 f"poc_seq_len={cache_config.poc_seq_len}, "
                 f"poc_max_tokens={cache_config.poc_max_tokens}); lower the "

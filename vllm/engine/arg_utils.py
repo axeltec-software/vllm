@@ -584,6 +584,8 @@ class EngineArgs:
     poc_seq_len: int = get_field(CacheConfig, "poc_seq_len")
     poc_max_tokens: int = get_field(CacheConfig, "poc_max_tokens")
     poc_share: float = get_field(CacheConfig, "poc_share")
+    poc_dynamic_kv: bool = get_field(CacheConfig, "poc_dynamic_kv")
+    poc_floor: int = get_field(CacheConfig, "poc_floor")
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -974,6 +976,12 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--poc-share", **cache_kwargs["poc_share"]
+        )
+        cache_group.add_argument(
+            "--poc-dynamic-kv", **cache_kwargs["poc_dynamic_kv"]
+        )
+        cache_group.add_argument(
+            "--poc-floor", **cache_kwargs["poc_floor"]
         )
 
         # Multimodal related configs
@@ -1458,6 +1466,8 @@ class EngineArgs:
             poc_seq_len=self.poc_seq_len,
             poc_max_tokens=self.poc_max_tokens,
             poc_share=self.poc_share,
+            poc_dynamic_kv=self.poc_dynamic_kv,
+            poc_floor=self.poc_floor,
         )
 
         ray_runtime_env = None

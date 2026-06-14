@@ -189,6 +189,23 @@ class CacheConfig:
     the rest. Explicit knob over the chat<->PoC mix: 1.0 = PoC greedy, 0.0 = chat
     only (PoC paused), 0.5 = even split. Prevents PoC from starving chat."""
 
+    poc_dynamic_kv: bool = Field(default=True)
+    """Dynamic PoC KV reservation (reserve-on-demand, release-on-idle). When True
+    only poc_floor slots are reserved as a guaranteed floor; PoC grows into the
+    shared pool on demand via the KV manager and releases on completion, so chat
+    reclaims capacity when PoC is idle/light. When False (default) the full
+    poc_max_batch_size worth of blocks is reserved statically.
+
+    NOTE: dynamic is currently verified for the GENERATION (mixed) path only; the
+    VALIDATION (pure execute_poc_forward) path is not yet manager-allocated, so a
+    validator server must run static until that conversion lands. Hence default
+    False until the pure path is converted + fraud/honest-verified."""
+
+    poc_floor: int = Field(default=1, ge=0)
+    """Guaranteed PoC slots under poc_dynamic_kv (elastic floor). 0 = pure-dynamic
+    (PoC fully yields to chat, may pause under saturation); poc_max_batch_size =
+    equivalent to the static reservation. Ignored when poc_dynamic_kv is False."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -216,6 +233,8 @@ class CacheConfig:
             "poc_seq_len",
             "poc_max_tokens",
             "poc_share",
+            "poc_dynamic_kv",
+            "poc_floor",
             # Post-init/derived counters
             "num_gpu_blocks",
             "num_cpu_blocks",

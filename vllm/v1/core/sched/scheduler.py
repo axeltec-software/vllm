@@ -405,6 +405,9 @@ class Scheduler(SchedulerInterface):
         # keeps drawing from the full budget.
         poc_token_budget = int(self.cache_config.poc_share * token_budget)
         poc_tokens_scheduled = 0
+        # Dynamic KV: PoC allocates real paged blocks via the manager (reserve-on-
+        # demand, release-on-completion) instead of the static reserved range.
+        poc_dynamic_kv = self.cache_config.poc_dynamic_kv
 
         # chat + PoC share a forward only when both decode; prefills run isolated.
         poc_will_prefill = (
@@ -476,17 +479,36 @@ class Scheduler(SchedulerInterface):
                     req_index += 1
                     continue
                 if num_new_tokens <= token_budget:
+                    if poc_dynamic_kv:
+                        # Dynamic KV: allocate real (paged) blocks via the manager,
+                        # like chat. None => no free blocks: PoC DEFERS (never
+                        # preempts chat); the floor reservation guarantees progress.
+                        # The pure path (validation / phase-1) runs the WHOLE decode
+                        # loop in one step, so allocate its full seq_len+max_tokens
+                        # footprint upfront (vs the step-driven mixed path's 1/step).
+                        _pure = not (_POC_MIXED_DECODE and pp.max_tokens > 0
+                                     and not pp.is_validation)
+                        _alloc = (pp.seq_len + pp.max_tokens) if _pure else num_new_tokens
+                        poc_blocks = self.kv_cache_manager.allocate_slots(
+                            request, _alloc,
+                            num_lookahead_tokens=self.num_lookahead_tokens,
+                        )
+                        if poc_blocks is None:
+                            req_index += 1
+                            continue
+                        req_to_new_blocks[request.request_id] = poc_blocks
+                    else:
+                        # Static: KV goes to the reserved range out-of-band; a
+                        # running step-driven decode-PoC still needs an entry so
+                        # _make_cached_request_data finds it.
+                        req_to_new_blocks[request.request_id] = KVCacheBlocks(
+                            blocks=tuple(
+                                [] for _ in range(
+                                    self.kv_cache_manager.num_kv_cache_groups)
+                            )
+                        )
                     scheduled_running_reqs.append(request)
                     num_scheduled_tokens[request.request_id] = num_new_tokens
-                    # PoC uses no manager-allocated blocks (KV goes to the
-                    # reserved range out-of-band); a running step-driven decode-PoC
-                    # still needs an entry so _make_cached_request_data finds it.
-                    req_to_new_blocks[request.request_id] = KVCacheBlocks(
-                        blocks=tuple(
-                            [] for _ in range(
-                                self.kv_cache_manager.num_kv_cache_groups)
-                        )
-                    )
                     token_budget -= num_new_tokens
                     poc_scheduled += 1
                     poc_tokens_scheduled += num_new_tokens
@@ -726,15 +748,34 @@ class Scheduler(SchedulerInterface):
                         skipped_waiting_requests.prepend_request(request)
                         continue
                     if num_new_tokens <= token_budget:
+                        if poc_dynamic_kv:
+                            # Dynamic KV: allocate paged blocks via the manager;
+                            # None => defer (PoC waits, never preempts chat). Pure
+                            # path (validation / phase-1) runs the whole decode loop
+                            # in one step -> allocate full seq_len+max_tokens upfront.
+                            _pp = request.poc_params
+                            _pure = not (_POC_MIXED_DECODE and _pp.max_tokens > 0
+                                         and not _pp.is_validation)
+                            _alloc = (_pp.seq_len + _pp.max_tokens) if _pure else num_new_tokens
+                            poc_blocks = self.kv_cache_manager.allocate_slots(
+                                request, _alloc,
+                                num_lookahead_tokens=self.num_lookahead_tokens,
+                            )
+                            if poc_blocks is None:
+                                self.waiting.pop_request()
+                                skipped_waiting_requests.prepend_request(request)
+                                continue
+                        else:
+                            poc_blocks = KVCacheBlocks(
+                                blocks=tuple([] for _ in range(self.kv_cache_manager.num_kv_cache_groups))
+                            )
                         self.waiting.pop_request()
                         self.running.append(request)
                         request.status = RequestStatus.RUNNING
 
                         scheduled_new_reqs.append(request)
                         num_scheduled_tokens[request.request_id] = num_new_tokens
-                        req_to_new_blocks[request.request_id] = KVCacheBlocks(
-                            blocks=tuple([] for _ in range(self.kv_cache_manager.num_kv_cache_groups))
-                        )
+                        req_to_new_blocks[request.request_id] = poc_blocks
                         token_budget -= num_new_tokens
                         poc_scheduled += 1
                         poc_tokens_scheduled += num_new_tokens

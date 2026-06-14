@@ -100,6 +100,25 @@ def poc_slot_block_ids(slot: int, poc_seq_len: int, poc_max_tokens: int,
     return list(range(base, base + per_slot))
 
 
+def poc_paged_layout(block_ids, seq_len, block_size):
+    """Paged slot_mapping + block_table for PoC KV from per-request block ids.
+
+    block_ids: list (one per request) of physical block ids; each list must hold
+    >= ceil(seq_len/block_size) ids. Blocks may be NON-contiguous (manager-paged)
+    or contiguous (static slot) — token p of a request maps to
+    ``block_ids[req][p // block_size] * block_size + p % block_size``.
+
+    Returns (slot_mapping, block_table): slot_mapping is a flat list of length
+    len(block_ids)*seq_len; block_table is the per-request block-id lists. Pure
+    (no torch / no GPU) so the layout is unit-testable in isolation.
+    """
+    slot_mapping = []
+    for seq_blocks in block_ids:
+        for p in range(seq_len):
+            slot_mapping.append(seq_blocks[p // block_size] * block_size + p % block_size)
+    return slot_mapping, block_ids
+
+
 @dataclass
 class PoCDecodeState:
     """Per-request decode state, carried across scheduler steps."""
@@ -194,6 +213,11 @@ def setup_decode_poc(runner, poc_requests) -> bool:
     mgr = get_decode_manager(runner)
     block_size = runner.cache_config.block_size
     num_groups = len(runner.input_batch.block_table.block_tables)
+    # Dynamic KV: the scheduler allocated real (paged) blocks via the manager, so
+    # _prepare_inputs already built the correct block-table row + slot_mapping — we
+    # must NOT override it with a reserved-slot row. Static: point the row at the
+    # reserved contiguous slot blocks (out-of-band KV).
+    dynamic = getattr(runner.cache_config, "poc_dynamic_kv", False)
     for r in decode_reqs:
         pp = r.poc_params
         st = mgr.allocate(r.req_id, pp.nonce, pp.seq_len, pp.max_tokens)
@@ -204,6 +228,8 @@ def setup_decode_poc(runner, poc_requests) -> bool:
             continue
         # decode step = tokens computed beyond prefill (0 during the prefill step)
         st.step = max(0, r.num_computed_tokens - pp.seq_len)
+        if dynamic:
+            continue
         block_ids = poc_slot_block_ids(
             st.slot, pp.seq_len, pp.max_tokens, block_size)
         req_index = runner.input_batch.req_id_to_index.get(r.req_id)

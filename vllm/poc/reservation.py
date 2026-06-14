@@ -35,9 +35,18 @@ def poc_blocks_needed(
 
 
 def poc_reserved_blocks(cache_config, block_size: int) -> int:
-    """Blocks reserved for PoC, sized from the configured worst-case PoC params."""
+    """Blocks reserved for PoC.
+
+    Static (default): worst-case poc_max_batch_size slots. Dynamic
+    (poc_dynamic_kv): only poc_floor slots as a guaranteed floor — PoC grows into
+    the shared pool on demand via the KV manager and releases on completion, so
+    chat reclaims the rest when PoC is idle/light.
+    """
+    batch = (cache_config.poc_floor
+             if getattr(cache_config, "poc_dynamic_kv", False)
+             else cache_config.poc_max_batch_size)
     return poc_blocks_needed(
-        cache_config.poc_max_batch_size,
+        batch,
         cache_config.poc_seq_len,
         cache_config.poc_max_tokens,
         block_size,
