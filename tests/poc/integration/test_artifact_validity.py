@@ -83,8 +83,11 @@ class TestDeterminism:
         vecs1 = [a["vector_b64"] for a in data1["artifacts"]]
         vecs2 = [a["vector_b64"] for a in data2["artifacts"]]
         for i, (v1, v2) in enumerate(zip(vecs1, vecs2)):
-            assert v1 == v2, f"Nonce {nonces[i]}: vector changed between identical calls"
-
+            assert v1 == v2, (
+            f"Nonce {nonces[i]}: vector changed between identical calls.\n"
+            f"Before: {vecs1!r}\n"
+            f"After:  {vecs2!r}"
+            )
 
 @pytest.mark.integration
 class TestNonceIndependence:
