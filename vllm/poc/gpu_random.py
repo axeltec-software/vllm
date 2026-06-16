@@ -173,22 +173,6 @@ def generate_inputs_concat_murmur(
     return result
 
 
-def generate_target(
-    block_hash: str,
-    public_key: str,
-    dim: int,
-    device: torch.device,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """Generate deterministic target unit vector."""
-    seed_str = f"{block_hash}_{public_key}_target"
-    seed = _seed_from_string(seed_str)
-    normal = _normal(seed, dim, device)
-    target = normal.to(dtype)
-    target = target / target.norm()
-    return target
-
-
 def generate_householder_vector(
     seed_str: str,
     dim: int,
@@ -198,15 +182,6 @@ def generate_householder_vector(
     seed = _seed_from_string(seed_str)
     v = _normal(seed, dim, device)
     return v / v.norm()
-
-
-def apply_householder(
-    x: torch.Tensor,
-    v: torch.Tensor,
-) -> torch.Tensor:
-    """Apply Householder reflection: H @ x = x - 2*(v.x)*v"""
-    dot = (x * v).sum(dim=-1, keepdim=True)
-    return x - 2 * dot * v
 
 
 def generate_decode_inputs(

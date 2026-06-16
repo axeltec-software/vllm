@@ -83,10 +83,8 @@ class PoCTestServer:
             "--host", host,
             "--port", str(self.port),
             "--poc-decode",
-            # PoC uses an out-of-band execute path (execute_poc_forward returns a
-            # complete ModelRunnerOutput, bypassing the sampler), which is
-            # incompatible with v15's default async scheduling (execute/sample
-            # batch-queue split). Force sync scheduling.
+            # PoC's step-driven decode + artifact readout is not supported under
+            # async scheduling's execute/sample batch-queue split. Force sync.
             "--no-async-scheduling",
             *vllm_serve_args,
         ]
@@ -207,8 +205,8 @@ CANONICAL_MODEL = "RedHatAI/Qwen2.5-7B-Instruct-quantized.w8a16"
 #    outside vLLM's init budget, so 0.9 util OOMs during capture.
 #  - PoC needs only seq_len=256 + max_tokens=256 = 512 tokens total, and chat in
 #    tests is short, so --max-model-len 1024 shrinks the engine's own cudagraph/
-#    activation footprint and frees GPU for the PoC graph pools.
-#  - util 0.8 keeps KV >= the PoC reservation while leaving headroom for capture.
+#    activation footprint and frees GPU for cudagraph capture.
+#  - util 0.8 leaves headroom for cudagraph capture alongside dynamic KV.
 DEFAULT_SERVER_ARGS = ["--gpu-memory-utilization", "0.8", "--max-model-len", "1024"]
 
 

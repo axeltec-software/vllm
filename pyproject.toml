@@ -120,6 +120,7 @@ markers = [
     "skip_v1: do not run this test with v1",
     "optional: optional tests that are automatically skipped, include --optional to run them",
 ]
+asyncio_mode = "auto"
 
 [tool.ty.src]
 root = "./vllm"

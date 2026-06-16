@@ -1,8 +1,7 @@
-"""Integration tests verifying KV cache is not corrupted by PoC.
+"""Integration tests verifying chat KV is not corrupted by PoC.
 
-PoC rewrites KV cache blocks starting from block 0. 
-
-Two strategies:
+PoC writes KV into its own paged manager blocks (allocated on demand like chat),
+so chat's KV must be untouched. Checked from the outside:
 1. Reproducibility — temperature=0 chat gives identical output before/after PoC.
 2. Multi-round — chat remains consistent across several PoC rounds.
 """

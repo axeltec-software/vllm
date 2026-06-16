@@ -318,7 +318,9 @@ class AsyncLLM(EngineClient):
 
             request = EngineCoreRequest(
                 request_id=request_id,
-                prompt_token_ids=[],  # Empty for PoC
+                # Dummy tokens (seq_len) so PoC rides the graphed input_ids path;
+                # the real PoC embeds are injected by PoCEmbeddingWrapper.
+                prompt_token_ids=[0] * poc_params.seq_len,
                 mm_features=None,
                 sampling_params=None,
                 pooling_params=None,

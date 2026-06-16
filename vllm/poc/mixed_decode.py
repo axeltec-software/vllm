@@ -2,22 +2,20 @@
 
 A decode-PoC request runs ONE decode token per scheduler step, mixed with chat
 in the same forward (instead of running its whole decode loop inside one
-pure-batch ``execute_poc_forward`` call). Its KV lives in a stable, contiguous
-slice ("slot") of the reserved block range ``[0, poc_reserved_blocks)`` so its
-prefill KV persists and each decode step reads it. ``sphere_k`` is chained across
-steps via the per-request state held here.
+pure-batch call). Its KV is allocated on demand by the KV manager exactly like
+chat (pure dynamic KV, no reserved blocks) so its prefill KV persists and each
+decode step reads it. ``sphere_k`` is chained across steps via the per-request
+state held here.
 
 Each PoC request carries a single nonce (routes fan out per-nonce via
 ``generate(poc_params)``), so the decode state is per-(request, nonce).
 
 The slot/layout helpers at the top are pure (no torch) and unit-tested. The
 model-runner helpers at the bottom (moved out of gpu_model_runner.py to keep the
-core vLLM footprint minimal) take the GPUModelRunner as ``runner``. Step-driven
-mixed decode is only active when ``VLLM_POC_MIXED_DECODE=1``; default-off keeps
-the Phase-1 behavior (decode-PoC runs as a pure batch).
+core vLLM footprint minimal) take the GPUModelRunner as ``runner``. Decode-PoC is
+always step-driven and mixed with chat (one PoC decode token per scheduler step,
+fused into the chat forward — chat is never frozen); validation runs pure.
 """
-import math
-import os
 from dataclasses import dataclass, field
 
 import torch
@@ -25,38 +23,76 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Phase 2 master switch. Default ON = step-driven mixed decode (one PoC decode
-# token per scheduler step, fused with chat in the same forward; chat is never
-# frozen). Set VLLM_POC_MIXED_DECODE=0 to fall back to Phase-1 behavior (decode-PoC
-# runs its whole loop in one pure execute_poc_forward step; chat deferred while it
-# runs — ~6x chat slowdown under load). Default ON is justified by the gsm8k
-# co-existence results (accuracy preserved, chat ~1.5x not ~6x). Single source of
-# truth, imported by scheduler.py and gpu_model_runner.py.
-POC_MIXED_DECODE = os.environ.get("VLLM_POC_MIXED_DECODE", "1") != "0"
+# Bound on consecutive chat-prefill defers before a decoding PoC is forced an
+# exclusive step (fairness valve — keeps PoC from starving under chat churn).
+POC_DEFER_LIMIT = 4
 
-
-def poc_per_slot_blocks(poc_seq_len: int, poc_max_tokens: int,
-                        block_size: int) -> int:
-    """Contiguous reserved blocks per decode-PoC slot.
-
-    Matches ``reservation.poc_blocks_needed`` per-sequence sizing:
-    ``ceil((seq_len + max_tokens)/block) + 1`` (the ``+1`` is decode slack).
-    With ``poc_max_batch_size`` slots this exactly tiles the reserved range
-    ``[0, poc_reserved_blocks)``.
+def decode_only_mixing_gate(
+    *,
+    mixed_cudagraph: bool,
+    poc_decode_pending: bool,
+    poc_will_prefill: bool,
+    chat_will_prefill: bool,
+    consecutive_defers: int,
+    defer_limit: int = POC_DEFER_LIMIT,
+) -> tuple[bool, bool, int]:
+    """Decide (defer_chat, defer_poc, consecutive_defers) so chat and PoC share a
+    forward only when both decode; prefills run isolated. Mutually exclusive defers.
+    Pure (unit-testable). With mixed_cudagraph=False reduces to the original
+    behaviour (defer_chat=poc_decode_pending, defer_poc=False). The valve bounds
+    consecutive chat-prefill defers so chat churn can't starve a decoding PoC.
     """
-    return math.ceil((poc_seq_len + poc_max_tokens) / block_size) + 1
+    defer_chat = poc_decode_pending or (mixed_cudagraph and poc_will_prefill)
+    defer_poc = mixed_cudagraph and (not defer_chat) and chat_will_prefill
+    if defer_poc:
+        consecutive_defers += 1
+        if consecutive_defers > defer_limit:
+            # Give the decoding PoC one exclusive (pure-decode, graphable) step.
+            defer_poc, defer_chat, consecutive_defers = False, True, 0
+    else:
+        consecutive_defers = 0
+    return defer_chat, defer_poc, consecutive_defers
 
 
-def poc_slot_block_ids(slot: int, poc_seq_len: int, poc_max_tokens: int,
-                       block_size: int) -> list[int]:
-    """Physical block IDs for ``slot`` — a contiguous slice of the reserved
-    range. The sequence is laid out contiguously, so the token at position ``p``
-    uses physical block ``base + p // block_size`` (natural layout; no separate
-    decode region needed since each request owns its own contiguous slot).
-    """
-    per_slot = poc_per_slot_blocks(poc_seq_len, poc_max_tokens, block_size)
-    base = slot * per_slot
-    return list(range(base, base + per_slot))
+def poc_is_pure_path(poc_params) -> bool:
+    """True for prefill-only PoC (max_tokens == 0), which has no decode loop. All
+    decode — generation and validation — runs step-driven. Pure (unit-testable)."""
+    return poc_params.max_tokens == 0
+
+
+def poc_step_num_tokens(poc_params, num_computed_tokens: int) -> int:
+    """Tokens to schedule for a PoC request this step: mixed decode generation
+    prefills seq_len once then 1 token/step; the pure / prefill-only path is a
+    single seq_len step. Pure (unit-testable)."""
+    if not poc_is_pure_path(poc_params):
+        return poc_params.seq_len if num_computed_tokens == 0 else 1
+    return poc_params.seq_len
+
+
+def aligned_step(own_k: int, reference_k):
+    """One validation comparison step, shared by both decode call-sites.
+    reference_k = the reference trajectory's sphere_k for this step, or None when
+    generating. Returns (mismatch_delta, next_prev_k): when validating, count a
+    mismatch if own_k differs and seed the next step from the reference k (aligned,
+    no cascade); when generating, seed from own_k."""
+    if reference_k is None:
+        return 0, own_k
+    return (1 if own_k != reference_k else 0), reference_k
+
+
+def poc_share_budget(poc_share: float, token_budget: int) -> int:
+    """PoC's slice of a step's compute (token) budget. poc_share=0 -> PoC blocked
+    this step; 1.0 -> PoC may use the whole budget. Pure (unit-testable)."""
+    return int(poc_share * token_budget)
+
+
+def poc_alloc_footprint(poc_params, num_new_tokens: int) -> int:
+    """Dynamic-KV blocks to allocate: the pure path runs the whole decode loop in
+    one step so it allocates seq_len+max_tokens upfront; the mixed path allocates
+    one step's tokens. Pure (unit-testable)."""
+    if poc_is_pure_path(poc_params):
+        return poc_params.seq_len + poc_params.max_tokens
+    return num_new_tokens
 
 
 @dataclass
@@ -76,15 +112,19 @@ class PoCDecodeState:
     # the prefill artifact vector (base64), set at the prefill step.
     vector_b64: str = ""
     n_sphere_mismatches: int = 0
+    # validation reference trajectory (inference_k_points_steps), or None for
+    # generation. index 0 = prefill k, 1..N = decode-step k. Drives aligned_step.
+    reference: list | None = None
 
 
 class PoCMixedDecodeManager:
-    """Reserved-slot pool + decode state for step-driven mixed decode-PoC.
+    """Per-request decode-state pool for step-driven mixed decode-PoC.
 
-    One instance per model runner (lazily created). Slots are a finite pool of
-    ``poc_max_batch_size`` contiguous reserved-block slices; the scheduler caps
-    concurrent decode-PoC requests to that many, so ``allocate`` never starves in
-    a correct configuration (returns ``None`` defensively if it would).
+    One instance per model runner (lazily created). A finite pool of
+    ``poc_max_batch_size`` state slots (sphere_k chaining + step counter); the
+    scheduler caps concurrent decode-PoC requests to that many, so ``allocate``
+    never starves in a correct configuration (returns ``None`` defensively if it
+    would). KV itself is paged/dynamic via the manager — slots hold no blocks.
     """
 
     def __init__(self, poc_max_batch_size: int):
@@ -113,9 +153,6 @@ class PoCMixedDecodeManager:
         if st is not None:
             self._free_slots.append(st.slot)
 
-    def active_req_ids(self) -> list[str]:
-        return list(self._state.keys())
-
 
 def get_decode_manager(runner) -> "PoCMixedDecodeManager":
     """Lazily get/create the per-runner mixed-decode manager."""
@@ -127,26 +164,24 @@ def get_decode_manager(runner) -> "PoCMixedDecodeManager":
 
 
 def setup_decode_poc(runner, poc_requests) -> bool:
-    """Phase-2 entry hook (called from gpu_model_runner before _prepare_inputs).
+    """Entry hook (called from gpu_model_runner before _prepare_inputs).
 
-    For each flag-on decode-PoC request (max_tokens>0): grab a stable reserved
-    block slot, point its InputBatch block-table row at those reserved blocks
-    (so _prepare_inputs builds correct reserved-KV attention with NO post-hoc
-    override), and refresh its per-request decode step counter.
+    For each decode-PoC request (max_tokens>0): grab a state slot + refresh its
+    per-request decode step counter. KV is pure dynamic: the scheduler-allocated
+    paged block-table row already drives decode (see below).
 
     Returns True if any decode-PoC is active this step, signalling the caller to
-    route the batch through the unified step-driven path (NOT the monolithic
-    execute_poc_forward). Returns False when the flag is off or there are no
-    decode-PoC requests (Phase-1 behavior unchanged).
+    route the batch through the unified step-driven path. Returns False when there
+    are no decode-PoC requests. Generation and validation both run here; validation
+    carries its reference trajectory in PoCDecodeState.reference (aligned compare).
     """
-    if not POC_MIXED_DECODE:
-        return False
     decode_reqs = [r for r in poc_requests if r.poc_params.max_tokens > 0]
     if not decode_reqs:
         return False
     mgr = get_decode_manager(runner)
-    block_size = runner.cache_config.block_size
-    num_groups = len(runner.input_batch.block_table.block_tables)
+    # Pure dynamic KV: the scheduler allocated real (paged) blocks via the
+    # manager, so _prepare_inputs already built the correct block-table row +
+    # slot_mapping. We only track decode state (step + reference trajectory).
     for r in decode_reqs:
         pp = r.poc_params
         st = mgr.allocate(r.req_id, pp.nonce, pp.seq_len, pp.max_tokens)
@@ -157,33 +192,8 @@ def setup_decode_poc(runner, poc_requests) -> bool:
             continue
         # decode step = tokens computed beyond prefill (0 during the prefill step)
         st.step = max(0, r.num_computed_tokens - pp.seq_len)
-        block_ids = poc_slot_block_ids(
-            st.slot, pp.seq_len, pp.max_tokens, block_size)
-        req_index = runner.input_batch.req_id_to_index.get(r.req_id)
-        if req_index is not None:
-            runner.input_batch.block_table.add_row(
-                tuple([block_ids] * num_groups), req_index)
+        st.reference = pp.inference_k_points_steps  # None for generation
     return True
-
-
-def apply_poc_kv_skip(attn_metadata, poc_metadata, num_total_tokens, device):
-    """Set slot_mapping = PAD (-1) at PREFILL-ONLY PoC positions to skip KV
-    writes. Decode-PoC positions keep their reserved-block slots — they must
-    write/read real KV — so they are left untouched."""
-    if not attn_metadata or not poc_metadata:
-        return
-    pad_mask = torch.zeros(num_total_tokens, dtype=torch.bool, device=device)
-    has_pad = False
-    for meta in poc_metadata:
-        if meta.get('decode_state') is None:
-            s = meta['start_idx']
-            pad_mask[s:s + meta['length']] = True
-            has_pad = True
-    if not has_pad:
-        return
-    for layer_metadata in attn_metadata.values():
-        if hasattr(layer_metadata, 'slot_mapping'):
-            layer_metadata.slot_mapping[pad_mask] = -1
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +342,7 @@ def process_poc_outputs_from_hidden(
     from vllm.v1.outputs import PoCOutput
     from vllm.poc.gpu_random import random_pick_indices, apply_haar_rotation
     from vllm.poc.data import encode_vector
-    from vllm.poc.poc_model_runner import (
+    from vllm.poc.sphere import (
         SPHERE_DIM, _SPHERE_CODEBOOK, project_to_sphere, nearest_sphere_index,
     )
 
@@ -377,23 +387,30 @@ def process_poc_outputs_from_hidden(
             continue
 
         if 'decode_step' not in meta:
-            # Prefill step of a decode-PoC: vector_b64 + seed prefill sphere_k.
+            # Prefill step of a decode-PoC: vector_b64 + seed prefill sphere_k
+            # (aligned to the reference when validating).
             st.vector_b64 = _vector_b64()
             k0 = _sphere_k(None, 0)
-            st.prev_k = k0
             st.k_points_steps = [k0]
+            ref0 = st.reference[0] if (st.reference and len(st.reference) > 0) else None
+            delta, st.prev_k = aligned_step(k0, ref0)
+            st.n_sphere_mismatches = delta
         else:
-            # One decode step: chain sphere_k from prev_k.
+            # One decode step: compute own sphere_k, then aligned_step counts a
+            # mismatch and seeds prev_k (from the reference when validating).
             step = meta['decode_step']
             k = _sphere_k([st.prev_k], step)
             st.k_points_steps.append(k)
-            st.prev_k = k
+            ref = st.reference[step] if (st.reference and step < len(st.reference)) else None
+            delta, st.prev_k = aligned_step(k, ref)
+            st.n_sphere_mismatches += delta
             if step >= st.max_tokens:
                 poc_outputs[meta['req_id']] = PoCOutput(
                     nonce=nonce,
                     vector_b64=st.vector_b64,
-                    sphere_k=st.k_points_steps[0],
                     k_points_steps=st.k_points_steps,
+                    n_sphere_mismatches=(
+                        st.n_sphere_mismatches if st.reference is not None else -1),
                 )
                 get_decode_manager(runner).free(meta['req_id'])
 
@@ -412,8 +429,6 @@ def filter_sampling_metadata_for_chat(
     """
     from vllm.v1.sample.metadata import SamplingMetadata
     from vllm.v1.sample.logits_processor.state import LogitsProcessors
-
-    num_chat = len(chat_indices)
 
     def filter_tensor(t, dim=0):
         if t is None:
@@ -551,3 +566,4 @@ def expand_sampler_output_for_poc(
         sampled_token_ids=full_sampled,
         logprobs_tensors=full_logprobs,
     )
+

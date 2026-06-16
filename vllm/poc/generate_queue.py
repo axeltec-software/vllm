@@ -32,9 +32,9 @@ async def compute_nonce_artifacts(
 
     One PoC request per nonce is submitted through
     ``engine_client.generate(poc_params=...)`` and gathered concurrently. The
-    scheduler runs pure-PoC batches (KV-bound decode on the reserved blocks,
-    full sphere_k trajectory) or interleaves prefill-only PoC with live chat —
-    PoC and chat co-exist with no collective_rpc and no chat freeze.
+    scheduler runs pure-PoC batches (KV-bound decode on paged blocks, full
+    sphere_k trajectory) or interleaves prefill-only PoC with live chat —
+    PoC and chat co-exist with no chat freeze.
 
     This is the single source of truth for PoC artifact computation; both the
     /generate endpoint and the queue worker call it.
@@ -68,12 +68,10 @@ async def compute_nonce_artifacts(
                     return None
                 get = poc_out.get if isinstance(poc_out, dict) else (
                     lambda k, d=None: getattr(poc_out, k, d))
-                # Same artifact structure as the old engine_patch path:
                 # sph_* debug fields are only included when debug is on.
                 artifact = {
                     "nonce": get("nonce", nonce),
                     "vector_b64": get("vector_b64", ""),
-                    "sphere_k": get("sphere_k", -1),
                     "k_points_steps": get("k_points_steps", []),
                     "n_sphere_mismatches": get("n_sphere_mismatches", -1),
                 }

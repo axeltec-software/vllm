@@ -18,7 +18,6 @@ from .generate_queue import (
     compute_nonce_artifacts,
 )
 from .validation import run_validation
-from .reservation import poc_blocks_needed, poc_reserved_blocks
 
 logger = init_logger(__name__)
 
@@ -92,7 +91,6 @@ class NonceIterator:
 class ArtifactModel(BaseModel):
     nonce: int
     vector_b64: str
-    sphere_k: Optional[int] = None
     k_points_steps: Optional[List[int]] = None
     n_sphere_mismatches: Optional[int] = None
     sph_indices_steps: Optional[List[List[int]]] = None
@@ -241,41 +239,6 @@ async def _cancel_poc_tasks(app_id: int):
 
 
 
-def check_reservation_fits(engine_client, body: "PoCGenerateRequest"):
-    """Reject (400) PoC requests that would overflow the KV reservation.
-
-    PoC writes KV into the reserved block range [0, reserved); a request whose
-    footprint exceeds it would land in chat-owned blocks and corrupt output.
-    This gives the client a clear error instead of a 500 from the worker-side
-    guard. Best-effort: if the engine config isn't reachable, the worker-side
-    guard still protects us.
-    """
-    cache_config = getattr(getattr(engine_client, "vllm_config", None),
-                           "cache_config", None)
-    if cache_config is None:
-        return
-    block_size = cache_config.block_size
-    if not block_size:
-        return
-    reserved = poc_reserved_blocks(cache_config, block_size)
-    # Effective per-forward batch is the chunk size, capped by nonce count.
-    batch = min(body.batch_size, len(body.nonces)) if body.nonces else 0
-    needed = poc_blocks_needed(batch, body.params.seq_len, body.params.max_tokens,
-                               block_size)
-    if needed > reserved:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"request exceeds PoC KV reservation: needs {needed} blocks "
-                f"(batch_size={batch}, seq_len={body.params.seq_len}, "
-                f"max_tokens={body.params.max_tokens}) but only {reserved} are reserved "
-                f"(poc_max_batch_size={cache_config.poc_max_batch_size}, "
-                f"poc_seq_len={cache_config.poc_seq_len}, "
-                f"poc_max_tokens={cache_config.poc_max_tokens}); lower the "
-                f"request params or raise the --poc-* server args"
-            ),
-        )
-
 
 async def _compute_artifacts_chunk(
     engine_client,
@@ -337,7 +300,6 @@ async def _generation_loop(
     last_report_time = start_time
     
     logger.info(f"PoC generation started (node {config['node_id']}/{config['node_count']}, group {config['group_id']}/{config['n_groups']})")
-    skip_count = 0
     timeout_count = 0
     pending_nonces = None
     
@@ -364,7 +326,6 @@ async def _generation_loop(
                 continue
 
             timeout_count = 0
-            skip_count = 0
             pending_nonces = None
 
             if artifacts and callback_sender:
@@ -472,7 +433,6 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     logger.info(f"PoC /generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.nonces}, {body.params}, {body.batch_size}, {body.wait}, {body.url}, {body.validation}, {body.stat_test}, {body.poc_stronger_rng}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
-    check_reservation_fits(engine_client, body)
 
     app_id = id(request.app)
 

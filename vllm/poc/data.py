@@ -1,6 +1,6 @@
 """PoC data types and helpers for artifact-based validation."""
 import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
 import numpy as np
@@ -11,14 +11,6 @@ from scipy.stats import binomtest
 DEFAULT_DIST_THRESHOLD = 0.02
 DEFAULT_P_MISMATCH = 0.001
 DEFAULT_FRAUD_THRESHOLD = 0.01
-
-
-@dataclass
-class PoCParams:
-    """Strict params for PoC requests - exactly 3 fields."""
-    model: str
-    seq_len: int
-    k_dim: int = 12
 
 
 @dataclass

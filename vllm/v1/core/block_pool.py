@@ -151,7 +151,6 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        poc_reserved_blocks: int = 0,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -174,17 +173,6 @@ class BlockPool:
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
-
-        # Blocks [0, poc_reserved_blocks) are permanently reserved for PoC
-        # (Proof of Compute) exclusive use.  Block 0 is the null_block already
-        # removed above.  Blocks 1..poc_reserved_blocks-1 are popped from the
-        # free queue so the chat scheduler never allocates them.  PoC forward
-        # passes use sequential block IDs starting from 0 and rely on this
-        # range being permanently free for their KV writes.
-        self.poc_reserved_block_ids: list[int] = [0]
-        if poc_reserved_blocks > 1:
-            extra = self.free_block_queue.popleft_n(poc_reserved_blocks - 1)
-            self.poc_reserved_block_ids.extend(b.block_id for b in extra)
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []

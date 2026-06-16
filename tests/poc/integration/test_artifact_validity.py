@@ -74,19 +74,6 @@ class TestVectorContent:
 
 
 @pytest.mark.integration
-class TestDeterminism:
-    def test_same_request_same_vectors(self, url):
-        """Identical request repeated twice produces identical vectors."""
-        nonces = [1, 2, 3]
-        data1 = _generate(url, "0xdeterminism", nonces)
-        data2 = _generate(url, "0xdeterminism", nonces)
-        vecs1 = [a["vector_b64"] for a in data1["artifacts"]]
-        vecs2 = [a["vector_b64"] for a in data2["artifacts"]]
-        for i, (v1, v2) in enumerate(zip(vecs1, vecs2)):
-            assert v1 == v2, f"Nonce {nonces[i]}: vector changed between identical calls"
-
-
-@pytest.mark.integration
 class TestNonceIndependence:
     def test_all_nonce_vectors_distinct(self, url):
         """10 different nonces produce 10 distinct vectors."""

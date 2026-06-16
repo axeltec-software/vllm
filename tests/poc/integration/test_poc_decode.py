@@ -80,25 +80,20 @@ class TestDecodeStepStructure:
                     f"k={k} out of [0, {SPHERE_POINTS})"
                 )
 
-    def test_sphere_k_present_with_decode(self, url):
-        """Prefill sphere_k is present, in range, and equals k_points_steps[0].
+    def test_prefill_k_present_with_decode(self, url):
+        """The prefill k is k_points_steps[0], present and in range.
 
-        The consolidated API exposes both the scalar ``sphere_k`` (prefill
-        codebook index) and the per-step ``k_points_steps``
-        ([prefill_k, decode1_k, ...]). sphere_k is the fundamental decode-PoC
-        artifact and must equal k_points_steps[0].
+        The scalar ``sphere_k`` field was dropped (it was just a redundant copy of
+        k_points_steps[0]); the per-step ``k_points_steps`` ([prefill_k, decode1_k,
+        ...]) is the decode-PoC artifact. Also assert sphere_k is GONE.
         """
         data = _poc_with_decode(url, "0xdecode_sphere_k", [1, 2], max_tokens=3)
         for artifact in data["artifacts"]:
             steps = artifact.get("k_points_steps", [])
             assert steps, f"Artifact nonce={artifact['nonce']} missing k_points_steps"
             assert 0 <= steps[0] < SPHERE_POINTS
-            sphere_k = artifact.get("sphere_k")
-            assert sphere_k is not None, \
-                f"Artifact nonce={artifact['nonce']} missing scalar sphere_k"
-            assert sphere_k == steps[0], (
-                f"sphere_k ({sphere_k}) must equal k_points_steps[0] ({steps[0]})"
-            )
+            assert "sphere_k" not in artifact, \
+                "scalar sphere_k should be dropped from the response"
 
 
 @pytest.mark.integration
@@ -138,27 +133,19 @@ class TestDecodeEntropy:
 
 
 @pytest.mark.integration
-class TestDecodeDeterminism:
-    def test_same_request_same_kpoints(self, url):
-        """Identical request returns identical k_points_steps on both calls."""
-        nonces = [7, 8, 9]
-        max_tokens = 5
-        data1 = _poc_with_decode(url, "0xdecode_repro", nonces, max_tokens)
-        data2 = _poc_with_decode(url, "0xdecode_repro", nonces, max_tokens)
-        for a1, a2 in zip(data1["artifacts"], data2["artifacts"]):
-            assert a1["nonce"] == a2["nonce"]
-            assert a1.get("k_points_steps") == a2.get("k_points_steps"), (
-                f"Nonce {a1['nonce']}: k_points_steps changed between identical calls\n"
-                f"Call 1: {a1.get('k_points_steps')}\n"
-                f"Call 2: {a2.get('k_points_steps')}"
-            )
-
-    def test_same_request_same_final_vector(self, url):
-        """Decode produces the same final vector on repeated calls."""
-        nonces = [42]
-        max_tokens = 3
-        data1 = _poc_with_decode(url, "0xdecode_vector_repro", nonces, max_tokens)
-        data2 = _poc_with_decode(url, "0xdecode_vector_repro", nonces, max_tokens)
-        v1 = data1["artifacts"][0]["vector_b64"]
-        v2 = data2["artifacts"][0]["vector_b64"]
-        assert v1 == v2, "Decode must produce the same final vector for identical inputs"
+class TestDecodeKVBound:
+    def test_decode_depends_on_prefill(self, url):
+        """A different prefill (block_hash) for the SAME nonce yields a
+        substantially different decode trajectory — proving each decode step reads
+        its prefill KV, not just the nonce seed. A couple of boundary flips would
+        be FP noise; most-steps-differ is real KV dependence (the security-critical
+        property: you cannot decode without having computed the right prefill)."""
+        nonce, mt = [5], 8
+        a = _poc_with_decode(url, "0xkvbound_A", nonce, mt)["artifacts"][0]["k_points_steps"]
+        b = _poc_with_decode(url, "0xkvbound_B", nonce, mt)["artifacts"][0]["k_points_steps"]
+        assert len(a) == len(b) == mt + 1
+        differ = sum(1 for x, y in zip(a, b) if x != y)
+        assert differ > 2, (
+            f"decode trajectory barely changed across different prefill "
+            f"({differ}/{len(a)} steps differ) — decode may not be KV-bound\n"
+            f"A={a}\nB={b}")

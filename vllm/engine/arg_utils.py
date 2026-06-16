@@ -583,6 +583,7 @@ class EngineArgs:
     poc_max_batch_size: int = get_field(CacheConfig, "poc_max_batch_size")
     poc_seq_len: int = get_field(CacheConfig, "poc_seq_len")
     poc_max_tokens: int = get_field(CacheConfig, "poc_max_tokens")
+    poc_share: float = get_field(CacheConfig, "poc_share")
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -970,6 +971,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--poc-max-tokens", **cache_kwargs["poc_max_tokens"]
+        )
+        cache_group.add_argument(
+            "--poc-share", **cache_kwargs["poc_share"]
         )
 
         # Multimodal related configs
@@ -1453,6 +1457,7 @@ class EngineArgs:
             poc_max_batch_size=self.poc_max_batch_size,
             poc_seq_len=self.poc_seq_len,
             poc_max_tokens=self.poc_max_tokens,
+            poc_share=self.poc_share,
         )
 
         ray_runtime_env = None
