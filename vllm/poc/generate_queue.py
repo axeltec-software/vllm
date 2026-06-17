@@ -344,6 +344,7 @@ class GenerateQueue:
             p_mismatch=job.stat_test_p_mismatch,
             fraud_threshold=job.stat_test_fraud_threshold,
             k_dim=job.k_dim,
+            use_trajectory=job.max_tokens > 0,
         )
         
         return {

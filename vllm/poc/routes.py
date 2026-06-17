@@ -553,8 +553,11 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         p_mismatch=stat_test.p_mismatch,
         fraud_threshold=stat_test.fraud_threshold,
         k_dim=body.params.k_dim,
+        # decode flow (max_tokens>0) → count sphere_k mismatches vs p_mismatch;
+        # prefill flow → vector-L2 + binomial (unchanged). Same response shape.
+        use_trajectory=body.params.max_tokens > 0,
     )
-    
+
     return {
         "status": "completed",
         "request_id": str(uuid.uuid4()),
