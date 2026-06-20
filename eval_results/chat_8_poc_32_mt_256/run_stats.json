@@ -1,0 +1,23 @@
+{
+  "model_name": "Qwen/Qwen3-0.6B",
+  "batch_size": 8,
+  "server_host": "127.0.0.1",
+  "server_port": 33567,
+  "tasks": "gsm8k",
+  "elapsed_seconds": 104.06287908554077,
+  "return_code": 0,
+  "poc_enabled": true,
+  "poc_requests": 32,
+  "poc_nonces": 1,
+  "poc_max_tokens": 256,
+  "gsm8k": {
+    "strict_match": 0.0,
+    "flexible_extract": 0.18,
+    "results_file": "eval_results/Qwen__Qwen3-0.6B/results_2026-06-14T07-28-59.020043.json"
+  },
+  "poc_requests_sent": 352,
+  "poc_requests_successful": 352,
+  "poc_nonces_processed": 352,
+  "poc_nonces_per_sec": 3.3825702603389662,
+  "poc_median_time": 9.077009797096252
+}

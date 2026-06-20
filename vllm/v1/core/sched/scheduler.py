@@ -418,6 +418,17 @@ class Scheduler(SchedulerInterface):
                     req_index += 1
                     continue
                 pp = request.poc_params
+                # Stop launching once every prefill + decode forward has been
+                # scheduled (num_computed counts launched tokens: seq_len at
+                # prefill, +1 per decode step). The request then stays alive (via
+                # num_output_placeholders) until the terminal forward's artifact
+                # drains; finish is artifact-driven in update_from_output, never
+                # num_computed-gated (which would strand the artifact under async).
+                if (pp.max_tokens > 0
+                        and request.num_computed_tokens
+                        >= pp.seq_len + pp.max_tokens):
+                    req_index += 1
+                    continue
                 num_new_tokens = poc_step_num_tokens(
                     pp, request.num_computed_tokens)
                 # poc_share cap: defer once PoC has used its slice of the budget.
@@ -1445,44 +1456,36 @@ class Scheduler(SchedulerInterface):
                 # in pipeline parallelism).
                 continue
             
-            # PoC: Handle PoC requests - they finish immediately after prefill
+            # PoC: a decode-PoC request stays RUNNING across prefill +
+            # max_tokens decode steps; the runner accumulates the trajectory
+            # on-device and emits the FULL artifact ONCE at the final step
+            # (emit-once — no per-step IPC). Every scheduled PoC step adds a
+            # num_output_placeholder (async_scheduler) which we decrement here
+            # per update; finish is driven by ARTIFACT PRESENCE in the popped
+            # output (never num_computed), so it is never stranded under async.
             if request.poc_params is not None:
-                pp = request.poc_params
-                # Step-driven mixed decode (Phase 2): a decode-PoC request stays
-                # RUNNING across prefill + max_tokens decode steps. num_computed_
-                # tokens is advanced by _update_after_schedule, so just check it
-                # here. Emit no output on intermediate steps; the model runner
-                # accumulates the sphere_k trajectory and returns the full
-                # PoCOutput only on the final step (handled by the fall-through).
-                if (pp.max_tokens > 0
-                        and request.num_computed_tokens
-                        < pp.seq_len + pp.max_tokens):
+                if request.num_output_placeholders > 0:
+                    request.num_output_placeholders -= 1
+                poc_outputs = getattr(model_runner_output, "poc_outputs", None)
+                poc_obj = poc_outputs.get(req_id) if poc_outputs else None
+                if poc_obj is None:
+                    # Intermediate forward (emit-once): nothing to drain yet.
                     continue
-                # PoC requests are prefill-only, mark as finished
+                poc_output: dict | None = {
+                    "nonce": poc_obj.nonce,
+                    "vector_b64": poc_obj.vector_b64,
+                    "hidden_state_b64": poc_obj.hidden_state_b64,
+                    "reduced_hidden_state_b64": poc_obj.reduced_hidden_state_b64,
+                    "reduced_hidden_state_decode_b64": getattr(poc_obj, "reduced_hidden_state_decode_b64", []),
+                    "k_points_steps": getattr(poc_obj, "k_points_steps", []),
+                    "n_sphere_mismatches": getattr(poc_obj, "n_sphere_mismatches", -1),
+                    "sph_indices_steps": getattr(poc_obj, "sph_indices_steps", []),
+                    "sph_values_steps": getattr(poc_obj, "sph_values_steps", []),
+                }
                 request.status = RequestStatus.FINISHED_STOPPED
-                request.num_computed_tokens += num_tokens_scheduled
-                
                 # Free the request (no KV cache to free, but clean up)
                 self._free_request(request)
                 stopped_running_reqs.add(request)
-                
-                # PoC outputs will be in model_runner_output.poc_outputs
-                # and will be handled by the output processor
-                poc_output: dict | None = {}  # empty dict = PoC ran but no artifacts
-                if hasattr(model_runner_output, 'poc_outputs') and model_runner_output.poc_outputs is not None:
-                    poc_obj = model_runner_output.poc_outputs.get(req_id)
-                    if poc_obj is not None:
-                        poc_output = {
-                            "nonce": poc_obj.nonce,
-                            "vector_b64": poc_obj.vector_b64,
-                            "hidden_state_b64": poc_obj.hidden_state_b64,
-                            "reduced_hidden_state_b64": poc_obj.reduced_hidden_state_b64,
-                            "reduced_hidden_state_decode_b64": getattr(poc_obj, "reduced_hidden_state_decode_b64", []),
-                            "k_points_steps": getattr(poc_obj, "k_points_steps", []),
-                            "n_sphere_mismatches": getattr(poc_obj, "n_sphere_mismatches", -1),
-                            "sph_indices_steps": getattr(poc_obj, "sph_indices_steps", []),
-                            "sph_values_steps": getattr(poc_obj, "sph_values_steps", []),
-                        }
 
                 outputs[request.client_index].append(
                     EngineCoreOutput(

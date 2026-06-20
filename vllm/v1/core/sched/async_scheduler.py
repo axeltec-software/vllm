@@ -17,6 +17,13 @@ class AsyncScheduler(Scheduler):
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
+            # PoC emit-once: the runner emits the full artifact only on the
+            # terminal forward. Add one placeholder per scheduled step so the
+            # request stays alive until that output drains (decremented per
+            # update in scheduler.update_from_output's PoC branch -> nets to 0).
+            if request.poc_params is not None:
+                request.num_output_placeholders += 1
+                continue
             has_structured_output_requests |= request.use_structured_output
             pending_structured_output_tokens |= (
                 request.use_structured_output and request.num_output_placeholders > 0

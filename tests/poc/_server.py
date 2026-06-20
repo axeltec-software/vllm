@@ -75,6 +75,10 @@ class PoCTestServer:
         env = os.environ.copy()
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+        # cudagraph capture allocates in many small chunks on top of the KV pool;
+        # the default allocator fragments and OOMs on ~20 GiB GPUs even with free
+        # headroom (reserved-but-unallocated). expandable_segments recovers it.
+        env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
         if env_dict:
             env.update(env_dict)
 
@@ -83,9 +87,6 @@ class PoCTestServer:
             "--host", host,
             "--port", str(self.port),
             "--poc-decode",
-            # PoC's step-driven decode + artifact readout is not supported under
-            # async scheduling's execute/sample batch-queue split. Force sync.
-            "--no-async-scheduling",
             *vllm_serve_args,
         ]
 
@@ -206,8 +207,11 @@ CANONICAL_MODEL = "RedHatAI/Qwen2.5-7B-Instruct-quantized.w8a16"
 #  - PoC needs only seq_len=256 + max_tokens=256 = 512 tokens total, and chat in
 #    tests is short, so --max-model-len 1024 shrinks the engine's own cudagraph/
 #    activation footprint and frees GPU for cudagraph capture.
-#  - util 0.8 leaves headroom for cudagraph capture alongside dynamic KV.
-DEFAULT_SERVER_ARGS = ["--gpu-memory-utilization", "0.8", "--max-model-len", "1024"]
+#  - util on this 20 GiB GPU is a NARROW window: 0.8 → init cudagraph-capture
+#    OOMs; 0.6 → no memory left for KV cache blocks. 0.7 fits both (KV pool +
+#    runtime PoC-capture headroom). Paired with PYTORCH_ALLOC_CONF
+#    expandable_segments (set in __init__) to reclaim fragmented reserve.
+DEFAULT_SERVER_ARGS = ["--gpu-memory-utilization", "0.7", "--max-model-len", "1024"]
 
 
 class _ExistingServer:

@@ -1,0 +1,843 @@
+[
+  {
+    "request_id": 1,
+    "timestamp": 1781387342.3788934,
+    "block_hash": "block_1",
+    "nonces": [
+      0
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "b979a325-5c00-460b-93d0-cbe4b8ba4208",
+      "artifacts": [
+        {
+          "nonce": 0,
+          "vector_b64": "W7Ugrky2srSnMdUxIrbuNlMtnzeTKlKq",
+          "sphere_k": 12,
+          "k_points_steps": [
+            12
+          ],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 12.314136743545532
+  },
+  {
+    "request_id": 2,
+    "timestamp": 1781387346.2754173,
+    "block_hash": "block_2",
+    "nonces": [
+      1
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "ab123acc-134a-483b-89e6-c64de632dc3f",
+      "artifacts": [
+        {
+          "nonce": 1,
+          "vector_b64": "x6oxtMc2srPStfsyaLMpt38mwDHjNloy",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 2.6517462730407715
+  },
+  {
+    "request_id": 3,
+    "timestamp": 1781387348.4218807,
+    "block_hash": "block_3",
+    "nonces": [
+      2
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "6d2a4aa0-a71f-4b35-a0bd-772427926c93",
+      "artifacts": [
+        {
+          "nonce": 2,
+          "vector_b64": "/TI1uCE0HatzqSs1wzCjtDW34LAgsQi2",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.7351794242858887
+  },
+  {
+    "request_id": 4,
+    "timestamp": 1781387350.795559,
+    "block_hash": "block_4",
+    "nonces": [
+      3
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "53c99dfa-147b-4d04-9703-0c39867c6b77",
+      "artifacts": [
+        {
+          "nonce": 3,
+          "vector_b64": "UjLhtKClr7RusV8uKrPcNF0y+Liwtpsl",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.9899516105651855
+  },
+  {
+    "request_id": 5,
+    "timestamp": 1781387357.1244886,
+    "block_hash": "block_5",
+    "nonces": [
+      4
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "ed785ba4-d62f-4146-8126-9b4f0fe74936",
+      "artifacts": [
+        {
+          "nonce": 4,
+          "vector_b64": "cbD6M3Q24jSBscYyWTYSqO+12DEht+Az",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 4.978899717330933
+  },
+  {
+    "request_id": 6,
+    "timestamp": 1781387359.44465,
+    "block_hash": "block_6",
+    "nonces": [
+      5
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "a0cfd969-9544-4413-b2db-7cadec94ec48",
+      "artifacts": [
+        {
+          "nonce": 5,
+          "vector_b64": "frKGrfgwIawTtm4saTkJNE41fy1VtQ0x",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 1.1519932746887207
+  },
+  {
+    "request_id": 7,
+    "timestamp": 1781387362.4697974,
+    "block_hash": "block_7",
+    "nonces": [
+      6
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "4a471961-1d9c-412d-97a8-76faaad889e6",
+      "artifacts": [
+        {
+          "nonce": 6,
+          "vector_b64": "Pi0quaouVKxHL4WvOLT0MCI32zZ6sj2w",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 1.8374097347259521
+  },
+  {
+    "request_id": 8,
+    "timestamp": 1781387364.4471977,
+    "block_hash": "block_8",
+    "nonces": [
+      7
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "58b889c9-36df-48b1-95b9-e34535253698",
+      "artifacts": [
+        {
+          "nonce": 7,
+          "vector_b64": "57BkM+m1ljJGNlu4lSHdtsithDTtrqCu",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.8237295150756836
+  },
+  {
+    "request_id": 9,
+    "timestamp": 1781387366.4467156,
+    "block_hash": "block_9",
+    "nonces": [
+      8
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "05aabc51-c681-42fe-ad10-72a4398bf839",
+      "artifacts": [
+        {
+          "nonce": 8,
+          "vector_b64": "NDRtNEwykqwqpUWl3DUsObw0I7Qorfo0",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.9468715190887451
+  },
+  {
+    "request_id": 10,
+    "timestamp": 1781387368.6961236,
+    "block_hash": "block_10",
+    "nonces": [
+      9
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "59a6d38a-9764-44fc-aaf3-eec24fb26d3d",
+      "artifacts": [
+        {
+          "nonce": 9,
+          "vector_b64": "RyU3rrIxqrEENbuwQjX9MIiuOrkoKMi3",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 1.0659618377685547
+  },
+  {
+    "request_id": 11,
+    "timestamp": 1781387371.1278236,
+    "block_hash": "block_11",
+    "nonces": [
+      10
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "cb82b3ba-8fc5-4d8c-9d49-82a90be8fa8e",
+      "artifacts": [
+        {
+          "nonce": 10,
+          "vector_b64": "UbCnKnMwmDXQuBiyRCflrKq41y5TIJG0",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.5735368728637695
+  },
+  {
+    "request_id": 12,
+    "timestamp": 1781387375.0542462,
+    "block_hash": "block_12",
+    "nonces": [
+      11
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "4af6ce03-6d01-4371-b0f3-139fdd7e6a2a",
+      "artifacts": [
+        {
+          "nonce": 11,
+          "vector_b64": "MzhrrcYwnzRBtOSywCwcLvcyFLYmsCu4",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 1.3243167400360107
+  },
+  {
+    "request_id": 13,
+    "timestamp": 1781387378.133653,
+    "block_hash": "block_13",
+    "nonces": [
+      12
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "70860b5f-6b7c-45e4-8916-e8d79f76adac",
+      "artifacts": [
+        {
+          "nonce": 12,
+          "vector_b64": "ijFKtRAwc7jVqZQuTLaTNWQ0eTVsspUv",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 1.203254222869873
+  },
+  {
+    "request_id": 14,
+    "timestamp": 1781387380.301766,
+    "block_hash": "block_14",
+    "nonces": [
+      13
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "b3f007fa-2e21-4ea2-bcfa-cb32392fff05",
+      "artifacts": [
+        {
+          "nonce": 13,
+          "vector_b64": "ya5nsXYt/bWdMVwvabhnrEy3YLHNtNu1",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.5692834854125977
+  },
+  {
+    "request_id": 15,
+    "timestamp": 1781387382.3633602,
+    "block_hash": "block_15",
+    "nonces": [
+      14
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "abcdfca3-124e-4973-a27f-359fa702398e",
+      "artifacts": [
+        {
+          "nonce": 14,
+          "vector_b64": "GjOYs4AwEbCOL8ItFDK/NIUvjblzNncz",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.7694284915924072
+  },
+  {
+    "request_id": 16,
+    "timestamp": 1781387384.2864463,
+    "block_hash": "block_16",
+    "nonces": [
+      15
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "b1521fac-16ea-4dd9-91f3-83f5fc90555c",
+      "artifacts": [
+        {
+          "nonce": 15,
+          "vector_b64": "xrgAoZK3/jQOJ3OybraxLAYk2qAyrT+1",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.8064720630645752
+  },
+  {
+    "request_id": 17,
+    "timestamp": 1781387386.3460855,
+    "block_hash": "block_17",
+    "nonces": [
+      16
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "233ab795-5a03-4d16-90e7-53739c140a85",
+      "artifacts": [
+        {
+          "nonce": 16,
+          "vector_b64": "y68stlKyDDOJtUozijE7uEYyOzMqNFC1",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.709470272064209
+  },
+  {
+    "request_id": 18,
+    "timestamp": 1781387390.988157,
+    "block_hash": "block_18",
+    "nonces": [
+      17
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "b79c5c31-e452-464a-b10d-ed293d077bd2",
+      "artifacts": [
+        {
+          "nonce": 17,
+          "vector_b64": "BjWzp/SuLbYutDA0fDQ4rhizDLESswK5",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 2.614809513092041
+  },
+  {
+    "request_id": 19,
+    "timestamp": 1781387393.8537536,
+    "block_hash": "block_19",
+    "nonces": [
+      18
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "16a9b905-3960-4c6e-96f4-4464df046895",
+      "artifacts": [
+        {
+          "nonce": 18,
+          "vector_b64": "MjTZNhQzPzgqNCk0JjOcsRg1mSw9Juw0",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.789025068283081
+  },
+  {
+    "request_id": 20,
+    "timestamp": 1781387395.8847785,
+    "block_hash": "block_20",
+    "nonces": [
+      19
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "bc6961d2-fca7-45f4-8a2b-7ad2f62b91c3",
+      "artifacts": [
+        {
+          "nonce": 19,
+          "vector_b64": "fLNfud+wbjIAtee0VDAZrDY1DDVXKIKu",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.5690648555755615
+  },
+  {
+    "request_id": 21,
+    "timestamp": 1781387398.526149,
+    "block_hash": "block_21",
+    "nonces": [
+      20
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "a5cefd66-c93a-476a-a07d-d5fd04a581dc",
+      "artifacts": [
+        {
+          "nonce": 20,
+          "vector_b64": "zjCLLR0ynrcCNK8qLi+ZMgW5PLGWtKE0",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 1.0047860145568848
+  },
+  {
+    "request_id": 22,
+    "timestamp": 1781387400.7632284,
+    "block_hash": "block_22",
+    "nonces": [
+      21
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "32811255-d809-4911-99af-c03eb94eac58",
+      "artifacts": [
+        {
+          "nonce": 21,
+          "vector_b64": "hyYuLBQ4yLXisHmuADYoDda1qbfcGyy0",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.8819088935852051
+  },
+  {
+    "request_id": 23,
+    "timestamp": 1781387405.028911,
+    "block_hash": "block_23",
+    "nonces": [
+      22
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "d5541bc5-bfb3-4ead-9b7b-97f1bed96b47",
+      "artifacts": [
+        {
+          "nonce": 22,
+          "vector_b64": "rDmtsVi2tapKHUmrmTfPM/wtcZ+0psSt",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 2.801377534866333
+  },
+  {
+    "request_id": 24,
+    "timestamp": 1781387406.7986774,
+    "block_hash": "block_24",
+    "nonces": [
+      23
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "76dfd285-0ca1-4172-b4ec-642cd2170a37",
+      "artifacts": [
+        {
+          "nonce": 23,
+          "vector_b64": "hLBlte+us7JFOLSyjzRIt+AzMzUCra4w",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.7514121532440186
+  },
+  {
+    "request_id": 25,
+    "timestamp": 1781387409.785617,
+    "block_hash": "block_25",
+    "nonces": [
+      24
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "c9e95f83-0399-4eb6-b2c7-1dd28db8a5e7",
+      "artifacts": [
+        {
+          "nonce": 24,
+          "vector_b64": "1zKtLsy5zzQrtByrbTLUMGmwrC1CNpsv",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 1.2254951000213623
+  },
+  {
+    "request_id": 26,
+    "timestamp": 1781387412.9578717,
+    "block_hash": "block_26",
+    "nonces": [
+      25
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "c41017cb-f4bb-4e78-9f97-5f4810eccc18",
+      "artifacts": [
+        {
+          "nonce": 25,
+          "vector_b64": "TKp4NAisEjnPov+w0baws38wPTHZtoww",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 1.5750999450683594
+  },
+  {
+    "request_id": 27,
+    "timestamp": 1781387415.6287138,
+    "block_hash": "block_27",
+    "nonces": [
+      26
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "6d0f49fd-5eb6-46dc-89e3-58c419110461",
+      "artifacts": [
+        {
+          "nonce": 26,
+          "vector_b64": "UrMtpMwyjjGjtKK4gqrvr5E3oyXWtIi1",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.9631125926971436
+  },
+  {
+    "request_id": 28,
+    "timestamp": 1781387417.5457044,
+    "block_hash": "block_28",
+    "nonces": [
+      27
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "c5a010a5-7154-43fd-ac1f-21237521f8c4",
+      "artifacts": [
+        {
+          "nonce": 27,
+          "vector_b64": "erM6NBKnn62uOA2xNzAuNXqsHLT6N7wz",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.8511426448822021
+  },
+  {
+    "request_id": 29,
+    "timestamp": 1781387420.19113,
+    "block_hash": "block_29",
+    "nonces": [
+      28
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "66b1245a-fd16-467e-847b-405c9cce8879",
+      "artifacts": [
+        {
+          "nonce": 28,
+          "vector_b64": "USiXuDsv/ix4LygqorThLQ+svbkJMNSt",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.5465254783630371
+  },
+  {
+    "request_id": 30,
+    "timestamp": 1781387422.15066,
+    "block_hash": "block_30",
+    "nonces": [
+      29
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "56879001-2ff2-43d9-a42b-c05b2d69ff8b",
+      "artifacts": [
+        {
+          "nonce": 29,
+          "vector_b64": "0DS/IMEwTCydOb+xGCuVKgA3NK2isZ+1",
+          "sphere_k": -1,
+          "k_points_steps": [],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 0.5307071208953857
+  },
+  {
+    "request_id": 31,
+    "timestamp": 1781387426.798858,
+    "block_hash": "block_31",
+    "nonces": [
+      30
+    ],
+    "result": {
+      "status": "completed",
+      "request_id": "bb4d4845-3012-41a7-94ae-9ac70ff801f8",
+      "artifacts": [
+        {
+          "nonce": 30,
+          "vector_b64": "nDWVMsw28bS0sEy0uDHynncuNLVpMUw4",
+          "sphere_k": 13,
+          "k_points_steps": [
+            13
+          ],
+          "n_sphere_mismatches": -1
+        }
+      ],
+      "encoding": {
+        "dtype": "f16",
+        "k_dim": 12,
+        "endian": "le"
+      }
+    },
+    "elapsed_time": 2.8020451068878174
+  }
+]

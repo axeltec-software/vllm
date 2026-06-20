@@ -1,0 +1,24 @@
+{
+  "model_name": "RedHatAI/Qwen2.5-7B-Instruct-quantized.w8a16",
+  "batch_size": 16,
+  "server_host": "127.0.0.1",
+  "server_port": 36653,
+  "tasks": "gsm8k",
+  "elapsed_seconds": 99.23358821868896,
+  "return_code": 0,
+  "poc_enabled": true,
+  "poc_requests": 1,
+  "poc_nonces": 1,
+  "poc_max_tokens": 0,
+  "gsm8k": {
+    "strict_match": 0.1,
+    "flexible_extract": 0.69,
+    "results_file": "eval_results/RedHatAI__Qwen2.5-7B-Instruct-quantized.w8a16/results_2026-06-13T23-50-24.817070.json"
+  },
+  "poc_requests_sent": 31,
+  "poc_requests_successful": 31,
+  "poc_median_time": 0.9631125926971436,
+  "poc_mean_time": 1.6567146393560594,
+  "poc_min_time": 0.5307071208953857,
+  "poc_max_time": 12.314136743545532
+}
