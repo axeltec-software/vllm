@@ -83,11 +83,21 @@ SEPARATION: PASS  (honest must be fraud=False, fraud must be fraud=True)
 ```
 Honest 0.14% ≪ 10% ≪ fraud 33.8% — a wide, unambiguous gap.
 
-## Determinism requirement
-The fingerprint must be **identical across engine configurations** — eager vs
-CUDA-graph, async vs sync. If graph mode changed the trajectory, validation would be
-meaningless, so this is a hard gate (`tests/poc/integration/test_async_equivalence.py`
-+ byte-comparing `collect.py` outputs).
+## Determinism & config sensitivity
+The trajectory is reproducible at a **fixed** config, but config-sensitive in degrees
+(measured on Qwen2.5-7B; honest = same model both sides):
+- **async on ↔ off** (same engine + backend): **byte-identical** — the hard gate we
+  enforce (`tests/poc/integration/test_async_equivalence.py` + byte-comparing
+  `collect.py` outputs). Async must not change the artifact.
+- **cudagraph ↔ eager** (same backend): **≈4%** mismatch (FP/fusion deltas). Well under
+  a typical `p_mismatch` of 10%, so validation **tolerates** graph-mode differences.
+- **FlashAttention ↔ FlashInfer**: **≈17%** — different kernels; a single early
+  `sphere_k` flip re-seeds the chain and compounds. The validator **must use the
+  prover's attention backend** (pin it), or an honest run reads as fraud.
+- **different model** (fraud): **≈34%**.
+
+So `p_mismatch` must sit between honest-same-backend (≈0–4%) and fraud (≈34%), **with
+the attention backend pinned** between prover and validator.
 
 Every result file also records **full provenance** (GPU + driver, vLLM commit, engine
 mode, attention backend, dtype, quant, model, shape), so any two runs are directly
@@ -162,7 +172,8 @@ above runs through the same `--profile` / `--url` / shape flags with no code cha
 | Result | Metric | Tool |
 |---|---|---|
 | Fraud/honest separation | `rate`, `fraud = rate > p_mismatch` | `collect.py` generate/validate → `analyze.py` SEPARATION (one command: `pair_report.sh`) |
-| Determinism | fingerprint byte-identical across engines | `tests/poc/integration/test_async_equivalence.py` + `collect.py` byte-compare |
+| Determinism | fingerprint byte-identical for async on↔off (same engine+backend) | `tests/poc/integration/test_async_equivalence.py` + `collect.py` byte-compare |
+| Config sensitivity | cudagraph↔eager ≈4% (tolerated); backend↔backend ≈17% (pin); fraud ≈34% | `collect.py` validate matrix → `analyze.py` SEPARATION |
 | Throughput | nonces/s, nonces/min, steps/s | `perfomance_nonces.py`; `collect.py` timing → `analyze.py` PERF |
 | Co-existence | GSM8K strict/flexible accuracy ± PoC load | `quality_gsm8k.py` (`--disable_poc` baseline) → `analyze.py` GSM8K |
 | Correctness suite | unit + integration (separation, equivalence, multi-batch slot-reuse) | `tests/poc/unit/*`, `tests/poc/integration/*` |
@@ -178,9 +189,8 @@ one says *how fast*, the other says *honest or fraud*.
 | `collect.py` | data collection (client/server): `--mode generate` / `--mode validate`, full provenance |
 | `analyze.py` | offline analysis: SEPARATION matrix, PERF table, GSM8K accuracy, cross-hardware |
 | `pair_report.sh` | one-command honest/fraud pair (generate ×2, validate ×4, analyze); `--gen-profile`/`--val-profile` for cross-engine |
-| `perfomance_nonces.py` | sustained decode throughput (nonces/s, steps/s) |
+| `perfomance_nonces.py` | sustained throughput — `--mode poc` (nonces/min, steps/s), `--mode chat` (req/min, tokens/s), or `--mode both` |
 | `quality_gsm8k.py` | GSM8K accuracy ± concurrent PoC load |
-| `chat_throughput.py` | chat-only baseline |
 | `poc_validation.py` | shared core: deploy/serve, profile resolution, request builder, provenance |
 | `poc_configs.json` | named engine profiles (graph/eager × attention backend) |
 | `requirements.txt` | tooling deps (`requests`; gsm8k: `aiohttp`, `numpy`, `lm_eval`) |

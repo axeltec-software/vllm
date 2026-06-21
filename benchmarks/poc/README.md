@@ -38,9 +38,8 @@ Three collectors drive the server; each writes its own **role-tagged** result fi
 | `collect.py` | Collect data from a server: `--mode generate` (produce a k-trajectory) or `--mode validate --ref F` (re-run teacher-forced against F → mismatches). Writes one result file with data + timing + provenance. |
 | `analyze.py` | Offline, no server. Loads many result files → **SEPARATION** matrix, **PERF** table, **GSM8K** table. Cross-hardware/engine comparison = feed in more files. |
 | `pair_report.sh` | One command for an honest/fraud pair (generate ×2, validate ×4, analyze). |
-| `perfomance_nonces.py` | Sustained decode throughput sweep (nonces/s, nonces/min, steps/s). |
+| `perfomance_nonces.py` | Sustained decode throughput, **one tool for both** `--mode poc` (nonces/min, steps/s) and `--mode chat` (req/min, tokens/s) — or `--mode both`. req/min ≈ nonce/min (same unit: one decode sequence), showing how closely PoC tracks real-inference capacity. |
 | `quality_gsm8k.py` | GSM8K accuracy with/without concurrent PoC load (co-existence). |
-| `chat_throughput.py` | Chat-only throughput baseline. |
 | `poc_validation.py` | Shared core: deploy/serve, profile resolution, request builder, provenance. |
 | `poc_configs.json` | Named engine **profiles** (graph/eager × attention backend, …). |
 
@@ -60,7 +59,8 @@ The tooling covers arbitrary configurations, not a fixed list:
 - **Engine configs are named profiles** (`poc_configs.json`, `--profile`): graph vs
   eager, attention backend (FlashAttention / FlashInfer), async vs sync, plus any
   extra serve flags. New profiles need no code change. A pair can use two profiles
-  (`--gen-profile` / `--val-profile`) to test cross-engine determinism.
+  (`--gen-profile` / `--val-profile`) to measure cross-engine divergence (cudagraph↔eager
+  ≈4%, FlashAttn↔FlashInfer ≈17% — pin the backend).
 - **Shape is configurable** — `--seq-len`, `--max-tokens`, `--nonces` (defaults match
   production) for varied input/output lengths.
 - **Comparison is provenance-driven** — each file records exactly what ran, so adding
