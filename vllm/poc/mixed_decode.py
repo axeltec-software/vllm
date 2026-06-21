@@ -27,6 +27,44 @@ logger = init_logger(__name__)
 # exclusive step (fairness valve — keeps PoC from starving under chat churn).
 POC_DEFER_LIMIT = 4
 
+
+def slice_sampling_metadata(sm, rows, device):
+    """Restrict a SamplingMetadata to `rows` (input_batch indices), so the sampler
+    runs on chat rows only. PoC rows have no sampling semantics; keeping them out
+    avoids stale/oversized penalty tensors and the per-row param mismatch."""
+    import dataclasses
+
+    idx = torch.tensor(rows, device=device, dtype=torch.long)
+    keep = set(rows)
+    remap = {old: new for new, old in enumerate(rows)}
+
+    def take_t(t):
+        return None if t is None else t[idx]
+
+    def take_list(lst):
+        return [lst[i] for i in rows] if lst else lst
+
+    def remap_dict(d):
+        return None if d is None else {remap[k]: v for k, v in d.items() if k in keep}
+
+    return dataclasses.replace(
+        sm,
+        temperature=take_t(sm.temperature),
+        top_p=take_t(sm.top_p),
+        top_k=take_t(sm.top_k),
+        generators=remap_dict(sm.generators) or {},
+        prompt_token_ids=take_t(sm.prompt_token_ids),
+        frequency_penalties=take_t(sm.frequency_penalties),
+        presence_penalties=take_t(sm.presence_penalties),
+        repetition_penalties=take_t(sm.repetition_penalties),
+        output_token_ids=take_list(sm.output_token_ids),
+        spec_token_ids=take_list(sm.spec_token_ids),
+        allowed_token_ids_mask=take_t(sm.allowed_token_ids_mask),
+        bad_words_token_ids=remap_dict(sm.bad_words_token_ids),
+        enforced_next_token_ids=take_t(sm.enforced_next_token_ids),
+    )
+
+
 def decode_only_mixing_gate(
     *,
     mixed_cudagraph: bool,
