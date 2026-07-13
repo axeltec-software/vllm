@@ -18,10 +18,22 @@ fused into the chat forward — chat is never frozen); validation runs pure.
 """
 from dataclasses import dataclass, field
 
+import os
 import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# MARGIN GATE (validator-side, mismatch-based). Count a teacher-forced disagreement as a
+# mismatch ONLY if the validator's own snap margin (top1-top2 cosine gap) >= tau. A tiny
+# margin means the query sat on a codebook boundary, where cross-HW/backend fp jitter flips
+# the snap — boundary jitter, NOT fraud; a structured fraud offset pushes the query
+# decisively into a wrong cell (larger margin) and still counts. Since margin >= 0 always,
+# tau=0.0 (default) is a no-op: every mismatch counts, artifacts and verdicts unchanged.
+# The prover is unaffected (it emits no margin); only the validator's count is gated. Pin
+# tau PER MODEL (calibrate so the honest cross-HW floor drops below the acceptance
+# threshold while the subtlest fraud of concern stays above it).
+_MARGIN_TAU = float(os.environ.get("VLLM_POC_MARGIN_TAU", "0") or "0")
 
 # Bound on consecutive chat-prefill defers before a decoding PoC is forced an
 # exclusive step (fairness valve — keeps PoC from starving under chat churn).
@@ -414,7 +426,7 @@ def process_poc_outputs_from_hidden(
     )
     from vllm.poc.data import encode_vector
     from vllm.poc.sphere import (
-        SPHERE_DIM, get_sphere_codebook, project_to_sphere, snap_with_guard,
+        SPHERE_DIM, get_sphere_codebook, project_to_sphere, snap_with_margin,
     )
 
     poc_outputs = {}
@@ -457,10 +469,10 @@ def process_poc_outputs_from_hidden(
             return encode_vector(yk.half().cpu().numpy())
 
         def _sphere_from_idx(sph):
-            """hidden -> (sphere index, non-finite mask) as [1] int64/bool TENSORs
+            """hidden -> (sphere index, non-finite mask, margin) as [1] TENSORs
             (no .item(), so the chain stays on GPU and async scheduling works)."""
             xk_sphere = project_to_sphere(torch.gather(last_hidden.unsqueeze(0), 1, sph))
-            return snap_with_guard(xk_sphere, codebook)  # (k[1] int64, bad[1] bool)
+            return snap_with_margin(xk_sphere, codebook)  # (k[1], bad[1], margin[1])
 
         if st is None:
             # Prefill-only PoC: just the vector_b64 artifact.
@@ -477,7 +489,7 @@ def process_poc_outputs_from_hidden(
         sph0 = random_pick_indices(
             poc_params.block_hash, poc_params.public_key, [nonce],
             hidden_size, SPHERE_DIM, runner.device)
-        k0_t, bad0 = _sphere_from_idx(sph0)                 # [1] tensors
+        k0_t, bad0, margin0 = _sphere_from_idx(sph0)        # [1] tensors
         st.k_steps_t = [k0_t]
         st.mismatch_t = torch.zeros(1, dtype=torch.int64, device=runner.device)
         st.n_nan_t = bad0.to(torch.int64)                   # [1] non-finite-step counter
@@ -485,8 +497,10 @@ def process_poc_outputs_from_hidden(
             st.reference_t = torch.tensor(
                 st.reference, dtype=torch.int64, device=runner.device)
             ref0 = st.reference_t[0:1]
-            # a non-finite step is a compute fault, not a mismatch -> exclude it
-            st.mismatch_t += ((k0_t != ref0) & (k0_t >= 0)).to(torch.int64)
+            # count a mismatch only if finite (fault != fraud) AND the validator's snap
+            # was confident (margin >= tau; low margin = boundary jitter, not fraud).
+            st.mismatch_t += (
+                (k0_t != ref0) & (k0_t >= 0) & (margin0 >= _MARGIN_TAU)).to(torch.int64)
             st.prev_k_t = ref0                              # aligned (teacher-forced)
         else:
             st.prev_k_t = k0_t
@@ -505,10 +519,10 @@ def process_poc_outputs_from_hidden(
         steps = torch.tensor([m['decode_step'] for m in decode_metas],
                              dtype=torch.int64, device=device)
         sph = random_pick_indices_gpu(base_seeds, prev_k, steps, H, SPHERE_DIM, device)
-        # snap_with_guard: argmax(NaN) is garbage -> non-finite rows return k=-1
-        # (compute fault, NOT fraud). bad_all stays on device (no per-step sync).
-        k_all, bad_all = snap_with_guard(
-            project_to_sphere(torch.gather(lh, 1, sph)), codebook)   # [B] int64, [B] bool
+        # snap_with_margin: argmax(NaN) is garbage -> non-finite rows return k=-1
+        # (compute fault, NOT fraud). bad_all/margin_all stay on device (no per-step sync).
+        k_all, bad_all, margin_all = snap_with_margin(
+            project_to_sphere(torch.gather(lh, 1, sph)), codebook)   # [B] int64/bool/float
 
         for i, meta in enumerate(decode_metas):
             st = meta['decode_state']
@@ -518,8 +532,11 @@ def process_poc_outputs_from_hidden(
             st.n_nan_t += bad_all[i:i + 1].to(torch.int64)    # device accumulate (no sync)
             if st.reference_t is not None and step < st.reference_t.shape[0]:
                 ref = st.reference_t[step:step + 1]
-                # exclude a non-finite step from the mismatch count (fault != fraud)
-                st.mismatch_t += ((k_t != ref) & (k_t >= 0)).to(torch.int64)
+                # count only finite (fault != fraud) AND confident (margin >= tau;
+                # low margin = boundary jitter, not fraud) disagreements.
+                st.mismatch_t += (
+                    (k_t != ref) & (k_t >= 0)
+                    & (margin_all[i:i + 1] >= _MARGIN_TAU)).to(torch.int64)
                 st.prev_k_t = ref                             # aligned (teacher-forced)
             else:
                 st.prev_k_t = k_t

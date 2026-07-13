@@ -172,3 +172,27 @@ def snap_with_guard(
     k = nearest_sphere_index(query, codebook)            # [batch]
     k = torch.where(bad, torch.full_like(k, -1), k)
     return k, bad
+
+
+def snap_with_margin(
+    query: torch.Tensor, codebook: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`snap_with_guard` plus the top1-top2 cosine margin (how decisively the point
+    won). A small margin means the query sits right on a codebook boundary, where
+    tiny fp differences across HW/attention-backend flip the snap; a large margin
+    means it is firmly inside one cell. The validator gates its mismatch count on
+    this margin (``VLLM_POC_MARGIN_TAU``): a low-margin disagreement is boundary
+    jitter, not fraud. Margin is computed on the validator's OWN forward, so a
+    prover cannot see or steer it.
+
+    Returns ``(k, bad, margin)``: ``k`` [batch] int64 (``-1`` where non-finite),
+    ``bad`` [batch] bool, ``margin`` [batch] float32 (``0.0`` for non-finite rows).
+    """
+    bad = ~torch.isfinite(query).all(dim=-1)             # [batch]
+    sims = query.float() @ codebook.float().T            # [batch, SPHERE_POINTS]
+    top2 = sims.topk(2, dim=-1)
+    k = top2.indices[:, 0]
+    margin = (top2.values[:, 0] - top2.values[:, 1]).float()
+    k = torch.where(bad, torch.full_like(k, -1), k)
+    margin = torch.where(bad, torch.zeros_like(margin), margin)
+    return k, bad, margin
