@@ -61,6 +61,15 @@ bash run_scope.sh <honest> <fraud> --mla --tp 8 --gpu-mem 0.95 --extra "--enable
 | `--push` | upload the session to the public-read S3 bucket (needs `SUPABASE_SECRET`); omit to render locally |
 | `--xhw <peer[,peer2]>` | cross-HW: also validate the peer session(s)' (local `reports/<name>` or S3 name) trajectories with this box's validator |
 | `--xhw-only` | skip local generation; only run the `--xhw` cross-validation (for a parallel 2-box verify) |
+| `--p-mismatch P` | report's production acceptance threshold, as a fraction (default 0.1 = 10%): the Separation card shows ALL-PASS only if every honest row stays below it and every fraud row above it |
+| `--gsm-tol T` | report's GSM8K co-existence tolerance, as a fraction (default 0.0251 ≈ 2.5pt): an on/off accuracy delta within it reads as sampling noise, not a regression |
+
+`--p-mismatch` only changes how the *report* draws its ALL-PASS/REVIEW line — it does **not**
+change the `fraud_detected` verdict already baked into each `val_*.json`. That verdict comes from
+`collect.py`'s own `--p-mismatch` (also default 0.1), sent to the server at validate time and fixed
+before `run_scope.sh` ever calls `simplify_report.py`. The two currently default to the same value
+but are independent knobs — raising/lowering `run_scope.sh --p-mismatch` re-labels the same raw
+mismatch rates against a different line without re-running or changing the underlying validation.
 
 ## 3. What it produces
 

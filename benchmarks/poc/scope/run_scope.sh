@@ -6,6 +6,7 @@
 #
 #   run_scope.sh <honest-model> <fraud-model> [--mla] [--nonces N] [--max-tokens M]
 #                [--seq-len S] [--gsm-limit L] [--no-gsm] [--push]
+#                [--p-mismatch P] [--gsm-tol T]
 #
 # Separation = 5 logical pairs (validator fixed = honest @ production cg-FA; vary the
 # reference ONE axis at a time, one direction):
@@ -23,6 +24,7 @@ export HF_TOKEN="$(cat ~/.cache/huggingface/token 2>/dev/null || echo "")"
 
 HONEST="${1:?usage: run_scope.sh <honest> <fraud> [--mla] [opts]}"; FRAUD="${2:?need fraud}"; shift 2
 MLA=0; NONCES=128; MT=256; SEQ=256; GSMN=100; GSM=1; PUSH=0; PERFON=1; NOFI=0; GSM_MML=2048; TP=1; GMU=0.90; EXTRA=""; XHW=""; XHW_ONLY=0
+P_MISMATCH=0.1; GSM_TOL=0.0251   # forwarded to simplify_report.py; keep in sync with its own defaults
 SCOPE_COMMIT="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo '?')"   # report-tooling version
 while [ $# -gt 0 ]; do case "$1" in
   --mla) MLA=1; shift;; --nonces) NONCES="$2"; shift 2;; --max-tokens) MT="$2"; shift 2;;
@@ -34,6 +36,8 @@ while [ $# -gt 0 ]; do case "$1" in
   --extra) EXTRA="$2"; shift 2;;   # raw extra serve args from the deploy config (e.g. "--enable-expert-parallel --attention-backend <MLA-backend>")
   --xhw) XHW="$2"; shift 2;;   # CROSS-HW: peer session (local reports/<name> dir OR S3 name); pull its refs + validate here
   --xhw-only) XHW_ONLY=1; shift;;   # phase-2: SKIP local gen/perf/gsm, ONLY cross-validate the --xhw peer (for parallel 2-box verify)
+  --p-mismatch) P_MISMATCH="$2"; shift 2;;   # report's production acceptance threshold (fraction); passed to simplify_report.py
+  --gsm-tol) GSM_TOL="$2"; shift 2;;   # report's GSM8K on/off tolerance (fraction); passed to simplify_report.py
   --push) PUSH=1; shift;; *) echo "unknown opt $1"; exit 2;;
 esac; done
 
@@ -131,7 +135,7 @@ cat > "$OUT/REPRODUCE.md" <<EOF
 # Reproduce: decode-PoC report
 - honest/validator: \`$HONEST\`  | fraud: \`$FRAUD\`  | attention: $([ "$MLA" = 1 ] && echo MLA || echo full)
 - perf=[${PERF[*]}] | validator=$VAL | honest-refs=[$VAL ${HREF[*]}] | fraud-refs=[${FREF[*]}]
-- params: nonces=$NONCES max_tokens=$MT seq_len=$SEQ gsm_limit=$GSMN | GPU=$GPU | vLLM $BRANCH@$COMMIT | poc-scope@$SCOPE_COMMIT${XHW:+ | cross-HW ref=$XHW}
+- params: nonces=$NONCES max_tokens=$MT seq_len=$SEQ gsm_limit=$GSMN p_mismatch=$P_MISMATCH gsm_tol=$GSM_TOL | GPU=$GPU | vLLM $BRANCH@$COMMIT | poc-scope@$SCOPE_COMMIT${XHW:+ | cross-HW ref=$XHW}
 - branch: https://github.com/axeltec-software/vllm/tree/poc-v0.20-decode-poc-cg
 Run:  bash run_scope.sh "$HONEST" "$FRAUD" $([ "$MLA" = 1 ] && echo --mla)
 Pull: bash s3.sh pull-report $SESS ./$SESS
@@ -192,7 +196,8 @@ sanitize_evidence(){ local d="$1"
 }
 sanitize_evidence "$OUT"
 # --- render: SINGLE report = the simplified (ideal) layout (the only report we keep) ---
-POC_SCOPE_COMMIT="$SCOPE_COMMIT" "$PY" "$HERE/simplify_report.py" "$OUT" --out "$OUT/report.html" || echo "render FAILED"
+POC_SCOPE_COMMIT="$SCOPE_COMMIT" "$PY" "$HERE/simplify_report.py" "$OUT" --out "$OUT/report.html" \
+   --p-mismatch "$P_MISMATCH" --gsm-tol "$GSM_TOL" || echo "render FAILED"
 # --- S3 archive (opt-in; separate approved step otherwise) ---
 if [ "$PUSH" = 1 ]; then "$PY" "$HERE/inject_s3.py" "$OUT/report.html" "$SESS"; bash "$HERE/s3.sh" push-report "$OUT" "$SESS"; fi
 echo "=== DONE: $OUT/report.html ==="
