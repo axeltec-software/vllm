@@ -18,8 +18,13 @@ fused into the chat forward — chat is never frozen); validation runs pure.
 """
 from dataclasses import dataclass, field
 
+import os
 import torch
 from vllm.logger import init_logger
+
+# EXPERIMENT (mismatch-based denoise): N per-nonce Householder reflections of the pre-snap
+# sphere vector. 0 = off (default, unchanged fingerprint). Producer AND validator must match.
+_SPHERE_REFLECT_N = int(os.environ.get("VLLM_POC_SPHERE_REFLECT", "0") or "0")
 
 logger = init_logger(__name__)
 
@@ -410,7 +415,7 @@ def process_poc_outputs_from_hidden(
     from vllm.v1.outputs import PoCOutput
     from vllm.poc.gpu_random import (
         random_pick_indices, apply_haar_rotation,
-        decode_base_seeds, random_pick_indices_gpu,
+        decode_base_seeds, random_pick_indices_gpu, poc_householder_reflect,
     )
     from vllm.poc.data import encode_vector
     from vllm.poc.sphere import (
@@ -459,8 +464,11 @@ def process_poc_outputs_from_hidden(
         def _sphere_from_idx(sph):
             """hidden -> (sphere index, non-finite mask) as [1] int64/bool TENSORs
             (no .item(), so the chain stays on GPU and async scheduling works)."""
-            xk_sphere = project_to_sphere(torch.gather(last_hidden.unsqueeze(0), 1, sph))
-            return snap_with_guard(xk_sphere, codebook)  # (k[1] int64, bad[1] bool)
+            xk = torch.gather(last_hidden.unsqueeze(0), 1, sph)
+            if _SPHERE_REFLECT_N:
+                xk = poc_householder_reflect(poc_params.block_hash, poc_params.public_key,
+                                             [nonce], xk, runner.device, _SPHERE_REFLECT_N)
+            return snap_with_guard(project_to_sphere(xk), codebook)  # (k[1] int64, bad[1] bool)
 
         if st is None:
             # Prefill-only PoC: just the vector_b64 artifact.
@@ -507,8 +515,16 @@ def process_poc_outputs_from_hidden(
         sph = random_pick_indices_gpu(base_seeds, prev_k, steps, H, SPHERE_DIM, device)
         # snap_with_guard: argmax(NaN) is garbage -> non-finite rows return k=-1
         # (compute fault, NOT fraud). bad_all stays on device (no per-step sync).
+        gathered = torch.gather(lh, 1, sph)                          # [B, SPHERE_DIM]
+        if _SPHERE_REFLECT_N:
+            # per-nonce Householder denoise (all decode_metas share the block in a run)
+            gathered = poc_householder_reflect(
+                decode_metas[0]['poc_params'].block_hash,
+                decode_metas[0]['poc_params'].public_key,
+                [m['poc_params'].nonce for m in decode_metas],
+                gathered, device, _SPHERE_REFLECT_N)
         k_all, bad_all = snap_with_guard(
-            project_to_sphere(torch.gather(lh, 1, sph)), codebook)   # [B] int64, [B] bool
+            project_to_sphere(gathered), codebook)   # [B] int64, [B] bool
 
         for i, meta in enumerate(decode_metas):
             st = meta['decode_state']

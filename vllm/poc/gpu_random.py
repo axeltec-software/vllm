@@ -285,6 +285,38 @@ def apply_haar_rotation(
     return y
 
 
+def poc_householder_reflect(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    x: torch.Tensor,
+    device: torch.device,
+    n_reflections: int = 1,
+) -> torch.Tensor:
+    """Per-nonce Householder reflection(s) of x [B, k] (orthogonal -> norm-preserving).
+
+    A CHEAP denoise for the sphere snap: n dot-products + subtracts per row (vs
+    apply_haar_rotation's full k-1-step Haar rotation, which is far too heavy for the
+    256-dim decode hot path). Seeded per (block, key, nonce, reflection-index) ->
+    deterministic and DECORRELATED across nonces: cross-HW hidden-state jitter then flips
+    the sphere_k of different nonces independently, so it averages down in the mismatch
+    RATE, while the structured quantization (fraud) offset survives. The metric is
+    unchanged (still snap -> sphere_k -> mismatch); this only rotates the pre-snap vector.
+    """
+    if n_reflections <= 0:
+        return x
+    y = x
+    _, k = x.shape
+    for r in range(n_reflections):
+        seeds = [_seed_from_string(
+            f"{block_hash}_{public_key}_nonce_{nonce}_hhrefl_{k}_{r}") for nonce in nonces]
+        u = _batched_normal(seeds, k, device)                 # [B, k]
+        u = u / (u.norm(dim=-1, keepdim=True) + 1e-30)
+        u = u.to(y.dtype)
+        y = y - 2.0 * (y * u).sum(dim=-1, keepdim=True) * u
+    return y
+
+
 # ---------------------------------------------------------------------------
 # GPU-native decode chaining
 # ---------------------------------------------------------------------------
