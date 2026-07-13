@@ -78,3 +78,36 @@ the pre-snap coordinate, **then snap the average** → one denoised `sphere_k`. 
 `k-id` continues to seed the chain (sequential-execution guarantee is unchanged). The
 reflection only rotates the hidden state before the snap to reduce boundary flips — it does
 not change what the prover must compute (still requires running the model).
+
+## Implementation status (Idea 1 — landed on this branch)
+- `poc_householder_reflect(block_hash, public_key, nonces, x, device, n_reflections)` in
+  `vllm/poc/gpu_random.py` — N per-nonce Householder reflections of `x [B, k]` (orthogonal →
+  norm-preserving; `n` dot-products + subtracts, NOT the 255-step full Haar). Seeded per
+  `(block, key, nonce, reflection-index)` → deterministic, decorrelated across nonces.
+- Wired into **both** snap sites in `vllm/poc/mixed_decode.py` (prefill `k0` +
+  batched decode), gated by env **`VLLM_POC_SPHERE_REFLECT`** (int; default `0` = off,
+  fingerprint unchanged). Producer AND validator MUST use the same value.
+- Unit tests: `tests/poc/unit/test_householder_reflect.py` (norm-preserving, deterministic,
+  per-nonce-distinct, block-scoped, off==identity).
+- Runtime-verified on a MoE (`allenai/OLMoE-1B-7B-0924-Instruct`, 20 GB card): boots, PoC
+  decode works, flag on/off both emit valid trajectories, and the flag changes the
+  fingerprint (≈15–28 / 33 steps differ per nonce).
+
+## How to A/B (honest floor ↓ AND fraud preserved)
+Needs a numerical-jitter source. `cudagraph`↔`eager` on one GPU ≈ no jitter (same kernels);
+use the **FlashAttn↔FlashInfer cross-backend** row instead (real kernel-level fp difference,
+same class as cross-HW). Run twice, same nonces, on a model where FlashInfer works (dense 7B):
+
+```bash
+# baseline
+VLLM_POC_SPHERE_REFLECT=0 bash benchmarks/poc/scope/run_scope.sh <honest> <fraud> --no-gsm --no-perf --nonces 32
+# with per-nonce reflection
+VLLM_POC_SPHERE_REFLECT=2 bash benchmarks/poc/scope/run_scope.sh <honest> <fraud> --no-gsm --no-perf --nonces 32
+```
+
+Compare, between the two runs:
+- **honest cross-backend** row (`cudagraph·FlashInfer ⇐ cudagraph·FlashAttn`) — expect it to **drop**;
+- **fraud** rows — expect them to **hold** (structured quant offset survives the rotation).
+
+The env is read at server import, so it applies on the booted server process (`run_scope`'s
+boots inherit it). If FlashInfer deadlocks on a given MoE, use a dense model for this A/B.
