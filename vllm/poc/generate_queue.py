@@ -116,6 +116,9 @@ class GenerateJob:
     enforced_k_steps: Optional[Dict[int, List[int]]] = None
     debug: bool = False
     validation_artifacts: Optional[Dict[int, str]] = None
+    # nonce -> reference sph_values_steps (debug refs): enables the continuous
+    # vector_score on the queued path, same as the inline wait=true path.
+    ref_vectors: Optional[Dict[int, List[str]]] = None
     stat_test_dist_threshold: float = DEFAULT_DIST_THRESHOLD
     stat_test_p_mismatch: float = DEFAULT_P_MISMATCH
     stat_test_fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD
@@ -348,12 +351,16 @@ class GenerateQueue:
             fraud_threshold=job.stat_test_fraud_threshold,
             k_dim=job.k_dim,
             use_trajectory=job.max_tokens > 0,
+            ref_vectors=job.ref_vectors,
         )
         
         return {
             "status": "completed",
             "request_id": job.request_id,
             **validation_result,
+            # parity with the inline wait=true path (routes.py): debug requests
+            # get the validator-side artifacts (sph_values_steps) back too.
+            "artifacts": computed_artifacts if job.debug else [],
         }
     
     def _enqueue_callback(self, job: GenerateJob, result: Dict[str, Any]):
@@ -385,6 +392,9 @@ class GenerateQueue:
                 "mismatch_nonces": result.get("mismatch_nonces", []),
                 "p_value": result.get("p_value", 1.0),
                 "fraud_detected": result.get("fraud_detected", False),
+                # continuous vector-channel evidence (present when the reference
+                # artifacts carried sph_values_steps); None otherwise.
+                "vector_score": result.get("vector_score"),
             }
             self._callback_queue.enqueue(job.callback_url, "validated", payload)
 
