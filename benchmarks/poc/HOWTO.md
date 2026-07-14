@@ -3,7 +3,8 @@
 `run_scope.sh` boots a vLLM server once per `(model, engine/backend)` config, runs the PoC
 measurements over HTTP, and renders one `report.html`. Inputs are two checkpoints of the **same
 architecture**: an **honest** model and a cheaper **fraud** stand-in. Examples below use the
-Qwen3-235B pair.
+Qwen3-235B pair. With `--perf-only` the fraud model can be omitted entirely — see
+[Options](#options).
 
 ## 1. Setup — pick the script by the host driver's CUDA
 
@@ -32,6 +33,9 @@ cd benchmarks/poc/scope
 bash run_scope.sh <honest-model> <fraud-model> [options]
 ```
 
+`<fraud-model>` is optional with `--perf-only` (only the Performance experiment needs no fraud
+model); omitting it without `--perf-only` is a usage error.
+
 Example — dense-ish model on 4 GPUs, full defaults, push to the artifact bucket:
 ```bash
 bash run_scope.sh \
@@ -43,6 +47,11 @@ bash run_scope.sh \
 Example — MLA-architecture MoE needing extra serve flags:
 ```bash
 bash run_scope.sh <honest> <fraud> --mla --tp 8 --gpu-mem 0.95 --extra "--enable-expert-parallel"
+```
+
+Example — performance only, no fraud model needed:
+```bash
+bash run_scope.sh Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 --perf-only --tp 4
 ```
 
 ### Options
@@ -63,6 +72,7 @@ bash run_scope.sh <honest> <fraud> --mla --tp 8 --gpu-mem 0.95 --extra "--enable
 | `--push` | upload the session to the public-read S3 bucket (needs `SUPABASE_SECRET`); omit to render locally |
 | `--xhw <peer[,peer2]>` | cross-HW: also validate the peer session(s)' (local `reports/<name>` or S3 name) trajectories with this box's validator |
 | `--xhw-only` | skip local generation; only run the `--xhw` cross-validation (for a parallel 2-box verify) |
+| `--perf-only` | run only the Performance experiment (cudagraph vs eager, all backends); skips separation, GSM8K, and xhw entirely — `<fraud-model>` may be omitted |
 
 ### Calibrating the margin gate (`--margin-tau`)
 
@@ -98,7 +108,8 @@ only changes how the validator scores them, so it stays optional.
 
 Every result JSON is stamped with `attention_backend` / `cudagraph_mode` / `profile` and full
 provenance (GPU, driver, vLLM commit, dtype/quant, shape). The report header names both models
-(`honest <model> vs fraud <model>`).
+(`honest <model> vs fraud <model>`). With `--perf-only`, only the Performance card is produced —
+Separation, Co-existence, and k-distribution are skipped since they all need a fraud model.
 
 ## 4. Get / re-render the report
 

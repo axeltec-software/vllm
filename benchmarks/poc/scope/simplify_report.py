@@ -93,27 +93,38 @@ sub = " · ".join(str(x) for x in [
 prov = (f"codebook {str(meta.get('codebook_hash','?'))[:12]} · vLLM {meta.get('vllm_commit','?')} · "
         f"poc-scope {os.environ.get('POC_SCOPE_COMMIT','?')} · block_hash {str(meta.get('block_hash','?'))[:12]}")
 
-def _sps(tag):   # decode-PoC throughput: steps/s
-    try: return res(L(f"{D}/perf_{tag}.poc.json")).get("steps_per_s")
-    except Exception: return None
-def _tps(tag):   # pure inference (chat) throughput: tokens/s
-    try: return res(L(f"{D}/perf_{tag}.chat.json")).get("tokens_per_s")
-    except Exception: return None
+def _sps(*tags):   # decode-PoC throughput: steps/s (tries each tag, e.g. non-MLA "cg-flashattn" then MLA "cudagraph")
+    for tag in tags:
+        try: return res(L(f"{D}/perf_{tag}.poc.json")).get("steps_per_s")
+        except Exception: continue
+    return None
+def _tps(*tags):   # pure inference (chat) throughput: tokens/s
+    for tag in tags:
+        try: return res(L(f"{D}/perf_{tag}.chat.json")).get("tokens_per_s")
+        except Exception: continue
+    return None
 
 cards = []
-# ---- Performance (decode-PoC ONLY; rendered LAST, after separation) ----
-#      cudagraph vs eager on the PoC decode path — no pure-inference row.
-poc_cg, poc_eg = _sps("cg-flashattn"), _sps("eager-flashattn")
+# ---- Performance: cudagraph vs eager, shown for BOTH pure inference and decode-PoC (rendered LAST).
+#      The gap between the two cudagraph speedups IS the decode-PoC tail overhead (the MoE-cudagraph
+#      metric). MLA models name their profiles "cudagraph"/"eager" — used as tag fallback.
+poc_cg, poc_eg = _sps("cg-flashattn", "cudagraph"), _sps("eager-flashattn", "eager")
+inf_cg, inf_eg = _tps("cg-flashattn", "cudagraph"), _tps("eager-flashattn", "eager")
 perf_card = ""
 if poc_cg and poc_eg:
     poc_sp = poc_cg / poc_eg
-    rows = (f"<tr class=hi><td><b>decode-PoC</b></td><td class=num>{poc_eg:.0f} steps/s</td>"
-            f"<td class=num>{poc_cg:.0f} steps/s</td><td class=num>{poc_sp:.2f}×</td></tr>")
-    perf_card = f"""<div class=card><div class=exp>Experiment 4</div>
- <h2>Performance — is cudagraph engaged for decode-PoC?</h2>
- <p class=lead>Same 32-wide batch, <b>cudagraph vs eager</b>, on the <b>decode-PoC</b> workload. A real cudagraph speedup confirms the PoC decode path is genuinely captured by cudagraph, not silently falling back to eager.</p>
+    rows = ""
+    if inf_cg and inf_eg:
+        rows += (f"<tr><td>pure inference (chat)</td><td class=num>{inf_eg:.0f} tok/s</td>"
+                 f"<td class=num>{inf_cg:.0f} tok/s</td><td class=num>{inf_cg/inf_eg:.2f}×</td></tr>")
+    rows += (f"<tr class=hi><td><b>decode-PoC</b></td><td class=num>{poc_eg:.0f} steps/s</td>"
+             f"<td class=num>{poc_cg:.0f} steps/s</td><td class=num>{poc_sp:.2f}×</td></tr>")
+    gap = f" vs pure inference <b>{inf_cg/inf_eg:.2f}×</b>" if inf_cg and inf_eg else ""
+    perf_card = f"""<div class=card><div class=exp>Performance</div>
+ <h2>Performance — cudagraph vs eager (pure inference and decode-PoC)</h2>
+ <p class=lead>Same 32-wide batch, <b>cudagraph vs eager</b>, for <b>pure inference</b> and <b>decode-PoC</b> on the same server. The difference between the two cudagraph speedups is the un-graphed decode-PoC tail overhead.</p>
  <table><tr><th>workload</th><th class=num>eager</th><th class=num>cudagraph</th><th class=num>cudagraph speedup</th></tr>{rows}</table>
- <p class=verdict><span class=lbl>VERDICT</span> cudagraph speeds up decode-PoC by <b>{poc_sp:.2f}×</b> — confirming it is effectively engaged for PoC decode.</p></div>"""
+ <p class=verdict><span class=lbl>VERDICT</span> cudagraph speeds up decode-PoC by <b>{poc_sp:.2f}×</b>{gap} — confirming it is engaged for PoC decode.</p></div>"""
 
 # ---- Experiment 1: Separation ----
 _short = lambda g: (g or "?").split(",")[0].replace("NVIDIA ", "").strip()   # GPU short name
