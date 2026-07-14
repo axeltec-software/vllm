@@ -70,18 +70,23 @@ sub = " · ".join(str(x) for x in [
 prov = (f"codebook {str(meta.get('codebook_hash','?'))[:12]} · vLLM {meta.get('vllm_commit','?')} · "
         f"poc-scope {os.environ.get('POC_SCOPE_COMMIT','?')} · block_hash {str(meta.get('block_hash','?'))[:12]}")
 
-def _sps(tag):   # decode-PoC throughput: steps/s
-    try: return res(L(f"{D}/perf_{tag}.poc.json")).get("steps_per_s")
-    except Exception: return None
-def _tps(tag):   # pure inference (chat) throughput: tokens/s
-    try: return res(L(f"{D}/perf_{tag}.chat.json")).get("tokens_per_s")
-    except Exception: return None
+def _sps(*tags):   # decode-PoC throughput: steps/s (tries each tag, e.g. non-MLA "cg-flashattn" then MLA "cudagraph")
+    for tag in tags:
+        try: return res(L(f"{D}/perf_{tag}.poc.json")).get("steps_per_s")
+        except Exception: continue
+    return None
+def _tps(*tags):   # pure inference (chat) throughput: tokens/s
+    for tag in tags:
+        try: return res(L(f"{D}/perf_{tag}.chat.json")).get("tokens_per_s")
+        except Exception: continue
+    return None
 
 cards = []
 # ---- Experiment 1: Performance — cudagraph is genuinely engaged for PoC (same 32-batch, cg vs eager,
 #      shown for BOTH pure inference and decode-PoC; PoC gets a real cudagraph speedup like normal decode) ----
-poc_cg, poc_eg = _sps("cg-flashattn"), _sps("eager-flashattn")
-inf_cg, inf_eg = _tps("cg-flashattn"), _tps("eager-flashattn")
+# tag order: non-MLA profile name first, MLA profile name ("cudagraph"/"eager") as fallback.
+poc_cg, poc_eg = _sps("cg-flashattn", "cudagraph"), _sps("eager-flashattn", "eager")
+inf_cg, inf_eg = _tps("cg-flashattn", "cudagraph"), _tps("eager-flashattn", "eager")
 if poc_cg and poc_eg:
     poc_sp = poc_cg / poc_eg
     rows = ""

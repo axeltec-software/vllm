@@ -4,8 +4,10 @@
 # REUSING in-git measurement tools (perfomance_nonces.py/collect.py/quality_gsm8k.py); renders ONE report via simplify_report.py.
 # Then renders the SINGLE simplified report (simplify_report.py). S3 push is a separate opt-in step (s3.sh push-report).
 #
-#   run_scope.sh <honest-model> <fraud-model> [--mla] [--nonces N] [--max-tokens M]
-#                [--seq-len S] [--gsm-limit L] [--no-gsm] [--push]
+#   run_scope.sh <honest-model> [fraud-model] [--mla] [--nonces N] [--max-tokens M]
+#                [--seq-len S] [--gsm-limit L] [--no-gsm] [--push] [--perf-only]
+# --perf-only runs ONLY the Performance experiment (cudagraph vs eager, all backends) and
+# needs no fraud model at all — separation/GSM8K/xhw are all skipped.
 #
 # Separation = 5 logical pairs (validator fixed = honest @ production cg-FA; vary the
 # reference ONE axis at a time, one direction):
@@ -21,8 +23,9 @@ PORT=8200; URL="http://127.0.0.1:$PORT"
 export PATH="$(dirname "$PY"):$PATH"
 export HF_TOKEN="$(cat ~/.cache/huggingface/token 2>/dev/null || echo "")"
 
-HONEST="${1:?usage: run_scope.sh <honest> <fraud> [--mla] [opts]}"; FRAUD="${2:?need fraud}"; shift 2
-MLA=0; NONCES=128; MT=256; SEQ=256; GSMN=100; GSM=1; PUSH=0; PERFON=1; NOFI=0; GSM_MML=2048; TP=1; GMU=0.90; EXTRA=""; XHW=""; XHW_ONLY=0
+HONEST="${1:?usage: run_scope.sh <honest> [fraud] [--mla] [opts]  (fraud may be omitted with --perf-only)}"; shift
+FRAUD=""; [ $# -gt 0 ] && [[ "$1" != -* ]] && { FRAUD="$1"; shift; }   # fraud is positional but optional (--perf-only)
+MLA=0; NONCES=128; MT=256; SEQ=256; GSMN=100; GSM=1; PUSH=0; PERFON=1; NOFI=0; GSM_MML=2048; TP=1; GMU=0.90; EXTRA=""; XHW=""; XHW_ONLY=0; PERF_ONLY=0
 SCOPE_COMMIT="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo '?')"   # report-tooling version
 while [ $# -gt 0 ]; do case "$1" in
   --mla) MLA=1; shift;; --nonces) NONCES="$2"; shift 2;; --max-tokens) MT="$2"; shift 2;;
@@ -34,8 +37,12 @@ while [ $# -gt 0 ]; do case "$1" in
   --extra) EXTRA="$2"; shift 2;;   # raw extra serve args from the deploy config (e.g. "--enable-expert-parallel --attention-backend <MLA-backend>")
   --xhw) XHW="$2"; shift 2;;   # CROSS-HW: peer session (local reports/<name> dir OR S3 name); pull its refs + validate here
   --xhw-only) XHW_ONLY=1; shift;;   # phase-2: SKIP local gen/perf/gsm, ONLY cross-validate the --xhw peer (for parallel 2-box verify)
+  --perf-only) PERF_ONLY=1; shift;;   # ONLY the Performance experiment; no fraud model needed, skips separation/GSM8K/xhw
   --push) PUSH=1; shift;; *) echo "unknown opt $1"; exit 2;;
 esac; done
+if [ "$PERF_ONLY" = 0 ] && [ -z "$FRAUD" ]; then
+  echo "usage: run_scope.sh <honest> <fraud> [opts]   (fraud may be omitted only with --perf-only)" >&2; exit 2
+fi
 
 slug(){ echo "$1" | tr '/: ' '___' | tr -cd 'A-Za-z0-9._-'; }
 GPU="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr ' /:' '___')"; [ -z "$GPU" ] && GPU=remote
@@ -129,21 +136,26 @@ op_gsm(){ local p="$1" oo="$2" extra="$3"; echo "[gsm] $p $oo"
 COMMIT="$(cd "$POC" && git rev-parse --short HEAD 2>/dev/null || echo '?')"; BRANCH="$(cd "$POC" && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 cat > "$OUT/REPRODUCE.md" <<EOF
 # Reproduce: decode-PoC report
-- honest/validator: \`$HONEST\`  | fraud: \`$FRAUD\`  | attention: $([ "$MLA" = 1 ] && echo MLA || echo full)
+- honest/validator: \`$HONEST\`  | fraud: \`${FRAUD:-none (--perf-only)}\`  | attention: $([ "$MLA" = 1 ] && echo MLA || echo full)
 - perf=[${PERF[*]}] | validator=$VAL | honest-refs=[$VAL ${HREF[*]}] | fraud-refs=[${FREF[*]}]
-- params: nonces=$NONCES max_tokens=$MT seq_len=$SEQ gsm_limit=$GSMN | GPU=$GPU | vLLM $BRANCH@$COMMIT | poc-scope@$SCOPE_COMMIT${XHW:+ | cross-HW ref=$XHW}
+- params: nonces=$NONCES max_tokens=$MT seq_len=$SEQ gsm_limit=$GSMN | GPU=$GPU | vLLM $BRANCH@$COMMIT | poc-scope@$SCOPE_COMMIT${XHW:+ | cross-HW ref=$XHW}${EXTRA:+ | extra="$EXTRA"}
 - branch: https://github.com/axeltec-software/vllm/tree/poc-v0.20-decode-poc-cg
-Run:  bash run_scope.sh "$HONEST" "$FRAUD" $([ "$MLA" = 1 ] && echo --mla)
+Run:  bash run_scope.sh "$HONEST" "$FRAUD" $([ "$MLA" = 1 ] && echo --mla)${EXTRA:+ --extra "$EXTRA"}
 Pull: bash s3.sh pull-report $SESS ./$SESS
 EOF
 
-echo "=== $SESS | honest=$HONEST fraud=$FRAUD mla=$MLA nonces=$NONCES mt=$MT ==="
+echo "=== $SESS | honest=$HONEST fraud=${FRAUD:-none (--perf-only)} mla=$MLA nonces=$NONCES mt=$MT perf_only=$PERF_ONLY ==="
 # === MODE 1 (same-HW): generate refs + local separation + perf.  Skipped in --xhw-only. ===
 if [ "$XHW_ONLY" = 0 ]; then
-  # fraud reference trajectories (one boot per fraud config)
-  for p in "${FREF[@]}"; do boot "$FRAUD" "$p" && op_gen "$FRAUD" "$p" fraud; kill_srv; done
-  # honest non-production configs: perf + honest refs (pairs 2,3)
-  for p in "${HREF[@]}"; do boot "$HONEST" "$p" && { op_perf "$p"; op_gen "$HONEST" "$p" honest; }; kill_srv; done
+  # fraud reference trajectories (one boot per fraud config) — skipped in --perf-only (no fraud model)
+  if [ "$PERF_ONLY" = 0 ]; then
+    for p in "${FREF[@]}"; do boot "$FRAUD" "$p" && op_gen "$FRAUD" "$p" fraud; kill_srv; done
+  fi
+  # honest non-production configs: perf always; honest refs (separation) skipped in --perf-only
+  for p in "${HREF[@]}"; do
+    boot "$HONEST" "$p" && { op_perf "$p"; [ "$PERF_ONLY" = 0 ] && op_gen "$HONEST" "$p" honest; }
+    kill_srv
+  done
   # remaining perf-only honest configs (no ref needed)
   if [ "$PERFON" = 1 ]; then for p in "${PERF[@]}"; do
     case " $VAL ${HREF[*]} " in *" $p "*) continue;; esac   # already perf'd above
@@ -154,12 +166,15 @@ fi
 if boot "$HONEST" "$VAL"; then
   if [ "$XHW_ONLY" = 0 ]; then
     op_perf "$VAL"
-    op_gen "$HONEST" "$VAL" honest                       # baseline ref H(cgFA)
-    for ref in "$OUT"/gen_honest_*.json "$OUT"/gen_fraud_*.json; do [ -e "$ref" ] && op_val "$VAL" "$ref"; done
+    if [ "$PERF_ONLY" = 0 ]; then
+      op_gen "$HONEST" "$VAL" honest                       # baseline ref H(cgFA)
+      for ref in "$OUT"/gen_honest_*.json "$OUT"/gen_fraud_*.json; do [ -e "$ref" ] && op_val "$VAL" "$ref"; done
+    fi
   fi
   # MODE 2 (cross-HW): ONE validator boot re-checks ALL peers' ALREADY-GENERATED refs
   # (comma-separate --xhw to fold many boxes into one boot — max artifact reuse, min runs).
-  if [ -n "$XHW" ]; then
+  # Skipped in --perf-only: there are no local refs to cross-validate against.
+  if [ -n "$XHW" ] && [ "$PERF_ONLY" = 0 ]; then
     IFS=',' read -ra PEERS <<< "$XHW"
     for peer in "${PEERS[@]}"; do
       [ -z "$peer" ] && continue
@@ -180,8 +195,8 @@ if boot "$HONEST" "$VAL"; then
   fi
 fi
 kill_srv
-# === GSM8K co-existence (own bigger-max-len boot; skipped in --xhw-only) ===
-if [ "$GSM" = 1 ] && [ "$XHW_ONLY" = 0 ]; then
+# === GSM8K co-existence (own bigger-max-len boot; skipped in --xhw-only or --perf-only) ===
+if [ "$GSM" = 1 ] && [ "$XHW_ONLY" = 0 ] && [ "$PERF_ONLY" = 0 ]; then
   if boot "$HONEST" "$VAL" "$GSM_MML"; then op_gsm "$VAL" on ""; op_gsm "$VAL" off "--disable_poc"; fi
   kill_srv
 fi
