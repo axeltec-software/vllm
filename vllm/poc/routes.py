@@ -437,7 +437,11 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
 
 @router.post("/generate")
 async def generate(request: Request, body: PoCGenerateRequest) -> dict:
-    logger.info(f"PoC /generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.nonces}, {body.params}, {body.batch_size}, {body.wait}, {body.url}, {body.validation}, {body.stat_test}, {body.poc_stronger_rng}")
+    # Summarize validation in the log: with debug refs its artifacts carry
+    # per-step sph_values_steps (multi-MB) — never dump the body wholesale.
+    val_log = (f"validation[{len(body.validation.artifacts)} artifacts]"
+               if body.validation else None)
+    logger.info(f"PoC /generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.nonces}, {body.params}, {body.batch_size}, {body.wait}, {body.url}, {val_log}, {body.stat_test}, {body.poc_stronger_rng}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
 
@@ -449,6 +453,10 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             raise HTTPException(status_code=400, detail="validation.artifacts nonces must match nonces field")
     
     validation_map = {a.nonce: a.vector_b64 for a in body.validation.artifacts} if body.validation else None
+    # prover-side pre-snap slices (when the reference was generated with debug):
+    # lets run_validation attach the continuous vector-channel score as evidence.
+    ref_vectors = {a.nonce: a.sph_values_steps for a in body.validation.artifacts
+                   if a.sph_values_steps} if body.validation else None
     stat_test = body.stat_test or StatTestModel()
     
     if not body.wait:
@@ -480,6 +488,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             enforced_k_steps=body.enforced_k_steps,
             debug=body.debug,
             validation_artifacts=validation_map,
+            ref_vectors=ref_vectors,
             stat_test_dist_threshold=stat_test.dist_threshold,
             stat_test_p_mismatch=stat_test.p_mismatch,
             stat_test_fraud_threshold=stat_test.fraud_threshold,
@@ -563,6 +572,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         # decode flow (max_tokens>0) → count sphere_k mismatches vs p_mismatch;
         # prefill flow → vector-L2 + binomial (unchanged). Same response shape.
         use_trajectory=body.params.max_tokens > 0,
+        ref_vectors=ref_vectors,
     )
 
     return {
