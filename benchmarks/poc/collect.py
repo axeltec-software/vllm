@@ -38,12 +38,14 @@ def cmd_generate(a):
     with deploy_from_args(a, a.model) as (url, srv):
         resp, secs = request_generate(url, target=a.target, model=a.model, nonces=nonces,
                                       block_hash=BH, public_key=PK, seq_len=a.seq_len,
-                                      max_tokens=a.max_tokens, k_dim=KDIM, debug=a.debug)
+                                      max_tokens=a.max_tokens, k_dim=KDIM, debug=a.debug,
+                                      per_nonce_reflection=a.per_nonce_reflection)
     arts = resp["artifacts"]
     nps = len(nonces) / secs if secs else 0.0
     meta = {"role": "generate", "model": a.model, "seq_len": a.seq_len,
             "max_tokens": a.max_tokens, "k_dim": KDIM, "block_hash": BH, "public_key": PK,
-            "codebook_hash": CODEBOOK_HASH, "nonces": nonces, "batch_size": 32, **a.prov}
+            "codebook_hash": CODEBOOK_HASH, "nonces": nonces, "batch_size": 32,
+            "per_nonce_reflection": a.per_nonce_reflection, **a.prov}
     save_run(a.save, meta, arts,
              results={"nonces_per_s": round(nps, 3), "steps_per_s": round(nps * (a.max_tokens + 1), 1),
                       "elapsed_s": round(secs, 1)})
@@ -55,12 +57,16 @@ def cmd_validate(a):
     rmeta, ref_arts = load_run(a.ref)
     nonces, mt, seq = rmeta["nonces"], rmeta["max_tokens"], rmeta["seq_len"]
     enforced = {x["nonce"]: x["k_points_steps"] for x in ref_arts}
+    # Replay the reference's reflection-seeding mode: forward-affecting, so the
+    # validator MUST run the same scheme the artifacts were generated with.
+    pnr = bool(rmeta.get("per_nonce_reflection", False))
     with deploy_from_args(a, a.model) as (url, srv):
         resp, secs = request_generate(url, target=a.target, model=a.model, nonces=nonces,
                                       block_hash=rmeta["block_hash"], public_key=rmeta["public_key"],
                                       seq_len=seq, max_tokens=mt, k_dim=rmeta["k_dim"],
                                       enforced_k=enforced, validation=ref_arts,
-                                      p_mismatch=a.p_mismatch, debug=a.debug)
+                                      p_mismatch=a.p_mismatch, debug=a.debug,
+                                      per_nonce_reflection=pnr)
     rate = resp["n_mismatch"] / (len(nonces) * (mt + 1))
     nps = len(nonces) / secs if secs else 0.0
     honest = a.model == rmeta["model"]
@@ -103,6 +109,11 @@ def main():
     # Generate refs with --debug AND validate with --debug to get the continuous
     # vector-channel score (vector_score) next to the k-mismatch rate.
     ap.add_argument("--debug", action="store_true")
+    # generate-only: seed the Householder reflections per (block_hash, nonce)
+    # instead of per block_hash (each nonce = its own independent draw). validate
+    # replays the mode from the reference meta automatically — never set by hand
+    # on validate (a mismatch diverges every chain).
+    ap.add_argument("--per-nonce-reflection", action="store_true")
     ap.add_argument("--save", required=True)
     a = ap.parse_args()
     if a.mode == "validate" and not a.ref:

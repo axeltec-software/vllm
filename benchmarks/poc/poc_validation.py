@@ -287,6 +287,7 @@ def request_generate(
     wait: bool = True,
     timeout: int = 900,
     debug: bool = False,
+    per_nonce_reflection: bool = False,
 ):
     """The one v2 /generate request builder. Returns (response_json, elapsed_sec).
 
@@ -296,6 +297,9 @@ def request_generate(
       returns fraud_detected. max_tokens>0 selects the decode trajectory metric.
     - debug=True: artifacts additionally carry the per-step pre-snap sphere slices
       (sph_values_steps) — needed for the vector-channel score / offline analysis.
+    - per_nonce_reflection=True: Householder reflections seeded per (block_hash,
+      nonce) instead of per block_hash. Forward-affecting — a validation request
+      must match the reference generation's setting.
     """
     payload: Dict[str, Any] = {
         "block_hash": block_hash, "block_height": 100, "public_key": public_key,
@@ -305,6 +309,8 @@ def request_generate(
     }
     if debug:
         payload["debug"] = True
+    if per_nonce_reflection:
+        payload["per_nonce_reflection"] = True
     if enforced_k is not None:
         payload["enforced_k_steps"] = enforced_k
     if validation is not None:

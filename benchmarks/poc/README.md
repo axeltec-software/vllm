@@ -179,6 +179,21 @@ no per-nonce overlap (worst honest 8.8e-4 < weakest fraud 3.0e-3), AUC 1.0,
 K=9 nonces — on the same trajectories where the k-rate misses at p_mismatch=0.1.
 Artifact cost: ~512 B/step fp16 (D=256); prefill keeps the legacy `vector_b64`.
 
+### Per-nonce reflection seeding (opt-in)
+By default every nonce of a block reflects with ONE Householder draw seeded by
+block_hash — the whole block shares a single measurement instrument, so the
+draw's own bias is a common term that block averaging cannot remove. With
+`--per-nonce-reflection` on **generate**, vectors are seeded by
+(block_hash, nonce): each nonce measures with an independent draw and the
+block statistic averages the draw noise away with 1/n like the nonce noise.
+Forward-affecting: validate replays the mode from the reference meta
+automatically — never set it by hand on validate.
+
+```bash
+collect.py --mode generate --model <honest> --debug --per-nonce-reflection --save gen_h.json --url $S
+collect.py --mode validate --model <honest> --debug --ref gen_h.json --save val_h.json --url $S
+```
+
 ## Test 2 — co-existence (GSM8K)
 A **separate** question from separation: does running PoC alongside real user inference
 degrade answer quality? Run GSM8K twice — once with PoC load, once without — and compare

@@ -123,6 +123,10 @@ class PoCGenerateRequest(BaseModel):
     poc_stronger_rng: bool = False
     enforced_k_steps: Optional[Dict[int, List[int]]] = None
     debug: bool = False
+    # Per-nonce Householder seeding (see PoCParams.per_nonce_reflection).
+    # Forward-affecting: a validation request MUST carry the same value the
+    # reference artifacts were generated with, or every chain diverges.
+    per_nonce_reflection: bool = False
 
 
 # =============================================================================
@@ -252,6 +256,7 @@ async def _compute_artifacts_chunk(
     max_tokens: int = 0,
     enforced_k_steps: Optional[Dict[int, List[int]]] = None,
     debug: bool = False,
+    per_nonce_reflection: bool = False,
     timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
     check_cancelled: Optional[callable] = None,
     block_height: int = 0,
@@ -272,6 +277,7 @@ async def _compute_artifacts_chunk(
         max_tokens=max_tokens,
         enforced_k_steps=enforced_k_steps,
         debug=debug,
+        per_nonce_reflection=per_nonce_reflection,
     )
 
 
@@ -487,6 +493,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             max_tokens=body.params.max_tokens,
             enforced_k_steps=body.enforced_k_steps,
             debug=body.debug,
+            per_nonce_reflection=body.per_nonce_reflection,
             validation_artifacts=validation_map,
             ref_vectors=ref_vectors,
             stat_test_dist_threshold=stat_test.dist_threshold,
@@ -540,6 +547,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 max_tokens=body.params.max_tokens,
                 enforced_k_steps=chunk_inference_steps,
                 debug=body.debug,
+                per_nonce_reflection=body.per_nonce_reflection,
                 timeout_sec=POC_GENERATE_CHUNK_TIMEOUT_SEC,
                 check_cancelled=check_cancelled,
                 block_height=body.block_height,

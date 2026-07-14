@@ -177,8 +177,11 @@ class PoCNativeState:
         ]
         self.mask = torch.zeros(max_tokens, dtype=torch.bool, device=device)
         self.embeds = torch.zeros(max_tokens, hidden_size, device=device, dtype=dtype)
-        self._hash_cache: dict[str, list] = {}      # block_hash -> per-layer vectors
-        self._last_row_hashes: list | None = None   # skip redundant per-step rescatter
+        # (block_hash, nonce-or-None) -> per-layer vectors. nonce=None is the
+        # per-block scheme (one draw shared by every nonce of the block); an int
+        # nonce is the per-nonce scheme (each nonce gets its own draw).
+        self._hash_cache: dict[tuple, list] = {}
+        self._last_refl_key: tuple | None = None    # skip redundant per-step rescatter
         # seeded-routing (MANDATORY for MoE; filled by attach_native_poc): per-MoE-layer
         # PER-ROW forced router-logits buffer [max_tokens, n_experts] + (n_experts,
         # top_k). Static shape -> cudagraph-safe; refreshed IN PLACE each step from
@@ -195,43 +198,70 @@ class PoCNativeState:
         self.embeds[:n].copy_(row_embeds)
         _assert_replicated_across_tp(self.embeds[:n], "embeds")
 
-    def _vectors_for(self, block_hash: str) -> list:
-        """Per-layer reflection vectors for a block_hash (cached across forwards)."""
-        vs = self._hash_cache.get(block_hash)
+    # Device-side cache bound: per-nonce seeding adds one entry per (block_hash,
+    # nonce), so a 128-nonce round is ~128 entries. Entries are stored in the
+    # reflection-buffer dtype (num_layers x hidden, fp16/bf16 -> e.g. ~0.75 MB
+    # for 94 x 4096), so the cap bounds the cache at ~200 MB worst case — memory
+    # allocated AFTER vLLM's startup profiling, so it must stay small. Clear
+    # wholesale past the cap (regeneration is cheap, seeded host murmur).
+    _HASH_CACHE_MAX = 256
+
+    def _vectors_for(self, block_hash: str, nonce: int | None = None) -> list:
+        """Per-layer reflection vectors for (block_hash, nonce) (cached across
+        forwards). nonce=None -> the per-block seed (production default); an int
+        nonce -> that nonce's own seed, so every nonce reflects with an
+        independent draw."""
+        key = (block_hash, nonce)
+        vs = self._hash_cache.get(key)
         if vs is None:
+            if len(self._hash_cache) >= self._HASH_CACHE_MAX:
+                self._hash_cache.clear()
+            suffix = ("" if nonce is None else f"_nonce{nonce}")
+            # Cache in the buffer dtype: halves the footprint vs the generator's
+            # fp32 and matches what the scatter writes (copy_ casts identically).
+            dt = self.vectors[0].dtype
             vs = [
                 generate_householder_vector(
-                    f"{block_hash}_layer_{i}_householder",
-                    self.hidden_size, self.device)
+                    f"{block_hash}{suffix}_layer_{i}_householder",
+                    self.hidden_size, self.device).to(dt)
                 for i in range(self.num_layers)
             ]
-            self._hash_cache[block_hash] = vs
+            self._hash_cache[key] = vs
         return vs
 
-    def set_row_block_hashes(self, row_hashes: list) -> None:
+    def set_row_block_hashes(self, row_hashes: list,
+                             row_refl_nonces: list | None = None) -> None:
         """Write each row's reflection vectors from ITS OWN block_hash (in place),
         so requests with different block_hashes coexist in one forward. row_hashes[i]
         = block_hash for row i, or None (left zero; masked out). Generation of the
-        vectors is cached per block_hash; the scatter is cheap CPU-side setup.
+        vectors is cached per (block_hash, nonce); the scatter is cheap CPU-side setup.
 
-        The reflection vectors depend only on block_hash (not the decode step), so for
-        a stable batch the row->hash mapping is unchanged across all decode steps. Skip
-        the zero + per-(row,layer) copy_ (num_layers x B kernels) when row_hashes
+        row_refl_nonces[i] (optional) = the row's nonce when its request runs
+        per-nonce reflection seeding, else None (per-block seed, the default —
+        omitting the argument reproduces the legacy behavior bit-exactly).
+
+        The reflection vectors do not depend on the decode step, so for a stable
+        batch the row->seed mapping is unchanged across all decode steps. Skip
+        the zero + per-(row,layer) copy_ (num_layers x B kernels) when the mapping
         matches the last call; the buffers already hold the right values."""
-        if row_hashes == self._last_row_hashes:
+        if row_refl_nonces is None:
+            row_refl_nonces = [None] * len(row_hashes)
+        refl_key = (tuple(row_hashes), tuple(row_refl_nonces))
+        if refl_key == self._last_refl_key:
             return
         for buf in self.vectors:
             buf.zero_()
-        for row, bh in enumerate(row_hashes):
+        for row, (bh, nz) in enumerate(zip(row_hashes, row_refl_nonces)):
             if bh is None:
                 continue
-            vs = self._vectors_for(bh)
+            vs = self._vectors_for(bh, nz)
             for i, buf in enumerate(self.vectors):
                 buf[row].copy_(vs[i].to(buf.dtype))
-        self._last_row_hashes = list(row_hashes)
+        self._last_refl_key = refl_key
         _assert_replicated_across_tp(self.vectors[0], "reflection_vectors[0]")
-        # (reflection vectors depend only on block_hash; routing also depends on
-        # nonce+step so it is refreshed separately, per step, via set_routing.)
+        # (reflection vectors depend on block_hash [+ nonce when per-nonce seeded],
+        # never the step; routing also depends on step so it is refreshed
+        # separately, per step, via set_routing.)
 
     def set_routing(self, row_hashes, row_nonces, row_steps) -> None:
         """Refresh PER-ROW seeded router logits — MANDATORY for MoE. EFFICIENT (the
