@@ -4172,9 +4172,13 @@ class GPUModelRunner(
                         row_hashes = [None] * n_rows
                         row_nonces = [0] * n_rows           # per-row nonce + step for
                         row_steps = [0] * n_rows            # MANDATORY seeded-routing
+                        # Reflection-seed nonce per row: the request's nonce when it
+                        # runs per-nonce reflection seeding, else None (per-block).
+                        row_refl_nonces = [None] * n_rows
                         for meta in poc_metadata:
-                            bh = meta['poc_params'].block_hash
-                            nz = meta['poc_params'].nonce
+                            pp = meta['poc_params']
+                            bh = pp.block_hash
+                            nz = pp.nonce
                             stp = meta.get('decode_step', 0)
                             s = meta['start_idx']
                             for r in range(s, s + meta['length']):
@@ -4182,7 +4186,10 @@ class GPUModelRunner(
                                     row_hashes[r] = bh
                                     row_nonces[r] = nz
                                     row_steps[r] = stp
-                        self._poc_native.set_row_block_hashes(row_hashes)
+                                    if pp.per_nonce_reflection:
+                                        row_refl_nonces[r] = nz
+                        self._poc_native.set_row_block_hashes(
+                            row_hashes, row_refl_nonces)
                         # Seeded routing (mandatory for MoE): refresh per-row forced
                         # experts from (block_hash,nonce,step,layer). Cached base +
                         # on-GPU step fold -> cudagraph-safe, no per-step host sync.

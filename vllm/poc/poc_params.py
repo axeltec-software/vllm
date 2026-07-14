@@ -26,6 +26,13 @@ class PoCParams:
     enforced_k_steps: Optional[List[int]] = field(default=None, repr=False)
     # Debug mode: collect per-step sphere indices and values for mismatch analysis.
     debug: bool = False
+    # Per-nonce Householder seeding: reflection vectors are seeded by
+    # (block_hash, nonce) instead of block_hash alone, so every nonce measures
+    # with its own independent draw (block statistics average over n independent
+    # instruments instead of sharing one). Forward-affecting: the prover and the
+    # validator MUST use the same value for a nonce or their chains diverge —
+    # which is why this is a per-request parameter, never an env toggle.
+    per_nonce_reflection: bool = False
 
     @property
     def is_validation(self) -> bool:
@@ -46,6 +53,7 @@ class PoCParams:
                 if self.enforced_k_steps is not None else None
             ),
             debug=self.debug,
+            per_nonce_reflection=self.per_nonce_reflection,
         )
 
     def __post_init__(self):

@@ -27,6 +27,7 @@ async def compute_nonce_artifacts(
     max_tokens: int = 0,
     enforced_k_steps: Optional[Dict[int, List[int]]] = None,
     debug: bool = False,
+    per_nonce_reflection: bool = False,
 ) -> List[dict]:
     """Compute PoC artifacts for a set of nonces via the scheduler.
 
@@ -53,6 +54,7 @@ async def compute_nonce_artifacts(
             max_tokens=max_tokens,
             enforced_k_steps=inf_steps,
             debug=debug,
+            per_nonce_reflection=per_nonce_reflection,
         )
         request_id = f"poc-{uuid.uuid4()}"
         # PoC emits its artifact ONCE (emit-once): a single finished output
@@ -115,6 +117,7 @@ class GenerateJob:
     max_tokens: int = 0
     enforced_k_steps: Optional[Dict[int, List[int]]] = None
     debug: bool = False
+    per_nonce_reflection: bool = False
     validation_artifacts: Optional[Dict[int, str]] = None
     # nonce -> reference sph_values_steps (debug refs): enables the continuous
     # vector_score on the queued path, same as the inline wait=true path.
@@ -322,6 +325,7 @@ class GenerateQueue:
                     max_tokens=job.max_tokens,
                     enforced_k_steps=chunk_inference_steps,
                     debug=job.debug,
+                    per_nonce_reflection=job.per_nonce_reflection,
                 )
             except asyncio.CancelledError:
                 logger.info(f"PoC queue job {job.request_id[:8]}: cancelled")
