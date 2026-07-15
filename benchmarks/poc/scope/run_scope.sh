@@ -138,13 +138,25 @@ op_gsm(){ local p="$1" oo="$2" extra="$3"; echo "[gsm] $p $oo"
      --limit "$GSMN" $extra --output_path "$OUT/gsm_${p}_$oo" --save "$OUT/gsm_${p}_$oo.json" || echo "  gsm $p $oo FAILED"; }
 
 COMMIT="$(cd "$POC" && git rev-parse --short HEAD 2>/dev/null || echo '?')"; BRANCH="$(cd "$POC" && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+# Build the reproduce command as an actually-copy-pasteable string: printf %q shell-quotes
+# each piece so it round-trips correctly (embedding "$VAR" inside a heredoc's ${x:+...} word
+# does NOT work — bash quote-removal strips those literal quotes before the heredoc ever sees
+# them, silently producing an unquoted, broken command; this bit us in practice — see
+# REPRODUCE.md history if you're tempted to "simplify" this back to inline ${EXTRA:+ "$EXTRA"}).
+REPRO_CMD="bash run_scope.sh $(printf '%q' "$HONEST")"
+[ -n "$FRAUD" ] && REPRO_CMD="$REPRO_CMD $(printf '%q' "$FRAUD")"
+[ "$MLA" = 1 ] && REPRO_CMD="$REPRO_CMD --mla"
+[ "$PERF_ONLY" = 1 ] && REPRO_CMD="$REPRO_CMD --perf-only"
+[ -n "$EXTRA" ] && REPRO_CMD="$REPRO_CMD --extra $(printf '%q' "$EXTRA")"
+EXTRA_DISPLAY=""
+[ -n "$EXTRA" ] && EXTRA_DISPLAY=" | extra=$(printf '%q' "$EXTRA")"
 cat > "$OUT/REPRODUCE.md" <<EOF
 # Reproduce: decode-PoC report
 - honest/validator: \`$HONEST\`  | fraud: \`${FRAUD:-none (--perf-only)}\`  | attention: $([ "$MLA" = 1 ] && echo MLA || echo full)
 - perf=[${PERF[*]}] | validator=$VAL | honest-refs=[$VAL ${HREF[*]}] | fraud-refs=[${FREF[*]}]
-- params: nonces=$NONCES max_tokens=$MT seq_len=$SEQ gsm_limit=$GSMN | GPU=$GPU | vLLM $BRANCH@$COMMIT | poc-scope@$SCOPE_COMMIT${XHW:+ | cross-HW ref=$XHW}${EXTRA:+ | extra="$EXTRA"}
+- params: nonces=$NONCES max_tokens=$MT seq_len=$SEQ gsm_limit=$GSMN | GPU=$GPU | vLLM $BRANCH@$COMMIT | poc-scope@$SCOPE_COMMIT${XHW:+ | cross-HW ref=$XHW}$EXTRA_DISPLAY
 - branch: https://github.com/axeltec-software/vllm/tree/poc-v0.20-decode-poc-cg
-Run:  bash run_scope.sh "$HONEST" "$FRAUD" $([ "$MLA" = 1 ] && echo --mla)${EXTRA:+ --extra "$EXTRA"}
+Run:  $REPRO_CMD
 Pull: bash s3.sh pull-report $SESS ./$SESS
 EOF
 
