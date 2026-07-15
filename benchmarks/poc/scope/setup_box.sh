@@ -55,6 +55,25 @@ find vllm \( -name '*.py' -o -name '*.pt' \) -printf '%P\n' | while read f; do
   install -D -m644 "vllm/$f" "$SP/$f"
 done
 
+echo "== 3b. patch the cute-FA arch gate (unblocks FLASH_ATTN on B300/sm_103) =="
+# The wheel's cute FA kernel gates on `Arch.sm_100 <= arch <= Arch.sm_110f`
+# ("Only SM 10.x and 11.x"), but the vendored nvidia-cutlass-dsl enum maps
+# sm_110f=(10,1,'f') — so the gate really means SM 10.0–10.1 and rejects
+# B300 (sm_103), which the kernel itself supports (it has an is_sm103 branch;
+# patched FA validates bit-exact against itself on B300). Rewrite the gate to
+# the check its own message claims. Idempotent.
+FA_FWD="$SP/vllm_flash_attn/cute/flash_fwd_sm100.py"
+if [ -f "$FA_FWD" ] && grep -q 'self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f' "$FA_FWD"; then
+  sed -i 's|assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"|assert self.arch.major in (10, 11), "Only SM 10.x and 11.x are supported"  # patched by setup_box: vendored cutlass maps sm_110f=(10,1), excluding sm_103/B300|' "$FA_FWD"
+  grep -q 'patched by setup_box' "$FA_FWD" || { echo "FATAL: FA gate substitution did not apply" >&2; exit 4; }
+  echo "   patched $FA_FWD"
+elif [ -f "$FA_FWD" ] && grep -q 'patched by setup_box' "$FA_FWD"; then
+  echo "   already patched — skipped"
+else
+  echo "FATAL: cute-FA arch gate not found in $FA_FWD (wheel changed?) — B300 FLASH_ATTN would stay blocked" >&2
+  exit 4
+fi
+
 echo "== 4. VERIFY consistency (fail-closed: any mismatch aborts) =="
 cd /tmp && "$REPO/.venv/bin/python" - <<'PY'
 import torch, torchvision, vllm, vllm._C, vllm._C_stable_libtorch
