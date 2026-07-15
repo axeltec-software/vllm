@@ -12,6 +12,15 @@ from .data import Artifact
 
 logger = init_logger(__name__)
 
+
+def _artifact_payload(a) -> dict:
+    d = {"nonce": a.nonce, "vector_b64": a.vector_b64}
+    if a.k_points_steps is not None:
+        d["k_points_steps"] = a.k_points_steps
+    if getattr(a, "sph_values_steps", None):
+        d["sph_values_steps"] = a.sph_values_steps
+    return d
+
 POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5"))
 POC_CALLBACK_MAX_ARTIFACTS = int(os.environ.get("POC_CALLBACK_MAX_ARTIFACTS", "1000000"))
 POC_CALLBACK_RETRY_BACKOFF_SEC = 1.0
@@ -83,15 +92,11 @@ class CallbackSender:
                     self._buffer.clear()
                     self._pending_payload = {
                         **self._metadata,
-                        # decode PoC: include the sphere_k trajectory; prefill leaves
-                        # it out (key absent) so the payload is byte-unchanged there.
-                        "artifacts": [
-                            ({"nonce": a.nonce, "vector_b64": a.vector_b64}
-                             if a.k_points_steps is None else
-                             {"nonce": a.nonce, "vector_b64": a.vector_b64,
-                              "k_points_steps": a.k_points_steps})
-                            for a in artifacts_to_send
-                        ],
+                        # decode PoC adds the sphere_k trajectory; the vector
+                        # window (poc_vector_artifacts/debug) adds sph_values_steps.
+                        # Absent fields leave no key, so prefill payloads stay
+                        # byte-unchanged.
+                        "artifacts": [_artifact_payload(a) for a in artifacts_to_send],
                         "encoding": {"dtype": "f16", "k_dim": self.k_dim, "endian": "le"},
                     }
                     retry_attempt = 0

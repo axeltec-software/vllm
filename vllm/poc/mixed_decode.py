@@ -40,6 +40,34 @@ _MARGIN_TAU = float(os.environ.get("VLLM_POC_MARGIN_TAU", "0") or "0")
 POC_DEFER_LIMIT = 4
 
 
+def _vector_artifact_cfg(runner) -> tuple:
+    """(enabled, steps, dim) emission knobs from the engine's CacheConfig.
+    The fallbacks are load-bearing: these files get overlaid onto vLLM trees
+    whose config may predate the fields — then disable, don't raise."""
+    cc = getattr(getattr(runner, "vllm_config", None), "cache_config", None)
+    if cc is None:
+        return False, 64, 32
+    return (bool(getattr(cc, "poc_vector_artifacts", False)),
+            int(getattr(cc, "poc_vector_artifact_steps", 64)),
+            int(getattr(cc, "poc_vector_artifact_dim", 32)))
+
+
+def keep_q_step(step: int, debug: bool, va_on: bool, va_steps: int) -> bool:
+    """Which decode steps retain their pre-snap slice for emission: all under
+    debug, the leading va_steps window under poc_vector_artifacts. Pure."""
+    return debug or (va_on and step <= va_steps)
+
+
+def encode_sph_slices(q_host, debug: bool, va_on: bool, va_dim: int) -> list:
+    """Wire-encode kept slices (one fp16-LE base64 row, vector_b64 codec).
+    Flag mode ships the raw leading va_dim coords — NOT renormalized; the
+    scorer renormalizes both sides. Debug ships full width. Pure."""
+    from .data import encode_vector
+    if not debug and va_on:
+        q_host = q_host[:, :va_dim]
+    return [encode_vector(row) for row in q_host]
+
+
 def slice_sampling_metadata(sm, rows, device):
     """Restrict a SamplingMetadata to `rows` (input_batch indices), so the sampler
     runs on chat rows only. PoC rows have no sampling semantics; keeping them out
@@ -175,11 +203,11 @@ class PoCDecodeState:
     mismatch_t: "torch.Tensor | None" = None      # [1] int64 on-device accumulator
     n_nan_t: "torch.Tensor | None" = None         # [1] int64 non-finite-step counter (device)
     k_steps_t: list = field(default_factory=list)  # list of [1] int64; cat+tolist at end
-    # debug only (PoCParams.debug): the per-step pre-snap sphere slices — the same
-    # q whose argmax is sphere_k — kept so the documented PoCOutput.sph_values_steps
-    # contract (v1/outputs.py) can be emitted. list of [1, SPHERE_DIM] float tensors,
-    # index 0 = prefill, 1..N = decode; device-accumulated like k_steps_t (no
-    # per-step host sync), encoded once at emit.
+    # per-step pre-snap sphere slices (the q whose argmax is sphere_k) for
+    # PoCOutput.sph_values_steps: full trajectory under debug, prefill +
+    # leading poc_vector_artifact_steps window under poc_vector_artifacts.
+    # [1, SPHERE_DIM] floats, index 0 = prefill; device-accumulated like
+    # k_steps_t (no per-step host sync), encoded once at emit.
     q_steps_t: list = field(default_factory=list)
 
 
@@ -442,6 +470,8 @@ def process_poc_outputs_from_hidden(
     if codebook is None:
         codebook = get_sphere_codebook().to(device=runner.device)
         runner._poc_codebook = codebook
+    # engine-static: safe to fetch once per forward
+    va_on, va_steps, va_dim = _vector_artifact_cfg(runner)
 
     # Decode steps are the hot path; collect them and run ONE batched set of GPU
     # ops for the whole nonce-batch below (was a per-nonce Python loop = B× the
@@ -499,8 +529,8 @@ def process_poc_outputs_from_hidden(
             hidden_size, SPHERE_DIM, runner.device)
         k0_t, bad0, margin0, q0 = _sphere_from_idx(sph0)    # [1]/[1]/[1]/[1,SPHERE_DIM]
         st.k_steps_t = [k0_t]
-        # debug: keep the pre-snap slice so sph_values_steps can be emitted
-        st.q_steps_t = [q0.detach()] if poc_params.debug else []
+        # emission only — forward unchanged (contract: q_steps_t field doc)
+        st.q_steps_t = [q0.detach()] if (poc_params.debug or va_on) else []
         st.mismatch_t = torch.zeros(1, dtype=torch.int64, device=runner.device)
         st.n_nan_t = bad0.to(torch.int64)                   # [1] non-finite-step counter
         if st.reference is not None:
@@ -532,16 +562,17 @@ def process_poc_outputs_from_hidden(
         # snap_with_margin: argmax(NaN) is garbage -> non-finite rows return k=-1
         # (compute fault, NOT fraud). bad_all/margin_all stay on device (no per-step sync).
         q_all = project_to_sphere(torch.gather(lh, 1, sph))          # [B, SPHERE_DIM]
-        k_all, bad_all, margin_all = snap_with_margin(q_all, codebook)  # [B] int64/bool/float
+        k_all, bad_all, margin_all = snap_with_margin(q_all, codebook)  # [B] each
 
         for i, meta in enumerate(decode_metas):
             st = meta['decode_state']
             step = meta['decode_step']
             k_t = k_all[i:i + 1]                               # [1] tensor (view)
             st.k_steps_t.append(k_t)
-            if meta['poc_params'].debug:
-                # debug: keep the pre-snap slice (device, like k_steps_t — no sync)
-                st.q_steps_t.append(q_all[i:i + 1].detach())
+            if keep_q_step(step, meta['poc_params'].debug, va_on, va_steps):
+                # device-side like k_steps_t — no per-step host sync; clone so
+                # a lone debug row does not pin the whole [B, SPHERE_DIM] batch
+                st.q_steps_t.append(q_all[i:i + 1].detach().clone())
             st.n_nan_t += bad_all[i:i + 1].to(torch.int64)    # device accumulate (no sync)
             if st.reference_t is not None and step < st.reference_t.shape[0]:
                 ref = st.reference_t[step:step + 1]
@@ -565,15 +596,13 @@ def process_poc_outputs_from_hidden(
                         "(compute fault, NOT fraud; excluded from mismatch rate) — "
                         "trajectory suspect, re-run on a clean GPU",
                         meta['poc_params'].nonce, n_nan, len(k_points))
-                # debug: emit the documented sph_values_steps contract (v1/outputs.py)
-                # — one fp16-LE base64 slice per trajectory step, same wire format as
-                # vector_b64 (data.encode_vector). Single host copy, emit-once.
                 sph_vals = []
-                if meta['poc_params'].debug and st.q_steps_t:
+                if st.q_steps_t:
                     # cat on device, then ONE host copy for the whole trajectory
                     # (a per-step .cpu() would sync T+1 times at emit).
                     q_host = torch.cat(st.q_steps_t).cpu().numpy()
-                    sph_vals = [encode_vector(row) for row in q_host]
+                    sph_vals = encode_sph_slices(
+                        q_host, meta['poc_params'].debug, va_on, va_dim)
                 poc_outputs[meta['req_id']] = PoCOutput(
                     nonce=meta['poc_params'].nonce,
                     vector_b64="",

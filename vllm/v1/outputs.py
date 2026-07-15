@@ -134,10 +134,13 @@ class PoCOutput:
     # FAULT (GPU contention / kernel fault), NOT fraud. Excluded from
     # n_sphere_mismatches; >0 means the trajectory is suspect and should be re-run.
     n_nan_steps: int = 0
-    # Debug mode (debug=True in request): per-step sphere slice indices and
-    # values.  Index 0 = prefill, 1..N = decode steps.
-    # sph_indices_steps[step] : list of SPHERE_DIM int indices into hidden state
-    # sph_values_steps[step]  : base64-encoded float16 array of gathered values
+    # Per-step sphere slices, index 0 = prefill, 1..N = decode steps. Emitted
+    # under debug (full trajectory, full SPHERE_DIM) or poc_vector_artifacts
+    # (prefill + leading window, leading poc_vector_artifact_dim coords).
+    # sph_indices_steps[step] : list of SPHERE_DIM int indices (debug only)
+    # sph_values_steps[step]  : base64 fp16-LE pre-snap slice — a raw slice of
+    #                           a unit vector, NOT unit itself; renormalize
+    #                           before any cosine.
     sph_indices_steps: list[list[int]] = field(default_factory=list)
     sph_values_steps: list[str] = field(default_factory=list)
 

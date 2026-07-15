@@ -3,7 +3,11 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from vllm.logger import init_logger
+
 from .data import decode_vector, fraud_test, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
+
+logger = init_logger(__name__)
 
 
 def score_vector_channel(
@@ -24,24 +28,39 @@ def score_vector_channel(
     vector_b64 path); non-finite slices are skipped like the NaN guard.
     Returns None when no (computed, reference) vector pair exists, so callers
     attach it as optional evidence.
+
+    Dim-adaptive: the two sides may ship different dims/steps (windowed
+    poc_vector_artifacts slices are raw, not renormalized) — both are
+    truncated to the common leading dims and renormalized before the cosine.
     """
     per_nonce: List[Dict] = []
+    n_skipped = 0      # nonces with a ref but nothing scorable (all-bad/short)
+    n_bad_total = 0
     for a in computed_artifacts:
         ref_b64 = ref_vectors.get(a["nonce"]) or []
         own_b64 = a.get("sph_values_steps") or []
         n = min(len(ref_b64), len(own_b64))
         if n < 2:      # need at least one decode step beyond the prefill slice
+            n_skipped += bool(ref_b64)
             continue
         dists = []
         n_bad = 0
         for t in range(1, n):
             vp = decode_vector(ref_b64[t])
             vv = decode_vector(own_b64[t])
-            if vp.shape != vv.shape or not (
+            d = min(vp.shape[0], vv.shape[0])
+            vp, vv = vp[:d], vv[:d]
+            if d == 0 or not (
                     np.all(np.isfinite(vp)) and np.all(np.isfinite(vv))):
                 n_bad += 1
                 continue
-            dists.append(1.0 - float(np.dot(vp, vv)))
+            np_norm = float(np.linalg.norm(vp))
+            nv_norm = float(np.linalg.norm(vv))
+            if np_norm == 0.0 or nv_norm == 0.0:
+                n_bad += 1
+                continue
+            dists.append(1.0 - float(np.dot(vp, vv)) / (np_norm * nv_norm))
+        n_bad_total += n_bad
         if dists:
             per_nonce.append({
                 "nonce": a["nonce"],
@@ -49,12 +68,16 @@ def score_vector_channel(
                 "n_steps_scored": len(dists),
                 "n_bad_steps": n_bad,
             })
+        else:
+            n_skipped += 1     # every step bad — adversarial NaN/zero slices land here
     if not per_nonce:
         return None
     return {
         "mean_dist": float(np.mean([e["mean_dist"] for e in per_nonce])),
         "max_nonce_dist": float(max(e["mean_dist"] for e in per_nonce)),
         "n_nonces_scored": len(per_nonce),
+        "n_nonces_skipped": n_skipped,
+        "n_bad_steps_total": n_bad_total,
         "per_nonce": per_nonce,
     }
 
@@ -169,4 +192,10 @@ def run_validation(
         vector_score = score_vector_channel(computed_artifacts, ref_vectors)
         if vector_score is not None:
             result["vector_score"] = vector_score
+        else:
+            # never silent: an adversary shipping all-bad slices (or a
+            # misconfigured pair) must not look like "channel not requested"
+            logger.warning(
+                "vector channel: %d reference trajectories supplied but no "
+                "(computed, reference) pair scored", len(ref_vectors))
     return result
