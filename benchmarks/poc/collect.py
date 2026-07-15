@@ -81,7 +81,8 @@ def cmd_validate(a):
              results={"validator_model": a.model, "prover_model": rmeta["model"], "honest": honest,
                       "rate": rate, "n_mismatch": resp["n_mismatch"], "fraud_detected": resp["fraud_detected"],
                       "per_nonce": resp.get("per_nonce", []),  # per-nonce mismatch counts (for charts)
-                      "vector_score": vec,  # continuous channel (needs --debug both sides)
+                      # continuous channel (vectors present on both sides)
+                      "vector_score": vec,
                       "prover_gpu": rmeta.get("gpu"),  # prover HW (this run is the validator's HW)
                       "nonces_per_s": round(nps, 3), "elapsed_s": round(secs, 1)})
     vtxt = f" vec_mean_dist={vec['mean_dist']:.2e}" if vec else ""

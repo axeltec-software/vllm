@@ -28,19 +28,26 @@ import sys
 import numpy as np
 
 
+try:  # single source of truth for the wire codec when vllm is importable
+    from vllm.poc.data import decode_vector as _decode_vector
+except ImportError:
+    def _decode_vector(s):
+        return np.frombuffer(base64.b64decode(s), dtype="<f2").astype(np.float32)
+
+
 def _slices(artifact):
     sv = artifact.get("sph_values_steps") or []
     if not sv:
         return None
-    return np.stack([
-        np.frombuffer(base64.b64decode(s), dtype="<f2").astype(np.float32)
-        for s in sv])
+    return np.stack([np.asarray(_decode_vector(s), dtype=np.float32) for s in sv])
 
 
 def pair_dists(gen_file, val_file):
     """Per-nonce mean cosine distance over decode steps (index 1..)."""
-    gen = json.load(open(gen_file))
-    val = json.load(open(val_file))
+    with open(gen_file) as f:
+        gen = json.load(f)
+    with open(val_file) as f:
+        val = json.load(f)
     g = {a["nonce"]: a for a in gen.get("artifacts", [])}
     v = {a["nonce"]: a for a in val.get("artifacts", [])}
     out = []
@@ -51,7 +58,14 @@ def pair_dists(gen_file, val_file):
         n = min(len(qp), len(qv))
         if n < 2:
             continue
-        cos = np.sum(qp[1:n] * qv[1:n], axis=1)
+        # scorer parity (score_vector_channel): common leading dims, then
+        # renormalize — wire slices are raw, not unit vectors
+        d = min(qp.shape[1], qv.shape[1])
+        a, b = qp[1:n, :d], qv[1:n, :d]
+        na = np.linalg.norm(a, axis=1)
+        nb = np.linalg.norm(b, axis=1)
+        good = (na > 0) & (nb > 0)
+        cos = np.where(good, np.sum(a * b, axis=1) / np.where(good, na * nb, 1.0), np.nan)
         ok = np.isfinite(cos)
         if ok.any():
             out.append(float(np.mean(1.0 - cos[ok])))

@@ -673,6 +673,9 @@ class EngineArgs:
     poc_seq_len: int = get_field(CacheConfig, "poc_seq_len")
     poc_max_tokens: int = get_field(CacheConfig, "poc_max_tokens")
     poc_share: float = get_field(CacheConfig, "poc_share")
+    poc_vector_artifacts: bool = get_field(CacheConfig, "poc_vector_artifacts")
+    poc_vector_artifact_steps: int = get_field(CacheConfig, "poc_vector_artifact_steps")
+    poc_vector_artifact_dim: int = get_field(CacheConfig, "poc_vector_artifact_dim")
 
     shutdown_timeout: int = 0
 
@@ -1119,6 +1122,17 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--poc-max-tokens", **cache_kwargs["poc_max_tokens"]
+        )
+        cache_group.add_argument(
+            "--poc-vector-artifacts", **cache_kwargs["poc_vector_artifacts"]
+        )
+        cache_group.add_argument(
+            "--poc-vector-artifact-steps",
+            **cache_kwargs["poc_vector_artifact_steps"]
+        )
+        cache_group.add_argument(
+            "--poc-vector-artifact-dim",
+            **cache_kwargs["poc_vector_artifact_dim"]
         )
         cache_group.add_argument(
             "--poc-share", **cache_kwargs["poc_share"]
@@ -1688,6 +1702,9 @@ class EngineArgs:
             poc_seq_len=self.poc_seq_len,
             poc_max_tokens=self.poc_max_tokens,
             poc_share=self.poc_share,
+            poc_vector_artifacts=self.poc_vector_artifacts,
+            poc_vector_artifact_steps=self.poc_vector_artifact_steps,
+            poc_vector_artifact_dim=self.poc_vector_artifact_dim,
         )
 
         # TurboQuant: auto-skip first/last 2 layers (boundary protection).

@@ -72,7 +72,8 @@ async def compute_nonce_artifacts(
                     return None
                 get = poc_out.get if isinstance(poc_out, dict) else (
                     lambda k, d=None: getattr(poc_out, k, d))
-                # sph_* debug fields are only included when debug is on.
+                # sph_indices_steps is debug-only; sph_values_steps is emitted
+                # under debug (full) or poc_vector_artifacts (windowed slice).
                 artifact = {
                     "nonce": get("nonce", nonce),
                     "vector_b64": get("vector_b64", ""),
@@ -83,6 +84,10 @@ async def compute_nonce_artifacts(
                 if debug:
                     artifact["sph_indices_steps"] = get("sph_indices_steps", [])
                     artifact["sph_values_steps"] = get("sph_values_steps", [])
+                else:
+                    sph_vals = get("sph_values_steps", [])
+                    if sph_vals:
+                        artifact["sph_values_steps"] = sph_vals
                 return artifact
         except Exception as e:
             logger.error("Error computing nonce %s: %r", nonce, e, exc_info=True)
@@ -119,8 +124,9 @@ class GenerateJob:
     debug: bool = False
     per_nonce_reflection: bool = False
     validation_artifacts: Optional[Dict[int, str]] = None
-    # nonce -> reference sph_values_steps (debug refs): enables the continuous
-    # vector_score on the queued path, same as the inline wait=true path.
+    # nonce -> reference sph_values_steps (debug or poc_vector_artifacts refs):
+    # enables the continuous vector_score on the queued path, same as the
+    # inline wait=true path.
     ref_vectors: Optional[Dict[int, List[str]]] = None
     stat_test_dist_threshold: float = DEFAULT_DIST_THRESHOLD
     stat_test_p_mismatch: float = DEFAULT_P_MISMATCH

@@ -20,6 +20,8 @@ class Artifact:
     nonce: int
     vector_b64: str
     k_points_steps: Optional[List[int]] = None
+    # windowed pre-snap slices (poc_vector_artifacts) or full debug trajectory
+    sph_values_steps: Optional[List[str]] = None
 
 
 @dataclass
