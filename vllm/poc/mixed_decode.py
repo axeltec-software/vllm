@@ -16,6 +16,7 @@ core vLLM footprint minimal) take the GPUModelRunner as ``runner``. Decode-PoC i
 always step-driven and mixed with chat (one PoC decode token per scheduler step,
 fused into the chat forward — chat is never frozen); validation runs pure.
 """
+import os
 from dataclasses import dataclass, field
 
 import os
@@ -551,18 +552,26 @@ def process_poc_outputs_from_hidden(
     if decode_metas:
         device = runner.device
         H = hidden_states.shape[-1]
-        idxs = [m['start_idx'] + m['length'] - 1 for m in decode_metas]
-        lh = hidden_states[idxs].float()                       # [B, H]
-        lh = lh / (lh.norm(dim=-1, keepdim=True) + 1e-8)
-        base_seeds = torch.cat([m['decode_state'].base_seeds for m in decode_metas])
-        prev_k = torch.cat([m['decode_state'].prev_k_t for m in decode_metas])
-        steps = torch.tensor([m['decode_step'] for m in decode_metas],
-                             dtype=torch.int64, device=device)
-        sph = random_pick_indices_gpu(base_seeds, prev_k, steps, H, SPHERE_DIM, device)
-        # snap_with_margin: argmax(NaN) is garbage -> non-finite rows return k=-1
-        # (compute fault, NOT fraud). bad_all/margin_all stay on device (no per-step sync).
-        q_all = project_to_sphere(torch.gather(lh, 1, sph))          # [B, SPHERE_DIM]
-        k_all, bad_all, margin_all = snap_with_margin(q_all, codebook)  # [B] each
+        # Eager tail is the LIVE path. Irene's tail CUDA graph (vllm/poc/tail_cudagraph.py)
+        # is NOT wired in here because (1) it's not a net win — the bottleneck is the per-step
+        # input prep (torch.cat/torch.tensor/gather), not the snap math (see
+        # CUDAGRAPH_POC_TAIL_STEPS.md), and (2) it returns only (k, bad) — not the margin /
+        # q-vectors the margin gate and vector channel now require. record_function label kept
+        # so this tail stays profileable while we attack the real (input-prep) bottleneck.
+        from torch.autograd.profiler import record_function
+        with record_function("poc_tail_eager_path"):
+            idxs = [m['start_idx'] + m['length'] - 1 for m in decode_metas]
+            lh = hidden_states[idxs].float()                       # [B, H]
+            lh = lh / (lh.norm(dim=-1, keepdim=True) + 1e-8)
+            base_seeds = torch.cat([m['decode_state'].base_seeds for m in decode_metas])
+            prev_k = torch.cat([m['decode_state'].prev_k_t for m in decode_metas])
+            steps = torch.tensor([m['decode_step'] for m in decode_metas],
+                                 dtype=torch.int64, device=device)
+            sph = random_pick_indices_gpu(base_seeds, prev_k, steps, H, SPHERE_DIM, device)
+            # snap_with_margin: argmax(NaN) is garbage -> non-finite rows return k=-1
+            # (compute fault, NOT fraud). bad_all/margin_all stay on device (no per-step sync).
+            q_all = project_to_sphere(torch.gather(lh, 1, sph))          # [B, SPHERE_DIM]
+            k_all, bad_all, margin_all = snap_with_margin(q_all, codebook)  # [B] each
 
         for i, meta in enumerate(decode_metas):
             st = meta['decode_state']

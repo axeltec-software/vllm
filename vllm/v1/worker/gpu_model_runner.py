@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -513,6 +514,11 @@ class GPUModelRunner(
 
         # Encoder CUDA graph manager (initialized after model load if enabled)
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
+
+        # Decode-PoC post-processing-tail CUDA graph manager (initialized after
+        # model load if the model has PoC-wrappable layers; captured in
+        # capture_model()). See vllm/poc/tail_cudagraph.py.
+        self._poc_tail_graph_mgr = None
 
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
@@ -5068,6 +5074,18 @@ class GPUModelRunner(
                     self._poc_native = attach_native_poc(
                         self.model, _layers, _inner, self.max_num_tokens,
                         self.model_config.get_hidden_size(), self.device, self.dtype)
+                    # Post-forward decode-PoC tail (sphere-snap) CUDA graph — captured
+                    # later in capture_model(). OFF by default: the tail graph is not a
+                    # net win (bottleneck is input prep, not the snap) AND the live path
+                    # in mixed_decode.py needs margin/q-vectors the graph doesn't produce.
+                    # Kept behind POC_TAIL_CUDAGRAPH=1 for the ongoing investigation.
+                    # See vllm/poc/tail_cudagraph.py, benchmarks/poc/CUDAGRAPH_POC_TAIL_STEPS.md.
+                    if os.environ.get("POC_TAIL_CUDAGRAPH") == "1":
+                        from vllm.poc.sphere import SPHERE_DIM
+                        from vllm.poc.tail_cudagraph import PoCTailGraphManager
+                        self._poc_tail_graph_mgr = PoCTailGraphManager(
+                            self.cache_config.poc_max_batch_size,
+                            self.model_config.get_hidden_size(), SPHERE_DIM, self.device)
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)
@@ -6379,6 +6397,21 @@ class GPUModelRunner(
             # Capture encoder CUDA graphs if enabled
             if self.encoder_cudagraph_manager is not None:
                 self.encoder_cudagraph_manager.capture()
+
+            # Capture the decode-PoC post-processing-tail graph if this model
+            # supports it (see vllm/poc/tail_cudagraph.py). Never captured under
+            # enforce_eager (this whole function returns early in that case, see
+            # top of capture_model()), matching the "PoC batch must be eager
+            # under enforce_eager" invariant enforced elsewhere for the main
+            # model graph.
+            if self._poc_tail_graph_mgr is not None and not self._poc_tail_graph_mgr.ready:
+                from vllm.poc.sphere import get_sphere_codebook
+                codebook = getattr(self, "_poc_codebook", None)
+                if codebook is None:
+                    codebook = get_sphere_codebook().to(device=self.device)
+                    self._poc_codebook = codebook
+                self._poc_tail_graph_mgr.capture(codebook)
+                logger.info("Captured decode-PoC post-processing-tail CUDA graph")
 
             torch.accelerator.synchronize()
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]

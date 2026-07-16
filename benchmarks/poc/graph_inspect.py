@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tests.poc._graph import (  # noqa: E402
     count_graph_launches,
+    count_tail_graph_launches,
     load_trace_events,
     profile_poc_request,
 )
@@ -118,14 +119,22 @@ def main() -> int:
             print("NO TRACE PRODUCED — check profiler support")
             return 1
         if not args.no_count:
+            tail_total = sum(count_tail_graph_launches(t) for t in traces)
             for t in traces:
-                print(f"{os.path.basename(t)}: cudaGraphLaunch = {count_graph_launches(t)}")
+                print(f"{os.path.basename(t)}: cudaGraphLaunch = {count_graph_launches(t)} "
+                      f"(tail = {count_tail_graph_launches(t)})")
             print(f"\nTOTAL cudaGraphLaunch during PoC request: {total}")
+            print(f"  of which decode-PoC tail graph: {tail_total}")
             print("GRAPHED" if total > 0 else "NOT GRAPHED (eager/compiled-only)")
+            print("TAIL GRAPHED" if tail_total > 0
+                  else "TAIL NOT GRAPHED (model forward may still be graphed above)")
     elif not args.no_count:
         total = sum(count_graph_launches(t) for t in traces)
-        print(f"TOTAL cudaGraphLaunch: {total}")
+        tail_total = sum(count_tail_graph_launches(t) for t in traces)
+        print(f"TOTAL cudaGraphLaunch: {total}  (of which tail: {tail_total})")
         print("GRAPHED" if total > 0 else "NOT GRAPHED (eager/compiled-only)")
+        print("TAIL GRAPHED" if tail_total > 0
+              else "TAIL NOT GRAPHED (model forward may still be graphed above)")
 
     if args.render:
         # render the GPU-side (rank-0) trace — the largest one
