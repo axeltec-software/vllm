@@ -18,7 +18,7 @@ import torch
 from torch import nn
 
 from .gpu_random import (expert_logits_from_base, generate_householder_vector,
-                         route_base_seed, _seed_from_string)
+                         route_base_seed, _seed_from_string, pinned_to_device)
 
 # Debug-only TP guard (VLLM_POC_DEBUG_TP=1): PoC reflection vectors / embeds are
 # generated per rank from deterministic seeds and MUST be bit-identical across
@@ -288,10 +288,21 @@ class PoCNativeState:
         if key == self._last_route_key:                      # nothing changed -> skip
             return
         b = len(row_steps)
-        steps_t = torch.tensor(row_steps, dtype=torch.int64, device=self.device)  # tiny [B] upload
-        for i, (buf, (n, k)) in enumerate(zip(self.router_force, self.router_meta)):
-            forced = expert_logits_from_base(self._route_base[i][:b], steps_t, n, k, self.device)
-            buf[:b].copy_(forced)                            # in place; graph reads live values
+        # sync-free host->device (MoE seeded routing runs this every step) — a direct
+        # torch.tensor(list, device=cuda) blocks on the forward; see pinned_to_device.
+        steps_t = pinned_to_device(row_steps, torch.int64, self.device)  # tiny [B] upload
+        metas = self.router_meta
+        if metas and all(m == metas[0] for m in metas):
+            # homogeneous MoE: all layers in ONE batched call (per-row independent -> identical, L->1)
+            n, k = metas[0]; L = len(self.router_force)
+            base_all = torch.stack([rb[:b] for rb in self._route_base]).reshape(-1)   # [L*b]
+            forced = expert_logits_from_base(
+                base_all, steps_t.repeat(L), n, k, self.device).view(L, b, n)         # [L, b, n]
+            for i, buf in enumerate(self.router_force):
+                buf[:b].copy_(forced[i])
+        else:                                                # heterogeneous layers -> per-layer
+            for i, (buf, (n, k)) in enumerate(zip(self.router_force, self.router_meta)):
+                buf[:b].copy_(expert_logits_from_base(self._route_base[i][:b], steps_t, n, k, self.device))
         self._last_route_key = key
 
     def set_mask(self, row_mask: torch.Tensor | None) -> None:

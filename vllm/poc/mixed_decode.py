@@ -16,6 +16,7 @@ core vLLM footprint minimal) take the GPUModelRunner as ``runner``. Decode-PoC i
 always step-driven and mixed with chat (one PoC decode token per scheduler step,
 fused into the chat forward — chat is never frozen); validation runs pure.
 """
+import os
 from dataclasses import dataclass, field
 
 import os
@@ -433,16 +434,16 @@ def build_unified_mixed_batch_inputs(
     # Batched decode-step embeddings: one generate_decode_inputs_gpu call for the
     # whole nonce-batch (per-row identical to the old per-nonce calls).
     if decode_embed_jobs:
-        from vllm.poc.gpu_random import generate_decode_inputs_gpu
+        from vllm.poc.gpu_random import generate_decode_inputs_gpu, pinned_to_device
         base_seeds = torch.cat([j[0].base_seeds for j in decode_embed_jobs])  # [B]
         prev_k = torch.cat([j[0].prev_k_t for j in decode_embed_jobs])        # [B]
-        steps = torch.tensor([j[1] for j in decode_embed_jobs],
-                             dtype=torch.int64, device=runner.device)
+        # sync-free host->device (pinned, non_blocking): direct torch.tensor(list,
+        # device=cuda) blocks on the forward every step (see pinned_to_device).
+        steps = pinned_to_device([j[1] for j in decode_embed_jobs], torch.int64, runner.device)
         embeds = generate_decode_inputs_gpu(
             base_seeds, prev_k, steps,
             dim=hidden_size, device=runner.device, dtype=runner.dtype)  # [B, 1, H]
-        offs = torch.tensor([j[2] for j in decode_embed_jobs],
-                            dtype=torch.long, device=runner.device)
+        offs = pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device)
         unified_embeds.index_copy_(0, offs, embeds[:, 0])   # [B, H] -> rows offs
 
     return unified_embeds, unified_positions, poc_position_mask, poc_metadata
@@ -456,7 +457,7 @@ def process_poc_outputs_from_hidden(
     from vllm.v1.outputs import PoCOutput
     from vllm.poc.gpu_random import (
         random_pick_indices, apply_haar_rotation,
-        decode_base_seeds, random_pick_indices_gpu,
+        decode_base_seeds, random_pick_indices_gpu, pinned_to_device,
     )
     from vllm.poc.data import encode_vector
     from vllm.poc.sphere import (
@@ -551,18 +552,29 @@ def process_poc_outputs_from_hidden(
     if decode_metas:
         device = runner.device
         H = hidden_states.shape[-1]
-        idxs = [m['start_idx'] + m['length'] - 1 for m in decode_metas]
-        lh = hidden_states[idxs].float()                       # [B, H]
-        lh = lh / (lh.norm(dim=-1, keepdim=True) + 1e-8)
-        base_seeds = torch.cat([m['decode_state'].base_seeds for m in decode_metas])
-        prev_k = torch.cat([m['decode_state'].prev_k_t for m in decode_metas])
-        steps = torch.tensor([m['decode_step'] for m in decode_metas],
-                             dtype=torch.int64, device=device)
-        sph = random_pick_indices_gpu(base_seeds, prev_k, steps, H, SPHERE_DIM, device)
-        # snap_with_margin: argmax(NaN) is garbage -> non-finite rows return k=-1
-        # (compute fault, NOT fraud). bad_all/margin_all stay on device (no per-step sync).
-        q_all = project_to_sphere(torch.gather(lh, 1, sph))          # [B, SPHERE_DIM]
-        k_all, bad_all, margin_all = snap_with_margin(q_all, codebook)  # [B] each
+        # Eager tail is the LIVE path. Irene's tail CUDA graph (vllm/poc/tail_cudagraph.py)
+        # is NOT wired in here because (1) it's not a net win — the bottleneck is the per-step
+        # input prep (torch.cat/torch.tensor/gather), not the snap math (see
+        # CUDAGRAPH_POC_TAIL_STEPS.md), and (2) it returns only (k, bad) — not the margin /
+        # q-vectors the margin gate and vector channel now require. record_function label kept
+        # so this tail stays profileable while we attack the real (input-prep) bottleneck.
+        from torch.autograd.profiler import record_function
+        with record_function("poc_tail_eager_path"):
+            # sync-free host->device: hidden[py_list] and torch.tensor(list, device=cuda)
+            # each block on the forward every step (see pinned_to_device); index_select
+            # with a pinned index avoids it. Values (hence artifacts) are identical.
+            idxs = [m['start_idx'] + m['length'] - 1 for m in decode_metas]
+            lh = hidden_states.index_select(
+                0, pinned_to_device(idxs, torch.long, device)).float()   # [B, H]
+            lh = lh / (lh.norm(dim=-1, keepdim=True) + 1e-8)
+            base_seeds = torch.cat([m['decode_state'].base_seeds for m in decode_metas])
+            prev_k = torch.cat([m['decode_state'].prev_k_t for m in decode_metas])
+            steps = pinned_to_device([m['decode_step'] for m in decode_metas], torch.int64, device)
+            sph = random_pick_indices_gpu(base_seeds, prev_k, steps, H, SPHERE_DIM, device)
+            # snap_with_margin: argmax(NaN) is garbage -> non-finite rows return k=-1
+            # (compute fault, NOT fraud). bad_all/margin_all stay on device (no per-step sync).
+            q_all = project_to_sphere(torch.gather(lh, 1, sph))          # [B, SPHERE_DIM]
+            k_all, bad_all, margin_all = snap_with_margin(q_all, codebook)  # [B] each
 
         for i, meta in enumerate(decode_metas):
             st = meta['decode_state']
