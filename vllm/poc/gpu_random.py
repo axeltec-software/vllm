@@ -12,6 +12,22 @@ from typing import List, Optional
 import torch
 
 
+def pinned_to_device(vals, dtype, device):
+    """Build a small [N] device tensor from a host sequence WITHOUT stalling the
+    async pipeline.
+
+    `torch.tensor(list, device='cuda')` — and indexing a CUDA tensor with a Python
+    list — construct on-device via a BLOCKING host->device copy that synchronizes
+    on the compute stream. Under async scheduling that stalls every decode step on
+    the model forward (measured ~17 ms/step; see the decode-PoC tail). Building a
+    pinned host tensor and copying non_blocking avoids the sync. The values are
+    identical to the direct construction, so PoC artifacts stay bit-for-bit the
+    same — do NOT "simplify" this back to torch.tensor(..., device=cuda).
+    """
+    cuda = torch.device(device).type == "cuda"
+    return torch.tensor(vals, dtype=dtype, pin_memory=cuda).to(device, non_blocking=cuda)
+
+
 def _seed_from_string(seed_string: str) -> int:
     h = hashlib.sha256(seed_string.encode("utf-8")).hexdigest()
     return int(h[:8], 16)
@@ -387,26 +403,35 @@ def random_pick_indices_gpu(
     return chosen.to(torch.int64)
 
 
+def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
+                   device: torch.device) -> torch.Tensor:
+    """THE seeded expert selection — single source of truth for seeded routing.
+
+    Draws top_k DISTINCT experts straight from ``seed`` ([B,1] int64) by a partial
+    Fisher-Yates shuffle: pure integer (no topk, no scores, no ties) -> identical on
+    any hardware / eager / graph, and robust for ANY n_experts. Returns [B,n_experts]
+    forced logits (chosen experts hold descending values, the rest a low floor); the
+    natural MoE top-k over these picks exactly the seeded experts + gate weights."""
+    b = seed.shape[0]
+    perm = torch.arange(n_experts, device=device, dtype=torch.int64).unsqueeze(0).repeat(b, 1)
+    for i in range(top_k):                                # k swaps -> k distinct experts in perm[:, :k]
+        j = i + _batched_murmur3_32(torch.full((b, 1), i, dtype=torch.int32, device=device),
+                                    seed) % (n_experts - i)          # [B,1] swap target in [i, n)
+        gi = perm[:, i:i + 1].clone()
+        perm[:, i:i + 1] = perm.gather(1, j)
+        perm.scatter_(1, j, gi)
+    logits = torch.full((b, n_experts), -1.0e4, device=device, dtype=torch.float32)
+    logits.scatter_(1, perm[:, :top_k],
+                    torch.arange(top_k, 0, -1, device=device, dtype=torch.float32).unsqueeze(0).expand(b, -1))
+    return logits
+
+
 def seeded_expert_logits(seed_str: str, n_experts: int, top_k: int,
                          device: torch.device) -> torch.Tensor:
-    """Deterministic forced router logits for SEEDED-ROUTING.
-
-    Picks top_k experts as a pure function of ``seed_str`` (bit-exact across
-    hardware via integer murmur3 — no transcendentals), then returns an
-    ``[n_experts]`` logits vector where the chosen experts hold high *descending*
-    values and the rest a low floor. Feeding this to the normal MoE top-k makes
-    BOTH the expert selection AND the gate weights a deterministic function of the
-    seed — independent of the (noise-prone) hidden — which removes the MoE routing
-    nondeterminism that drives the decode-PoC honest floor.
-    """
-    idx = torch.arange(n_experts, device=device, dtype=torch.int32).unsqueeze(0)
-    seed_t = torch.tensor([_seed_from_string(seed_str)], dtype=torch.int64,
-                          device=device).unsqueeze(1)
-    scores = _batched_murmur3_32(idx, seed_t)[0]          # [n_experts] integer hash
-    chosen = torch.topk(scores, top_k).indices            # deterministic pick
-    logits = torch.full((n_experts,), -1.0e4, device=device, dtype=torch.float32)
-    logits[chosen] = torch.arange(top_k, 0, -1, device=device, dtype=torch.float32)
-    return logits
+    """Single-row forced logits from a seed string (tests / offline validators).
+    Same selection as the live path — both go through the shared _forced_logits."""
+    seed = torch.tensor([[_seed_from_string(seed_str)]], dtype=torch.int64, device=device)
+    return _forced_logits(seed, n_experts, top_k, device)[0]
 
 
 def route_base_seed(block_hash: str, nonce: int, layer: int) -> str:
@@ -420,21 +445,13 @@ def route_base_seed(block_hash: str, nonce: int, layer: int) -> str:
 def expert_logits_from_base(base_ints: torch.Tensor, steps: torch.Tensor,
                             n_experts: int, top_k: int,
                             device: torch.device) -> torch.Tensor:
-    """Per-row forced router logits, folding the decode ``step`` into a cached base
-    ENTIRELY ON GPU. ``base_ints``/``steps`` are [B] int64 tensors; returns
-    [B, n_experts]. The full seed is murmur3(base, step) -> murmur3(seed, expert_idx),
-    all integer (bit-exact cross-HW), batched in two kernels — NO host loop, NO
+    """Per-row forced router logits: fold the decode ``step`` into the cached base seed
+    ON GPU, then the shared _forced_logits selection. ``base_ints``/``steps`` are [B]
+    int64; returns [B, n_experts]. All integer (bit-exact cross-HW), no host loop, no
     device->host sync. Equivalent per (row, layer) to seeded_experts()."""
-    b = base_ints.shape[0]
-    seed = _batched_murmur3_32(steps.view(b, 1).to(torch.int32),
-                               base_ints.view(b, 1))                # [B,1] = fold step
-    idx = torch.arange(n_experts, device=device, dtype=torch.int32).unsqueeze(0).expand(b, -1)
-    scores = _batched_murmur3_32(idx, seed)                         # [B, n_experts]
-    chosen = torch.topk(scores, top_k, dim=1).indices              # [B, top_k]
-    logits = torch.full((b, n_experts), -1.0e4, device=device, dtype=torch.float32)
-    desc = torch.arange(top_k, 0, -1, device=device, dtype=torch.float32).unsqueeze(0).expand(b, -1)
-    logits.scatter_(1, chosen, desc)
-    return logits
+    seed = _batched_murmur3_32(steps.view(-1, 1).to(torch.int32),
+                               base_ints.view(-1, 1))               # [B,1] = fold step into base
+    return _forced_logits(seed, n_experts, top_k, device)
 
 
 def seeded_experts(block_hash: str, nonce: int, step: int, layer: int,

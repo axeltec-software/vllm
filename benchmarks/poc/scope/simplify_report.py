@@ -119,12 +119,9 @@ if poc_cg and poc_eg:
                  f"<td class=num>{inf_cg:.0f} tok/s</td><td class=num>{inf_cg/inf_eg:.2f}×</td></tr>")
     rows += (f"<tr class=hi><td><b>decode-PoC</b></td><td class=num>{poc_eg:.0f} steps/s</td>"
              f"<td class=num>{poc_cg:.0f} steps/s</td><td class=num>{poc_sp:.2f}×</td></tr>")
-    gap = f" vs pure inference <b>{inf_cg/inf_eg:.2f}×</b>" if inf_cg and inf_eg else ""
     perf_card = f"""<div class=card><div class=exp>Performance</div>
- <h2>Performance — cudagraph vs eager (pure inference and decode-PoC)</h2>
- <p class=lead>Same 32-wide batch, <b>cudagraph vs eager</b>, for <b>pure inference</b> and <b>decode-PoC</b> on the same server. The difference between the two cudagraph speedups is the un-graphed decode-PoC tail overhead.</p>
- <table><tr><th>workload</th><th class=num>eager</th><th class=num>cudagraph</th><th class=num>cudagraph speedup</th></tr>{rows}</table>
- <p class=verdict><span class=lbl>VERDICT</span> cudagraph speeds up decode-PoC by <b>{poc_sp:.2f}×</b>{gap} — confirming it is engaged for PoC decode.</p></div>"""
+ <h2>Performance — cudagraph vs eager</h2>
+ <table><tr><th>workload</th><th class=num>eager</th><th class=num>cudagraph</th><th class=num>cudagraph speedup</th></tr>{rows}</table></div>"""
 
 # ---- Experiment 1: Separation ----
 _short = lambda g: (g or "?").split(",")[0].replace("NVIDIA ", "").strip()   # GPU short name
