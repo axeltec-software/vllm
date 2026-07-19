@@ -122,9 +122,11 @@ json.dump(d,open(f,"w"),indent=2)
 P
 }
 op_perf(){ [ "$PERFON" = 0 ] && return 0; local p="$1"; echo "[perf] $p"
-  "$PY" "$POC/perfomance_nonces.py" --mode poc --model "$HONEST" --profile "$p" --url "$URL" \
+  # --mode both: measure pure inference (chat tok/s) AND decode-PoC (steps/s) on the same server.
+  # The pure-inference-vs-PoC cudagraph-speedup GAP is the key MoE metric (report shows both rows).
+  "$PY" "$POC/perfomance_nonces.py" --mode both --model "$HONEST" --profile "$p" --url "$URL" \
      --seq-len "$SEQ" --max-tokens "$MT" --duration 20 --save "$OUT/perf_$p.json" || echo "  perf $p FAILED"
-  stamp "$OUT/perf_$p.poc.json" "$p"; }
+  stamp "$OUT/perf_$p.poc.json" "$p"; stamp "$OUT/perf_$p.chat.json" "$p"; }
 op_gen(){ local model="$1" p="$2" tag="$3"; echo "[gen $tag] $p"
   "$PY" "$POC/collect.py" --mode generate --model "$model" --profile "$p" --url "$URL" \
      --nonces "$NONCES" --max-tokens "$MT" --seq-len "$SEQ" --save "$OUT/gen_${tag}_$p.json" || echo "  gen $tag $p FAILED"
