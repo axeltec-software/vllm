@@ -46,7 +46,9 @@ Copies repo `.py` over the installed vllm package; leaves compiled CUDA untouche
 edits live instantly — no image needed.)
 
 ## 3. mlnode image (FROM the vLLM engine)
-`mlnode/packages/api/Dockerfile` is parameterized:
+`mlnode/` lives in a separate (gonka) repo — check it out alongside this one; the paths
+below assume `mlnode/` sits next to the build context. `mlnode/packages/api/Dockerfile`
+is parameterized:
 ```bash
 docker buildx build -f mlnode/packages/api/Dockerfile \
   --build-arg VLLM_BASE=ghcr.io/axeltec-software/vllm:v0.20-decode-poc-cu128 \
@@ -56,9 +58,10 @@ docker buildx build -f mlnode/packages/api/Dockerfile \
 (The `VLLM_BASE` default already points at the v0.20 engine, so the overrides are only
 needed to retarget.)
 
-## 4. Push (as axeltec-gonka)
+## 4. Push
 ```bash
-cat ~/.config/ghcr-axeltec-gonka.token | docker login ghcr.io -u axeltec-gonka --password-stdin
+# log in with your own GHCR user + a personal access token (write:packages)
+echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 docker push ghcr.io/axeltec-software/vllm:v0.20-decode-poc-cu128
 docker push ghcr.io/axeltec-software/mlnode:v0.20-decode-poc
 ```

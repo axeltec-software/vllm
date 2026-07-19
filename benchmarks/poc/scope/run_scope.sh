@@ -23,6 +23,7 @@ export HF_TOKEN="$(cat ~/.cache/huggingface/token 2>/dev/null || echo "")"
 
 HONEST="${1:?usage: run_scope.sh <honest> <fraud> [--mla] [opts]}"; FRAUD="${2:?need fraud}"; shift 2
 MLA=0; NONCES=128; MT=256; SEQ=256; GSMN=100; GSM=1; PUSH=0; PERFON=1; NOFI=0; GSM_MML=2048; TP=1; GMU=0.90; EXTRA=""; XHW=""; XHW_ONLY=0
+MTAU=0; VECART=1   # margin-gate tau (validator-side) ; vector-channel artifacts on (poc_vector_artifacts)
 SCOPE_COMMIT="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo '?')"   # report-tooling version
 while [ $# -gt 0 ]; do case "$1" in
   --mla) MLA=1; shift;; --nonces) NONCES="$2"; shift 2;; --max-tokens) MT="$2"; shift 2;;
@@ -34,6 +35,8 @@ while [ $# -gt 0 ]; do case "$1" in
   --extra) EXTRA="$2"; shift 2;;   # raw extra serve args from the deploy config (e.g. "--enable-expert-parallel --attention-backend <MLA-backend>")
   --xhw) XHW="$2"; shift 2;;   # CROSS-HW: peer session (local reports/<name> dir OR S3 name); pull its refs + validate here
   --xhw-only) XHW_ONLY=1; shift;;   # phase-2: SKIP local gen/perf/gsm, ONLY cross-validate the --xhw peer (for parallel 2-box verify)
+  --margin-tau) MTAU="$2"; shift 2;;   # validator margin gate: count a k mismatch only if snap margin >= tau (0 = off)
+  --no-vec) VECART=0; shift;;   # disable the continuous vector channel (poc_vector_artifacts)
   --push) PUSH=1; shift;; *) echo "unknown opt $1"; exit 2;;
 esac; done
 
@@ -58,9 +61,10 @@ SRV_PID=""
 boot(){ # model profile [max_model_len]  -> boot one server (own process group); PoC needs only
         # seq_len+max_tokens (<=320) so default 1024; GSM passes a bigger value for its long prompts.
   local model="$1" prof="$2" mml="${3:-1024}"; local lg="$OUT/serve_$(slug "$model")_$prof.log"
-  ( cd /tmp && exec setsid "$PY" -m vllm.entrypoints.openai.api_server --model "$model" --port "$PORT" \
+  local vart=""; [ "$VECART" = 1 ] && vart="--poc-vector-artifacts"   # windowed continuous vectors (64x32)
+  ( cd /tmp && exec setsid env VLLM_POC_MARGIN_TAU="$MTAU" "$PY" -m vllm.entrypoints.openai.api_server --model "$model" --port "$PORT" \
       --poc-decode --gpu-memory-utilization "$GMU" --max-model-len "$mml" --tensor-parallel-size "$TP" --trust-remote-code \
-      $EXTRA $(prof_args "$prof") ) > "$lg" 2>&1 &
+      $vart $EXTRA $(prof_args "$prof") ) > "$lg" 2>&1 &
   SRV_PID=$!
   for i in $(seq 1 100); do
     s=$(curl -s "$URL/v1/models" 2>/dev/null | "$PY" -c "import sys,json;print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null || true)
@@ -111,9 +115,9 @@ json.dump(d,open(f,"w"),indent=2)
 P
 }
 op_perf(){ [ "$PERFON" = 0 ] && return 0; local p="$1"; echo "[perf] $p"
-  "$PY" "$POC/perfomance_nonces.py" --mode both --model "$HONEST" --profile "$p" --url "$URL" \
+  "$PY" "$POC/perfomance_nonces.py" --mode poc --model "$HONEST" --profile "$p" --url "$URL" \
      --seq-len "$SEQ" --max-tokens "$MT" --duration 20 --save "$OUT/perf_$p.json" || echo "  perf $p FAILED"
-  stamp "$OUT/perf_$p.poc.json" "$p"; stamp "$OUT/perf_$p.chat.json" "$p"; }
+  stamp "$OUT/perf_$p.poc.json" "$p"; }
 op_gen(){ local model="$1" p="$2" tag="$3"; echo "[gen $tag] $p"
   "$PY" "$POC/collect.py" --mode generate --model "$model" --profile "$p" --url "$URL" \
      --nonces "$NONCES" --max-tokens "$MT" --seq-len "$SEQ" --save "$OUT/gen_${tag}_$p.json" || echo "  gen $tag $p FAILED"
@@ -192,7 +196,7 @@ sanitize_evidence(){ local d="$1"
 }
 sanitize_evidence "$OUT"
 # --- render: SINGLE report = the simplified (ideal) layout (the only report we keep) ---
-POC_SCOPE_COMMIT="$SCOPE_COMMIT" "$PY" "$HERE/simplify_report.py" "$OUT" --out "$OUT/report.html" || echo "render FAILED"
+POC_MARGIN_TAU="$MTAU" POC_SCOPE_COMMIT="$SCOPE_COMMIT" "$PY" "$HERE/simplify_report.py" "$OUT" --out "$OUT/report.html" || echo "render FAILED"
 # --- S3 archive (opt-in; separate approved step otherwise) ---
 if [ "$PUSH" = 1 ]; then "$PY" "$HERE/inject_s3.py" "$OUT/report.html" "$SESS"; bash "$HERE/s3.sh" push-report "$OUT" "$SESS"; fi
 echo "=== DONE: $OUT/report.html ==="

@@ -46,6 +46,29 @@ GSM_TOL = a.gsm_tol
 L = lambda f: json.load(open(f))
 def res(d): r = d.get("results", d); return r[0] if isinstance(r, list) and r else r
 
+# --- derived-threshold calibration (mirrors benchmarks/poc/vector_separation.py) ---
+# From the per-nonce honest vs fraud distributions, compute a threshold-free separability
+# (AUC), the sample size to separate (K), and a recommended operating threshold at a target
+# FPR. Nothing hardcoded — the report OUTPUTS these per model. Pure python.
+def _mean(a): return sum(a) / len(a) if a else 0.0
+def _std(a):
+    if len(a) < 2: return 0.0
+    m = _mean(a); return (sum((x - m) ** 2 for x in a) / (len(a) - 1)) ** 0.5
+def _auc(hon, fr):   # P(a fraud nonce scores higher than a honest one); 1.0 = perfectly separable
+    if not hon or not fr: return None
+    wins = sum((1.0 if f > h else 0.5 if f == h else 0.0) for h in hon for f in fr)
+    return wins / (len(hon) * len(fr))
+def _k_sep(hon, fr, z=3.719 + 1.645):   # nonces for FPR 1e-4 / power 95% (gaussian)
+    if not hon or not fr: return None
+    mh, mf = _mean(hon), _mean(fr); sh, sf = _std(hon), _std(fr)
+    if mf <= mh: return None
+    return max(1, math.ceil((z * ((sh ** 2 + sf ** 2) / 2) ** 0.5 / (mf - mh)) ** 2))
+def _thr_at_fpr(hon, fr, z=3.719):   # recommended threshold = honest_mean + z*std (FPR 1e-4); + power
+    if not hon: return None, None
+    t = _mean(hon) + z * _std(hon)
+    power = (sum(1 for f in fr if f > t) / len(fr)) if fr else None
+    return t, power
+
 # ---- provenance: title = the HONEST/validator model (prefer val_/gen_honest_ over fraud) ----
 meta = {}
 for f in (sorted(glob.glob(f"{D}/val_*.json")) + sorted(glob.glob(f"{D}/gen_honest_*.json"))
@@ -78,25 +101,21 @@ def _tps(tag):   # pure inference (chat) throughput: tokens/s
     except Exception: return None
 
 cards = []
-# ---- Experiment 1: Performance — cudagraph is genuinely engaged for PoC (same 32-batch, cg vs eager,
-#      shown for BOTH pure inference and decode-PoC; PoC gets a real cudagraph speedup like normal decode) ----
+# ---- Performance (decode-PoC ONLY; rendered LAST, after separation) ----
+#      cudagraph vs eager on the PoC decode path — no pure-inference row.
 poc_cg, poc_eg = _sps("cg-flashattn"), _sps("eager-flashattn")
-inf_cg, inf_eg = _tps("cg-flashattn"), _tps("eager-flashattn")
+perf_card = ""
 if poc_cg and poc_eg:
     poc_sp = poc_cg / poc_eg
-    rows = ""
-    if inf_cg and inf_eg:
-        rows += (f"<tr><td>pure inference (chat)</td><td class=num>{inf_eg:.0f} tok/s</td>"
-                 f"<td class=num>{inf_cg:.0f} tok/s</td><td class=num>{inf_cg/inf_eg:.2f}×</td></tr>")
-    rows += (f"<tr class=hi><td><b>decode-PoC</b></td><td class=num>{poc_eg:.0f} steps/s</td>"
-             f"<td class=num>{poc_cg:.0f} steps/s</td><td class=num>{poc_sp:.2f}×</td></tr>")
-    cards.append(f"""<div class=card><div class=exp>Experiment 1</div>
- <h2>Performance — is cudagraph actually engaged for PoC?</h2>
- <p class=lead>Same 32-wide batch, <b>cudagraph vs eager</b>, measured for two workloads on the same server: <b>pure inference</b> (normal decode) and <b>decode-PoC</b>. Both get a real cudagraph speedup — so the PoC decode path is genuinely captured by cudagraph, not silently falling back to eager.</p>
+    rows = (f"<tr class=hi><td><b>decode-PoC</b></td><td class=num>{poc_eg:.0f} steps/s</td>"
+            f"<td class=num>{poc_cg:.0f} steps/s</td><td class=num>{poc_sp:.2f}×</td></tr>")
+    perf_card = f"""<div class=card><div class=exp>Experiment 4</div>
+ <h2>Performance — is cudagraph engaged for decode-PoC?</h2>
+ <p class=lead>Same 32-wide batch, <b>cudagraph vs eager</b>, on the <b>decode-PoC</b> workload. A real cudagraph speedup confirms the PoC decode path is genuinely captured by cudagraph, not silently falling back to eager.</p>
  <table><tr><th>workload</th><th class=num>eager</th><th class=num>cudagraph</th><th class=num>cudagraph speedup</th></tr>{rows}</table>
- <p class=verdict><span class=lbl>VERDICT</span> cudagraph speeds up decode-PoC by <b>{poc_sp:.2f}×</b> — the same mechanism that accelerates pure inference — confirming it is effectively engaged for PoC decode.</p></div>""")
+ <p class=verdict><span class=lbl>VERDICT</span> cudagraph speeds up decode-PoC by <b>{poc_sp:.2f}×</b> — confirming it is effectively engaged for PoC decode.</p></div>"""
 
-# ---- Experiment 2: Separation ----
+# ---- Experiment 1: Separation ----
 _short = lambda g: (g or "?").split(",")[0].replace("NVIDIA ", "").strip()   # GPU short name
 LABELS = {"gen_honest_cg-flashattn": "honest producer · same config as validator (floor)",
           "gen_honest_cg-flashinfer": "honest producer · FlashInfer backend",
@@ -120,7 +139,9 @@ for f in sorted(glob.glob(f"{D}/val_*.json")):
     prof = key.replace("gen_honest_", "").replace("gen_fraud_", "")
     if is_xhw:
         lab = f"{lab} · xHW⇐{pgpu}"; prof = f"{prof} · xHW ({pgpu}⇐{vgpu})"
-    vals.append((lab, r.get("rate", 0)*100, honest, r.get("per_nonce", []), prof))
+    vsc = (r.get("vector_score") or {}).get("mean_dist")   # continuous channel (None if not emitted)
+    vpn = (r.get("vector_score") or {}).get("per_nonce", [])   # per-nonce vector distances (for calibration)
+    vals.append((lab, r.get("rate", 0)*100, honest, r.get("per_nonce", []), prof, vsc, vpn))
 if vals:
     hon = [v for v in vals if v[2]]; fr = [v for v in vals if not v[2]]
     hmax = max((v[1] for v in hon), default=0); fmin = min((v[1] for v in fr), default=0)
@@ -130,7 +151,8 @@ if vals:
     v_eng, v_bk = _cfg(meta.get("profile", "cg-flashattn"))    # validator config — READ from the artifact meta
     validator_cfg = f"{v_eng} · {v_bk}"
     rows = ""
-    for lab, rate, honest, _pn, _pr in vals:
+    any_vec = any(v[5] is not None for v in vals)             # vector channel present?
+    for lab, rate, honest, _pn, _pr, vsc, _vpn in vals:
         cls = "good-t" if honest else "bad-t"
         ok = (rate < P_MISMATCH) if honest else (rate > P_MISMATCH)   # production acceptance at p_mismatch
         vd = ("honest ✓" if ok else "honest ✗ false-pos") if honest else ("fraud ✓" if ok else "fraud ✗ MISSED")
@@ -149,22 +171,52 @@ if vals:
         if "xHW" in _pr: diffs.append("cross-HW")
         base = "honest" if honest else "fraud"
         what = (f"{base} · " + " · ".join(diffs)) if diffs else (f"{base} · floor (same config)" if honest else f"{base} detection")
+        vstr = (f"{vsc:.1e}" if vsc is not None else "—")
         rows += (f"<tr{hi}><td>{prod}{note}</td><td>{validator_cfg}</td><td class={cls}>{what}</td>"
-                 f"<td class=num>{rate:.2f}%</td><td class={vdcls}>{vd}</td></tr>")
+                 f"<td class=num>{rate:.2f}%</td><td class=num>{vstr}</td><td class={vdcls}>{vd}</td></tr>")
     # acceptance = the PRODUCTION fixed threshold p_mismatch (all honest below it, all fraud above it).
     passed = (not hon or hmax < P_MISMATCH) and (not fr or fmin > P_MISMATCH)
     _adapt = f" · adaptive gap √(honest_max·fraud_min) ≈ {thr:.2f}%" if thr else ""
     vtxt = (f"At production <b>p_mismatch = {P_MISMATCH:.1f}%</b>: honest ≤ <b>{hmax:.2f}%</b>, fraud ≥ <b>{fmin:.2f}%</b> — every honest pair below and every fraud pair above → fraud caught.{_adapt}" if passed
             else f"At production <b>p_mismatch = {P_MISMATCH:.1f}%</b>: honest ≤ {hmax:.2f}%, fraud ≥ {fmin:.2f}% — a pair crosses the line (honest &gt; p_mismatch → false-positive, or fraud &lt; p_mismatch → MISSED).{_adapt}")
-    cards.append(f"""<div class=card><div class=exp>Experiment 2</div>
+    mtau = meta.get("margin_tau") or float(os.environ.get("POC_MARGIN_TAU", "0") or 0)
+    gate_note = (f" The discrete rate is <b>margin-gated at τ={mtau:g}</b>." if mtau else "")
+    vec_note = (" A second, continuous <b>vector distance</b> (cosine distance on the pre-snap vectors) rides"
+                " alongside as <b>evidence</b> — the verdict stays on the discrete rate." if any_vec else "")
+    vec_th = "<th class=num>vector dist</th>"
+    # ---- Calibration (DERIVED from this run — no hardcoded threshold): per-channel AUC / K /
+    #      recommended operating threshold @ target FPR, from the pooled per-nonce distributions ----
+    _pn_k = lambda v: [e["n_sphere_mismatches"] / max(e.get("n_steps", 1), 1) * 100 for e in (v[3] or [])]
+    hon_k = [x for v in vals if v[2] for x in _pn_k(v)];  fr_k = [x for v in vals if not v[2] for x in _pn_k(v)]
+    hon_v = [e["mean_dist"] for v in vals if v[2] for e in (v[6] or [])]
+    fr_v  = [e["mean_dist"] for v in vals if not v[2] for e in (v[6] or [])]
+    crows = ""
+    for name, hp, fp, fmt in [("vector distance (primary)", hon_v, fr_v, lambda x: f"{x:.2e}"),
+                              ("discrete k-rate (anchor)", hon_k, fr_k, (lambda x: f"{x:.2f}%"))]:
+        if not hp or not fp: continue
+        auc = _auc(hp, fp); K = _k_sep(hp, fp); t, power = _thr_at_fpr(hp, fp)
+        crows += (f"<tr><td>{name}</td><td class=num>{fmt(t) if t is not None else '—'}</td>"
+                  f"<td class=num>{(f'{auc:.3f}' if auc is not None else '—')}</td>"
+                  f"<td class=num>{(f'{power*100:.0f}%' if power is not None else '—')}</td>"
+                  f"<td class=num>{K if K else '∞'}</td>"
+                  f"<td class=num>{fmt(max(hp))} / {fmt(min(fp))}</td></tr>")
+    calib = ("" if not crows else
+             "<p class=lead style='margin-top:1.2rem'><b>Calibration — derived from this run, nothing hardcoded.</b> "
+             "Recommended operating threshold at target <b>FPR 1e-4</b> (honest wrongly flagged ≤ 1e-4), with "
+             "<b>AUC</b> (separability), <b>power</b> at that threshold (fraud caught), and <b>K</b> = nonces to separate "
+             "at FPR 1e-4 / power 95%. The <b>vector distance</b> is the primary operating point; discrete k is the anchor.</p>"
+             "<table><tr><th>channel</th><th class=num>recommended threshold</th><th class=num>AUC</th>"
+             f"<th class=num>power@thr</th><th class=num>K</th><th class=num>honest-max / fraud-min</th></tr>{crows}</table>")
+    cards.append(f"""<div class=card><div class=exp>Experiment 1</div>
  <h2>Separation — honest vs fraud (anti-cheat)</h2>
- <p class=lead>A <b>producer</b> generates a trajectory; the <b>validator</b> (the honest model) re-runs it teacher-forced and counts mismatches. An <span class=good-t>honest producer</span> (real model) matches the validator → low %; a <span class=bad-t>fraud producer</span> (cheaper model) diverges → high %.</p>
- <div class=flow><span class=box>producer (honest or fraud)</span><span class=arr>→</span><span class=box>sphere_k trajectory</span><span class=arr>→</span><span class="box alt">honest validator re-runs</span><span class=arr>→</span><span class=box>mismatch rate</span><span class=cap>honest producer → low · fraud producer → high</span></div>
- <table><tr><th>producer config — what we validate</th><th>validator config — what validates</th><th>what it tests</th><th class=num>mismatch rate</th><th>verdict</th></tr>{rows}</table>
+ <p class=lead>A <b>producer</b> generates a trajectory; the <b>validator</b> (the honest model) re-runs it teacher-forced and counts mismatches. An <span class=good-t>honest producer</span> (real model) matches the validator → low %; a <span class=bad-t>fraud producer</span> (cheaper model) diverges → high %.{gate_note}{vec_note}</p>
+ <div class=flow><span class=box>producer (honest or fraud)</span><span class=arr>→</span><span class=box>sphere_k trajectory</span><span class=arr>→</span><span class="box alt">honest validator re-runs</span><span class=arr>→</span><span class=box>mismatch rate + vector dist</span><span class=cap>honest producer → low · fraud producer → high</span></div>
+ <table><tr><th>producer config — what we validate</th><th>validator config — what validates</th><th>what it tests</th><th class=num>mismatch rate</th>{vec_th}<th>verdict</th></tr>{rows}</table>
+ {calib}
  <p class=verdict><span class=lbl>VERDICT — {'PASS' if passed else 'REVIEW'}</span> {vtxt}</p></div>""")
 
     # ---- Experiment 2 (detail): per-nonce HONEST vs FRAUD overlaid, one chart per prover config ----
-    rows_pn = [(lab, rate, honest, pn, prof) for (lab, rate, honest, pn, prof) in vals if pn]
+    rows_pn = [(lab, rate, honest, pn, prof) for (lab, rate, honest, pn, prof, _vs, _vp) in vals if pn]
     if rows_pn:
         nst = max((e.get("n_steps", 257) for (_, _, _, pn, _) in rows_pn for e in pn), default=257)
         n_nonce = len(rows_pn[0][3])
@@ -225,7 +277,7 @@ if vals:
         setup_rows = "".join(_setup(prof, honest, rate) for (_l, rate, honest, pn, prof) in rows_pn)
         setup_tbl = (f'<table><tr><th>role · producer</th><th>engine (graph or not)</th><th>attention backend</th>'
                      f'<th class=num>mismatch rate</th></tr>{vrow}{setup_rows}</table>')
-        cards.append(f"""<div class=card><div class=exp>Experiment 2 — detail</div>
+        cards.append(f"""<div class=card><div class=exp>Experiment 1 — detail</div>
  <h2>Per-nonce separation — honest producer vs fraud producer</h2>
  <p class=lead>The one <b>validator</b> is fixed at <b>{validator_cfg}</b> and re-checks every producer run below — each producer varies its engine (graph or not) and/or backend. The two chart rows then plot each nonce's <b>mismatch rate</b> (%) on a shared scale: <span class=good-t><b>honest producer</b></span> stays in the green zone (below threshold), <span class=bad-t><b>fraud producer</b></span> in the red zone (above).</p>
  {setup_tbl}
@@ -238,7 +290,7 @@ def gsm(s):
 on, off = gsm("on"), gsm("off")
 if on is not None and off is not None:
     same = abs(on-off) <= GSM_TOL      # tolerance (default ~2.5pt = sampling noise on 100 q); --gsm-tol
-    cards.append(f"""<div class=card><div class=exp>Experiment 3</div>
+    cards.append(f"""<div class=card><div class=exp>Experiment 2</div>
  <h2>Co-existence — GSM8K under PoC load</h2>
  <p class=lead>GSM8K accuracy <b>with</b> a concurrent PoC load vs <b>without</b>.</p>
  <div class=flow><span class=box>GSM8K</span><span class=arr>+</span><span class="box alt">concurrent PoC</span><span class=arr>→</span><span class="box good">accuracy unchanged?</span></div>
@@ -275,7 +327,7 @@ if hon_k:
     leg = (f'<span><span style="display:inline-block;width:12px;height:12px;background:#2563eb"></span> honest (N={nh:,})</span>'
            + (f' &nbsp; <span><span style="display:inline-block;width:12px;height:12px;background:#dc2626;opacity:.75"></span> fraud (N={nf:,})</span>' if fra_k else '')
            + ' &nbsp; <span style="color:#16a34a">– – ideal 6.25%</span>')
-    cards.append(f"""<div class=card><div class=exp>Experiment 4</div>
+    cards.append(f"""<div class=card><div class=exp>Experiment 3</div>
  <h2>k-distribution — codebook coverage</h2>
  <p class=lead>How often each of the 16 sphere codebook points is hit across all nonces × steps. Near-uniform = high-entropy fingerprint (full codebook live). Honest &amp; fraud both cover all 16 — fraud is caught by <b>which step lands where</b> (the chained trajectory), not by codebook coverage.</p>
  <div style="margin:.4rem 0">{leg}</div>
@@ -286,7 +338,7 @@ html = f"""<!doctype html><meta charset=utf-8><title>Decode-PoC report — {mode
 <style>{_IDEAL_CSS}</style><div class=wrap>
 <h1>Decode-PoC validation &nbsp;<span class=chip>{chip}</span></h1>
 <p class=sub>{sub}</p>
-{''.join(cards)}
+{''.join(cards)}{perf_card}
 <p style="text-align:center;color:#94a3b8;font-size:.9rem">rate = Σ sphere_k mismatches / (nonces × (max_tokens+1)) · raw data in {os.path.basename(D)}</p>
 <p style="text-align:center;color:#cbd5e1;font-size:.78rem;font-variant-numeric:tabular-nums">provenance — {prov}</p>
 </div>"""

@@ -53,6 +53,8 @@ bash run_scope.sh <honest> <fraud> --mla --tp 8 --gpu-mem 0.95 --extra "--enable
 | `--gpu-mem G` | GPU memory utilization per server (default 0.90) |
 | `--mla` | MLA architecture — collapses the FlashAttn/FlashInfer axis to one `cudagraph` config |
 | `--no-fi` | drop the FlashInfer backend axis |
+| `--margin-tau T` | validator margin gate: count a k-mismatch only when the snap margin ≥ T (default 0 = off); per-model/HW, calibrate with `scope/calibrate_tau.sh` |
+| `--no-vec` | disable the continuous vector-channel artifacts (`--poc-vector-artifacts`, on by default) |
 | `--nonces N` / `--seq-len S` / `--max-tokens M` | PoC trajectory shape (defaults 128 / 256 / 256) |
 | `--no-perf` | skip performance benchmarking |
 | `--no-gsm` | skip the co-existence (GSM8K) experiment |
@@ -61,6 +63,29 @@ bash run_scope.sh <honest> <fraud> --mla --tp 8 --gpu-mem 0.95 --extra "--enable
 | `--push` | upload the session to the public-read S3 bucket (needs `SUPABASE_SECRET`); omit to render locally |
 | `--xhw <peer[,peer2]>` | cross-HW: also validate the peer session(s)' (local `reports/<name>` or S3 name) trajectories with this box's validator |
 | `--xhw-only` | skip local generation; only run the `--xhw` cross-validation (for a parallel 2-box verify) |
+
+### Calibrating the margin gate (`--margin-tau`)
+
+The margin gate is a **validator-side** filter: it counts a decode k-mismatch only when the
+validator's own snap margin (top-1 − top-2 cosine gap) ≥ τ, so near-boundary flips from
+fp/backend jitter don't read as fraud. τ=0 (default) is a no-op. The right τ is **per model +
+per GPU** and can't be swept from a finished report (a run is already gated at one τ) — so you
+calibrate it **once, up front** with the standalone tool, then feed it to the report:
+
+```bash
+# quick sample: boots fraud + honest refs, then bisects τ to find the smallest value
+# where honest cross-backend ≤ target while fraud stays high
+bash benchmarks/poc/scope/calibrate_tau.sh <honest-model> <fraud-model> \
+  --nonces 12 --max-tokens 24 --tau-lo 0.002 --tau-hi 0.06 --honest-target 5
+# -> prints RECOMMENDED τ; writes recommended_tau.json + tau_chart.html under calib_tau/
+
+bash run_scope.sh <honest> <fraud> --margin-tau <recommended-τ>
+```
+
+It runs an adaptive **log-space bisection** over `[--tau-lo, --tau-hi]` (no fixed grid, so the
+same tool works across models whose optimal τ differ by an order of magnitude). Needs a free
+GPU — it refuses to run if another process holds the card. τ leaves the artifacts untouched; it
+only changes how the validator scores them, so it stays optional.
 
 ## 3. What it produces
 

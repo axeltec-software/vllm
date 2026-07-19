@@ -109,6 +109,38 @@ def test_gsm_tolerance_configurable(tmp_path):
     assert "differs" in _render(str(tmp_path), ["--gsm-tol", "0.005"])  # 0.5pt tol flags the 1pt delta
 
 
+def test_calibration_block_derived(tmp_path):
+    """The report OUTPUTS derived thresholds — AUC + recommended threshold + K from the
+    per-nonce honest/fraud distributions (vector distance primary, discrete k anchor).
+    Nothing hardcoded: the numbers come from the data."""
+    d = os.path.join(str(tmp_path), "sess"); os.makedirs(d, exist_ok=True)
+
+    def vv(honest, rate, kc, vd):
+        return {"meta": {"gpu": VAL_GPU, "validator_model": "M", "vllm_commit": "x",
+                         "codebook_hash": "d" * 64, "block_hash": "c" * 64,
+                         "nonces": list(range(len(kc))), "seq_len": 64, "max_tokens": 64},
+                "results": {"rate": rate, "honest": honest, "prover_gpu": VAL_GPU,
+                            "per_nonce": [{"nonce": i, "n_sphere_mismatches": c, "n_steps": 65}
+                                          for i, c in enumerate(kc)],
+                            "vector_score": {"mean_dist": sum(vd) / len(vd),
+                                             "per_nonce": [{"nonce": i, "mean_dist": x}
+                                                           for i, x in enumerate(vd)]}}}
+    # honest vector dists ~3e-4, fraud ~5e-3 -> cleanly separable (AUC 1.000)
+    json.dump(vv(True, 0.01, [0, 1, 0, 1, 0, 1], [3e-4, 4e-4, 3e-4, 5e-4, 3e-4, 4e-4]),
+              open(os.path.join(d, "val_cg-flashattn__gen_honest_cg-flashattn.json"), "w"))
+    json.dump(vv(False, 0.30, [40, 42, 41, 43, 40, 44], [5e-3, 6e-3, 5e-3, 7e-3, 5e-3, 6e-3]),
+              open(os.path.join(d, "val_cg-flashattn__gen_fraud_cg-flashattn.json"), "w"))
+    out = os.path.join(d, "r.html")
+    subprocess.run([sys.executable, SIMPLIFY, d, "--out", out], check=True,
+                   env={**os.environ, "POC_SCOPE_COMMIT": "t"})
+    html = open(out, encoding="utf-8").read()
+    assert "Calibration — derived" in html            # the derived-threshold block is present
+    assert "vector distance (primary)" in html         # vector channel calibrated
+    assert "discrete k-rate (anchor)" in html          # k anchor calibrated
+    assert "AUC" in html
+    assert "1.000" in html                             # clean separation -> AUC 1.000
+
+
 if __name__ == "__main__":  # allow plain `python test_simplify_report.py`
     import tempfile
     with tempfile.TemporaryDirectory() as t:
