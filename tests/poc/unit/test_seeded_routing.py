@@ -35,25 +35,29 @@ def test_seed_varies_selection_per_layer():
 
 
 def test_router_wrapper_applies_to_poc_rows_only():
-    """The mask is what makes it PoC-only: True rows get the forced (seeded) logits,
-    False (chat) rows pass through the real router UNCHANGED."""
-    n_exp = 16
-    natural = torch.full((3, n_exp), 0.0)
+    """The mask is what makes it PoC-only: True rows get the in-graph seeded
+    (Fisher-Yates) logits the wrapper computes from (route_base, route_step); False
+    (chat) rows pass through the real router UNCHANGED. Also pins the invariant that
+    makes the graph-move safe: the wrapper's in-forward compute is BYTE-IDENTICAL to
+    a direct eager expert_logits_from_base call (so artifacts don't move eager<->graph)."""
+    n_exp, top_k = 16, 4
+    natural = torch.full((3, n_exp), 0.0, device=DEV)
     natural[:, 7] = 9.0                            # chat's real router would pick expert 7
 
     class FakeGate(nn.Module):
         def forward(self, x):
             return natural.clone(), None           # (logits, bias)
 
-    force = torch.full((3, n_exp), -1.0e4)         # PER-ROW seeded logits buffer [B, n_experts]
-    force[:, 3] = 5.0                               # seeded expert = 3 for every PoC row
-    mask = torch.tensor([True, False, True])       # rows 0,2 = PoC ; row 1 = chat
-    w = PoCRouterWrapper(FakeGate(), force, mask)
+    route_base = torch.tensor([111, 222, 333], dtype=torch.int64, device=DEV)  # per-row seed
+    route_step = torch.tensor([1, 1, 1], dtype=torch.int64, device=DEV)        # shared decode step
+    mask = torch.tensor([True, False, True], device=DEV)   # rows 0,2 = PoC ; row 1 = chat
+    w = PoCRouterWrapper(FakeGate(), route_base, route_step, n_exp, top_k, mask)
 
-    logits, bias = w(torch.randn(3, 8))
+    logits, bias = w(torch.randn(3, 8, device=DEV))
     assert bias is None
-    assert int(torch.argmax(logits[0])) == 3       # PoC row -> seeded expert 3
-    assert int(torch.argmax(logits[2])) == 3       # PoC row -> seeded expert 3
+    expected = expert_logits_from_base(route_base, route_step, n_exp, top_k, DEV)
+    assert torch.equal(logits[0], expected[0].to(logits.dtype))   # PoC row == eager compute
+    assert torch.equal(logits[2], expected[2].to(logits.dtype))   # PoC row == eager compute
     assert torch.equal(logits[1], natural[1])      # CHAT row untouched (still expert 7)
 
 

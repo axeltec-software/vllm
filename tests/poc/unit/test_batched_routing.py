@@ -1,6 +1,8 @@
-"""Batching seeded routing across layers (native.py set_routing) must be BYTE-IDENTICAL
-to the per-layer loop it replaces — murmur/topk/scatter are per-row independent, so
-stacking layers into the batch dim changes only the launch count, never the values."""
+"""expert_logits_from_base is per-ROW independent: murmur/Fisher-Yates/scatter touch
+each row alone, so stacking many layers' seeds into one batch is BYTE-IDENTICAL to a
+per-layer loop. This is the invariant the in-graph router move relies on — each MoE
+layer's PoCRouterWrapper computes its own rows in-forward, yet every row matches what a
+single fused call would produce (no topk, so no cross-row tie coupling)."""
 import pytest
 import torch
 

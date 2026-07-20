@@ -125,14 +125,26 @@ class PoCRouterWrapper(nn.Module):
     router logits with deterministic, hidden-INDEPENDENT seeded logits, so MoE
     expert selection (and gate weights) no longer read the noise-prone hidden ->
     removes the routing nondeterminism that drives the decode-PoC honest floor.
-    Chat rows (mask False) keep their natural logits untouched. ``force`` is this
-    layer's seeded logits buffer ([n_experts], updated per block_hash in place);
-    ``mask`` is the shared per-row PoC mask. Static-shape -> cudagraph-safe."""
+    Chat rows (mask False) keep their natural logits untouched.
 
-    def __init__(self, inner: nn.Module, force: torch.Tensor, mask: torch.Tensor):
+    The seeded logits are computed HERE, INSIDE the forward — i.e. INSIDE the
+    captured cudagraph — from this layer's cached seed base ([max_tokens] int64)
+    and the shared per-row decode ``step`` buffer. Both are address-stable and
+    updated in place by ``set_routing`` (the graph reads live values), so per step
+    the eager path only bumps a tiny [B] step scalar; the Fisher-Yates selection
+    (pure integer, no topk/scores/ties -> bit-identical eager==graph) rides in the
+    graph instead of stalling the decode pipeline as an eager tail. Static shape ->
+    cudagraph-safe."""
+
+    def __init__(self, inner: nn.Module, route_base: torch.Tensor,
+                 route_step: torch.Tensor, n_experts: int, top_k: int,
+                 mask: torch.Tensor):
         super().__init__()
         self.inner = inner
-        self.register_buffer("poc_force", force, persistent=False)  # [n_experts]
+        self.n_experts = n_experts
+        self.top_k = top_k
+        self.register_buffer("poc_route_base", route_base, persistent=False)  # [max_tokens] int64
+        self.register_buffer("poc_route_step", route_step, persistent=False)  # [max_tokens] int64 (shared)
         self.register_buffer("poc_mask", mask, persistent=False)
 
     def __getattr__(self, name: str):
@@ -149,7 +161,9 @@ class PoCRouterWrapper(nn.Module):
         logits = out[0] if isinstance(out, tuple) else out
         n = logits.shape[0]
         m = self.poc_mask[:n].unsqueeze(-1)
-        forced = self.poc_force[:n].to(logits.dtype)        # per-row [n, n_experts]
+        forced = expert_logits_from_base(                   # in-graph seeded selection
+            self.poc_route_base[:n], self.poc_route_step[:n],
+            self.n_experts, self.top_k, logits.device).to(logits.dtype)
         logits = torch.where(m, forced, logits)
         return (logits, *out[1:]) if isinstance(out, tuple) else logits
 
@@ -183,10 +197,11 @@ class PoCNativeState:
         self._hash_cache: dict[tuple, list] = {}
         self._last_refl_key: tuple | None = None    # skip redundant per-step rescatter
         # seeded-routing (MANDATORY for MoE; filled by attach_native_poc): per-MoE-layer
-        # PER-ROW forced router-logits buffer [max_tokens, n_experts] + (n_experts,
-        # top_k). Static shape -> cudagraph-safe; refreshed IN PLACE each step from
-        # route_seed(block_hash,nonce,step,layer) (the graph only reads it).
-        self.router_force: list = []                # per-layer [max_tokens, n_experts]
+        # cached seed base [max_tokens] int64 (block_hash,nonce,layer, hashed once per
+        # mapping) + a SHARED per-row decode-step buffer. The forced-logit selection
+        # itself runs in-graph inside PoCRouterWrapper.forward; per step set_routing
+        # only writes the step buffer (the graph reads base+step live). Static shape.
+        self.route_step = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.router_meta: list = []                 # [(n_experts, top_k), ...]
         self._route_base: list = []                 # per-layer [max_tokens] int64 sha256 base (cached)
         self._base_key: tuple | None = None         # (hashes,nonces) the base was built for
@@ -274,7 +289,7 @@ class PoCNativeState:
         So per step there is NO host string-hashing, NO device->host sync, and the
         captured graph (which only READS the buffer) needs no recapture. Rows with
         block_hash None get base 0 (masked out anyway)."""
-        if not self.router_force:
+        if not self._route_base:
             return
         base_key = (tuple(row_hashes), tuple(row_nonces))
         if base_key != self._base_key:                       # rebuild cached base (host, ONCE/mapping)
@@ -288,21 +303,11 @@ class PoCNativeState:
         if key == self._last_route_key:                      # nothing changed -> skip
             return
         b = len(row_steps)
-        # sync-free host->device (MoE seeded routing runs this every step) — a direct
-        # torch.tensor(list, device=cuda) blocks on the forward; see pinned_to_device.
-        steps_t = pinned_to_device(row_steps, torch.int64, self.device)  # tiny [B] upload
-        metas = self.router_meta
-        if metas and all(m == metas[0] for m in metas):
-            # homogeneous MoE: all layers in ONE batched call (per-row independent -> identical, L->1)
-            n, k = metas[0]; L = len(self.router_force)
-            base_all = torch.stack([rb[:b] for rb in self._route_base]).reshape(-1)   # [L*b]
-            forced = expert_logits_from_base(
-                base_all, steps_t.repeat(L), n, k, self.device).view(L, b, n)         # [L, b, n]
-            for i, buf in enumerate(self.router_force):
-                buf[:b].copy_(forced[i])
-        else:                                                # heterogeneous layers -> per-layer
-            for i, (buf, (n, k)) in enumerate(zip(self.router_force, self.router_meta)):
-                buf[:b].copy_(expert_logits_from_base(self._route_base[i][:b], steps_t, n, k, self.device))
+        # Per step, ONLY publish the decode step into the shared buffer (tiny [B]
+        # upload, sync-free; a direct torch.tensor(list, device=cuda) would block the
+        # forward — see pinned_to_device). The Fisher-Yates forced-logit selection
+        # runs in-graph in PoCRouterWrapper.forward, reading base+step live.
+        self.route_step[:b].copy_(pinned_to_device(row_steps, torch.int64, self.device))
         self._last_route_key = key
 
     def set_mask(self, row_mask: torch.Tensor | None) -> None:
@@ -344,15 +349,14 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
             continue
         n_exp = int(moe.experts.global_num_experts)
         top_k = int(moe.experts.top_k)
-        # PER-ROW static buffer [max_tokens, n_experts] -> cudagraph-safe, refreshed
-        # in place each step by set_routing (batched, one GPU call per layer).
-        force = torch.full((state.max_tokens, n_exp), -1.0e4,
-                           device=device, dtype=torch.float32)
-        state.router_force.append(force)
-        state._route_base.append(
-            torch.zeros(state.max_tokens, dtype=torch.int64, device=device))
+        # Address-stable per-layer seed base [max_tokens] -> the wrapper folds the
+        # shared route_step buffer into it and runs the Fisher-Yates selection
+        # in-graph (see PoCRouterWrapper). cudagraph-safe (static shape).
+        route_base = torch.zeros(state.max_tokens, dtype=torch.int64, device=device)
+        state._route_base.append(route_base)
         state.router_meta.append((n_exp, top_k))
-        moe.gate = PoCRouterWrapper(moe.gate, force, state.mask)
+        moe.gate = PoCRouterWrapper(moe.gate, route_base, state.route_step,
+                                    n_exp, top_k, state.mask)
 
     model._poc_native_state = state
     return state
