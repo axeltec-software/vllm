@@ -27,6 +27,10 @@ import sys
 
 import numpy as np
 
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import thresholds   # shared honest/fraud separation math (auc, recommended threshold)
+
 
 try:  # single source of truth for the wire codec when vllm is importable
     from vllm.poc.data import decode_vector as _decode_vector
@@ -74,12 +78,6 @@ def pair_dists(gen_file, val_file):
     return np.array(out), honest, rate
 
 
-def auc(honest, fraud):
-    wins = sum((1.0 if f > h else 0.5 if f == h else 0.0)
-               for h in honest for f in fraud)
-    return wins / (len(honest) * len(fraud))
-
-
 def k_to_separate(honest, fraud, z=3.719 + 1.645):
     """Nonces needed so a mean-of-K test separates at FPR 1e-4 / power 95%.
     z = Phi^-1(1 - 1e-4) + Phi^-1(0.95) = 3.719 + 1.645 (one-sided)."""
@@ -123,9 +121,10 @@ def main():
         h, f = np.concatenate(hon_all), np.concatenate(fr_all)
         gap = f.min() / h.max() if h.max() > 0 else math.inf
         print(f"\nhonest n={len(h)}  fraud n={len(f)}")
-        print(f"AUC={auc(h, f):.4f}   worst-honest={h.max():.2e}  "
+        print(f"AUC={thresholds.auc(h, f):.4f}   worst-honest={h.max():.2e}  "
               f"weakest-fraud={f.min():.2e}  gap={gap:.1f}x"
               f"{'  (NO overlap)' if gap > 1 else '  (OVERLAP)'}")
+        print(f"recommended threshold (same calc as the report) = {thresholds.recommend(list(h), list(f)):.2e}")
         print(f"K (nonces to separate @ FPR 1e-4 / power .95) = {k_to_separate(h, f)}")
 
 

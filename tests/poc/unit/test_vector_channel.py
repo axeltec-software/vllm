@@ -48,6 +48,25 @@ def test_identical_slices_score_zero_and_orthogonal_score_one():
     assert abs(score["max_nonce_dist"] - by[1]["mean_dist"]) < 1e-9
 
 
+def test_diverged_rate_is_a_percent_on_the_same_scale_as_k():
+    """Non-expert report signal: per-nonce n_diverged / n_steps (%), the SAME
+    0-100% scale as the k-mismatch rate. Honest (identical slices) -> 0% of steps
+    diverged; fraud (orthogonal slices, distance 1 >> tol) -> 100%."""
+    e0, e1 = [1, 0, 0, 0], [0, 1, 0, 0]
+    computed = [{"nonce": 0, "sph_values_steps": _steps(e0, e0, e0)},   # honest
+                {"nonce": 1, "sph_values_steps": _steps(e0, e0, e0)}]   # fraud
+    ref = {0: _steps(e0, e0, e0),        # identical -> no step diverges
+           1: _steps(e1, e1, e1)}        # orthogonal -> every decode step diverges
+    score = score_vector_channel(computed, ref)
+    by = {e["nonce"]: e for e in score["per_nonce"]}
+    assert by[0]["n_steps"] == 3 and by[0]["n_diverged"] == 0          # honest 0/3
+    assert by[1]["n_steps"] == 3 and by[1]["n_diverged"] == 3          # fraud 3/3
+    assert by[0]["n_diverged"] / by[0]["n_steps"] * 100 == 0.0
+    assert by[1]["n_diverged"] / by[1]["n_steps"] * 100 == 100.0
+    assert abs(score["diverged_rate"] - 50.0) < 1e-9   # plain top-level summary
+    assert score["step_tol"] == 0.01
+
+
 def test_prefill_slice_is_excluded_from_the_score():
     e0, e1 = [1, 0, 0, 0], [0, 1, 0, 0]
     # trajectories whose PREFILL slices disagree maximally but decode steps agree

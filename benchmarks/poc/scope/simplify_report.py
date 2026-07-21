@@ -8,7 +8,9 @@ over the same role-tagged JSONs run_scope.sh writes.
 
   simplify_report.py <session-dir> [--out FILE]
 """
-import argparse, glob, json, math, os
+import argparse, glob, json, math, os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # benchmarks/poc
+import thresholds   # ONE artifact-derived acceptance-line calculator (k + vector)
 
 _IDEAL_CSS = """:root{--ink:#0f172a;--mut:#64748b;--line:#e2e8f0;--bg:#f1f5f9;--card:#fff;--blue:#2563eb;--green:#16a34a;--red:#dc2626}
 *{box-sizing:border-box}
@@ -45,29 +47,6 @@ P_MISMATCH = a.p_mismatch * 100.0   # percent, to match the mismatch-rate scale
 GSM_TOL = a.gsm_tol
 L = lambda f: json.load(open(f))
 def res(d): r = d.get("results", d); return r[0] if isinstance(r, list) and r else r
-
-# --- derived-threshold calibration (mirrors benchmarks/poc/vector_separation.py) ---
-# From the per-nonce honest vs fraud distributions, compute a threshold-free separability
-# (AUC), the sample size to separate (K), and a recommended operating threshold at a target
-# FPR. Nothing hardcoded — the report OUTPUTS these per model. Pure python.
-def _mean(a): return sum(a) / len(a) if a else 0.0
-def _std(a):
-    if len(a) < 2: return 0.0
-    m = _mean(a); return (sum((x - m) ** 2 for x in a) / (len(a) - 1)) ** 0.5
-def _auc(hon, fr):   # P(a fraud nonce scores higher than a honest one); 1.0 = perfectly separable
-    if not hon or not fr: return None
-    wins = sum((1.0 if f > h else 0.5 if f == h else 0.0) for h in hon for f in fr)
-    return wins / (len(hon) * len(fr))
-def _k_sep(hon, fr, z=3.719 + 1.645):   # nonces for FPR 1e-4 / power 95% (gaussian)
-    if not hon or not fr: return None
-    mh, mf = _mean(hon), _mean(fr); sh, sf = _std(hon), _std(fr)
-    if mf <= mh: return None
-    return max(1, math.ceil((z * ((sh ** 2 + sf ** 2) / 2) ** 0.5 / (mf - mh)) ** 2))
-def _thr_at_fpr(hon, fr, z=3.719):   # recommended threshold = honest_mean + z*std (FPR 1e-4); + power
-    if not hon: return None, None
-    t = _mean(hon) + z * _std(hon)
-    power = (sum(1 for f in fr if f > t) / len(fr)) if fr else None
-    return t, power
 
 # ---- provenance: title = the HONEST/validator model (prefer val_/gen_honest_ over fraud) ----
 meta = {}
@@ -147,13 +126,20 @@ for f in sorted(glob.glob(f"{D}/val_*.json")):
     prof = key.replace("gen_honest_", "").replace("gen_fraud_", "")
     if is_xhw:
         lab = f"{lab} · xHW⇐{pgpu}"; prof = f"{prof} · xHW ({pgpu}⇐{vgpu})"
-    vsc = (r.get("vector_score") or {}).get("mean_dist")   # continuous channel (None if not emitted)
-    vpn = (r.get("vector_score") or {}).get("per_nonce", [])   # per-nonce vector distances (for calibration)
+    vsc = (r.get("vector_score") or {}).get("mean_dist")       # absolute cosine distance (None if not emitted)
+    vpn = (r.get("vector_score") or {}).get("per_nonce", [])   # per-nonce vector detail (mean_dist per nonce)
     vals.append((lab, r.get("rate", 0)*100, honest, r.get("per_nonce", []), prof, vsc, vpn))
 if vals:
     hon = [v for v in vals if v[2]]; fr = [v for v in vals if not v[2]]
     hmax = max((v[1] for v in hon), default=0); fmin = min((v[1] for v in fr), default=0)
-    thr = math.sqrt(hmax*fmin) if (hmax and fmin) else None
+    # artifact-derived acceptance lines — ONE calculator for BOTH channels (thresholds.py),
+    # read off the finished per-config scores. NOT tau (that needs GPU re-validation).
+    hon_vd = [v[5] for v in vals if v[2] and v[5] is not None]
+    fr_vd = [v[5] for v in vals if not v[2] and v[5] is not None]
+    thr_k = thresholds.recommend([v[1] for v in hon], [v[1] for v in fr])   # discrete k line (%)
+    thr_v = thresholds.recommend(hon_vd, fr_vd)                             # vector line (distance)
+    kline = thr_k if thr_k is not None else P_MISMATCH                      # production line as fallback
+    thr = thr_k                                                            # alias used by the charts
     _cfg = lambda p: (("cudagraph" if str(p).split(" ")[0].startswith("cg") else "eager"),
                       ("FlashInfer" if "flashinfer" in str(p) else "FlashAttn"))
     v_eng, v_bk = _cfg(meta.get("profile", "cg-flashattn"))    # validator config — READ from the artifact meta
@@ -162,7 +148,7 @@ if vals:
     any_vec = any(v[5] is not None for v in vals)             # vector channel present?
     for lab, rate, honest, _pn, _pr, vsc, _vpn in vals:
         cls = "good-t" if honest else "bad-t"
-        ok = (rate < P_MISMATCH) if honest else (rate > P_MISMATCH)   # production acceptance at p_mismatch
+        ok = (rate < kline) if honest else (rate > kline)   # artifact-derived k line (thresholds.py)
         vd = ("honest ✓" if ok else "honest ✗ false-pos") if honest else ("fraud ✓" if ok else "fraud ✗ MISSED")
         vdcls = cls if ok else "bad-t"
         hi = " class=hi" if not honest else ""
@@ -182,67 +168,42 @@ if vals:
         vstr = (f"{vsc:.1e}" if vsc is not None else "—")
         rows += (f"<tr{hi}><td>{prod}{note}</td><td>{validator_cfg}</td><td class={cls}>{what}</td>"
                  f"<td class=num>{rate:.2f}%</td><td class=num>{vstr}</td><td class={vdcls}>{vd}</td></tr>")
-    # acceptance = the PRODUCTION fixed threshold p_mismatch (all honest below it, all fraud above it).
-    passed = (not hon or hmax < P_MISMATCH) and (not fr or fmin > P_MISMATCH)
-    _adapt = f" · adaptive gap √(honest_max·fraud_min) ≈ {thr:.2f}%" if thr else ""
-    vtxt = (f"At production <b>p_mismatch = {P_MISMATCH:.1f}%</b>: honest ≤ <b>{hmax:.2f}%</b>, fraud ≥ <b>{fmin:.2f}%</b> — every honest pair below and every fraud pair above → fraud caught.{_adapt}" if passed
-            else f"At production <b>p_mismatch = {P_MISMATCH:.1f}%</b>: honest ≤ {hmax:.2f}%, fraud ≥ {fmin:.2f}% — a pair crosses the line (honest &gt; p_mismatch → false-positive, or fraud &lt; p_mismatch → MISSED).{_adapt}")
-    mtau = meta.get("margin_tau") or float(os.environ.get("POC_MARGIN_TAU", "0") or 0)
-    gate_note = (f" The discrete rate is <b>margin-gated at τ={mtau:g}</b>." if mtau else "")
-    vec_note = (" A second, continuous <b>vector distance</b> (cosine distance on the pre-snap vectors) rides"
-                " alongside as <b>evidence</b> — the verdict stays on the discrete rate." if any_vec else "")
-    vec_th = "<th class=num>vector dist</th>"
-    # ---- Calibration (DERIVED from this run — no hardcoded threshold): per-channel AUC / K /
-    #      recommended operating threshold @ target FPR, from the pooled per-nonce distributions ----
-    _pn_k = lambda v: [e["n_sphere_mismatches"] / max(e.get("n_steps", 1), 1) * 100 for e in (v[3] or [])]
-    hon_k = [x for v in vals if v[2] for x in _pn_k(v)];  fr_k = [x for v in vals if not v[2] for x in _pn_k(v)]
-    hon_v = [e["mean_dist"] for v in vals if v[2] for e in (v[6] or [])]
-    fr_v  = [e["mean_dist"] for v in vals if not v[2] for e in (v[6] or [])]
-    crows = ""
-    for name, hp, fp, fmt in [("vector distance (primary)", hon_v, fr_v, lambda x: f"{x:.2e}"),
-                              ("discrete k-rate (anchor)", hon_k, fr_k, (lambda x: f"{x:.2f}%"))]:
-        if not hp or not fp: continue
-        auc = _auc(hp, fp); K = _k_sep(hp, fp); t, power = _thr_at_fpr(hp, fp)
-        crows += (f"<tr><td>{name}</td><td class=num>{fmt(t) if t is not None else '—'}</td>"
-                  f"<td class=num>{(f'{auc:.3f}' if auc is not None else '—')}</td>"
-                  f"<td class=num>{(f'{power*100:.0f}%' if power is not None else '—')}</td>"
-                  f"<td class=num>{K if K else '∞'}</td>"
-                  f"<td class=num>{fmt(max(hp))} / {fmt(min(fp))}</td></tr>")
-    calib = ("" if not crows else
-             "<p class=lead style='margin-top:1.2rem'><b>Calibration — derived from this run, nothing hardcoded.</b> "
-             "Recommended operating threshold at target <b>FPR 1e-4</b> (honest wrongly flagged ≤ 1e-4), with "
-             "<b>AUC</b> (separability), <b>power</b> at that threshold (fraud caught), and <b>K</b> = nonces to separate "
-             "at FPR 1e-4 / power 95%. The <b>vector distance</b> is the primary operating point; discrete k is the anchor.</p>"
-             "<table><tr><th>channel</th><th class=num>recommended threshold</th><th class=num>AUC</th>"
-             f"<th class=num>power@thr</th><th class=num>K</th><th class=num>honest-max / fraud-min</th></tr>{crows}</table>")
+    passed = (not hon or hmax < kline) and (not fr or fmin > kline)
+    vec_th = "<th class=num>vector: mean dist</th>"
+    thr_row = (f'<tr class=hi><td><b>acceptance line · from artifacts</b></td><td>—</td>'
+               f'<td>honest &lt; line · fraud &gt; line</td>'
+               f'<td class=num><b>{kline:.2f}%</b></td>'
+               f'<td class=num><b>{(f"{thr_v:.1e}" if thr_v is not None else "—")}</b></td><td>—</td></tr>')
     cards.append(f"""<div class=card><div class=exp>Experiment 1</div>
- <h2>Separation — honest vs fraud (anti-cheat)</h2>
- <p class=lead>A <b>producer</b> generates a trajectory; the <b>validator</b> (the honest model) re-runs it teacher-forced and counts mismatches. An <span class=good-t>honest producer</span> (real model) matches the validator → low %; a <span class=bad-t>fraud producer</span> (cheaper model) diverges → high %.{gate_note}{vec_note}</p>
- <div class=flow><span class=box>producer (honest or fraud)</span><span class=arr>→</span><span class=box>sphere_k trajectory</span><span class=arr>→</span><span class="box alt">honest validator re-runs</span><span class=arr>→</span><span class=box>mismatch rate + vector dist</span><span class=cap>honest producer → low · fraud producer → high</span></div>
- <table><tr><th>producer config — what we validate</th><th>validator config — what validates</th><th>what it tests</th><th class=num>mismatch rate</th>{vec_th}<th>verdict</th></tr>{rows}</table>
- {calib}
- <p class=verdict><span class=lbl>VERDICT — {'PASS' if passed else 'REVIEW'}</span> {vtxt}</p></div>""")
+ <h2>Separation — honest vs fraud</h2>
+ <table><tr><th>producer (validated)</th><th>validator</th><th>test</th><th class=num>k: % mismatched</th>{vec_th}<th>verdict</th></tr>{thr_row}{rows}</table>
+ <p class=verdict><span class=lbl>{'PASS' if passed else 'REVIEW'}</span> honest ≤ {hmax:.2f}% · fraud ≥ {fmin:.2f}% · line {kline:.2f}%</p></div>""")
 
-    # ---- Experiment 2 (detail): per-nonce HONEST vs FRAUD overlaid, one chart per prover config ----
-    rows_pn = [(lab, rate, honest, pn, prof) for (lab, rate, honest, pn, prof, _vs, _vp) in vals if pn]
-    if rows_pn:
-        nst = max((e.get("n_steps", 257) for (_, _, _, pn, _) in rows_pn for e in pn), default=257)
-        n_nonce = len(rows_pn[0][3])
-        # per-nonce charts in PERCENT (consistent with the rate labels + the calculated threshold),
-        # on ONE shared y-scale so every config is directly comparable.
-        _pct = lambda e: e["n_sphere_mismatches"] / max(e.get("n_steps", nst), 1) * 100.0
-        _allpct = [_pct(e) for (_, _, _, pn, _) in rows_pn for e in pn]
-        ytop = max((max(_allpct) * 1.1 if _allpct else 5.0), (thr * 1.4 if thr else 0.0), 5.0)
-        prof_name = {"cg-flashattn": "cudagraph·FlashAttn", "cg-flashinfer": "cudagraph·FlashInfer",
-                     "eager-flashattn": "eager·FlashAttn", "eager-flashinfer": "eager·FlashInfer",
-                     "cudagraph": "cudagraph", "eager": "eager"}
-        # TWO rows by PRODUCER — honest producer (all its configs) then fraud producer (all its configs),
-        # both re-checked by the SAME honest validator.
-        hon_ser = [(prof_name.get(prof, prof), rate, pn) for (_l, rate, honest, pn, prof) in rows_pn if honest]
-        fr_ser  = [(prof_name.get(prof, prof), rate, pn) for (_l, rate, honest, pn, prof) in rows_pn if not honest]
-        W, H = 900.0, 230.0; mL, mR, mT, mB = 50.0, 14.0, 12.0, 22.0
+    # ---- Experiment 1 — detail: per-nonce dot charts, ONE PER CHANNEL (same look, SEPARATE charts) ----
+    prof_name = {"cg-flashattn": "cudagraph·FlashAttn", "cg-flashinfer": "cudagraph·FlashInfer",
+                 "eager-flashattn": "eager·FlashAttn", "eager-flashinfer": "eager·FlashInfer",
+                 "cudagraph": "cudagraph", "eager": "eager"}
+    def _series(num_key, idx):
+        """(honest, fraud) series; each item = (name, config-rate%, [per-nonce entries])."""
+        hon_s, fr_s = [], []
+        for v in vals:
+            pn = [e for e in (v[idx] or []) if e.get("n_steps") and num_key in e]
+            if not pn:
+                continue
+            rate = sum(e[num_key] for e in pn) / max(sum(e["n_steps"] for e in pn), 1) * 100.0
+            (hon_s if v[2] else fr_s).append((prof_name.get(v[4], v[4]), rate, pn))
+        return hon_s, fr_s
+    def _chart(num_key, hon_s, fr_s):
+        """ONE per-nonce dot chart (honest row + fraud row) on its OWN 0-100% scale + threshold."""
+        pct = lambda e: e[num_key] / max(e["n_steps"], 1) * 100.0
+        allp = [pct(e) for s in (hon_s, fr_s) for _n, _r, pn in s for e in pn]
+        hmx = max([r for _n, r, _p in hon_s], default=0.0)
+        fmn = min([r for _n, r, _p in fr_s], default=0.0)
+        th = thresholds.recommend([s[1] for s in hon_s], [s[1] for s in fr_s])
+        ytop = min(max((max(allp) * 1.1 if allp else 5.0), (th * 1.4 if th else 0.0), 5.0), 100.0)
+        W, H = 900.0, 190.0; mL, mR, mT, mB = 50.0, 14.0, 12.0, 22.0
         pw, ph = W - mL - mR, H - mT - mB
-        Y = lambda p: mT + (1 - p / ytop) * ph          # p = per-nonce mismatch RATE (%), shared ytop
+        Y = lambda p: mT + (1 - p / ytop) * ph
         def _bg():
             grid = ""
             for yv in (0, ytop / 2, ytop):
@@ -250,46 +211,101 @@ if vals:
                 grid += (f'<line x1="{mL}" x2="{mL+pw}" y1="{yy:.1f}" y2="{yy:.1f}" stroke="#eef2f7"/>'
                          f'<text x="{mL-5}" y="{yy+4:.1f}" text-anchor="end" font-size="10" fill="#94a3b8">{yv:.1f}%</text>')
             tl = zones = ""
-            if thr and 0 < thr <= ytop:
-                yt = Y(thr)
+            if th and 0 < th <= ytop:
+                yt = Y(th)
                 zones = (f'<rect x="{mL}" y="{mT:.1f}" width="{pw}" height="{yt-mT:.1f}" fill="#dc2626" fill-opacity="0.06"/>'
                          f'<rect x="{mL}" y="{yt:.1f}" width="{pw}" height="{mT+ph-yt:.1f}" fill="#16a34a" fill-opacity="0.06"/>'
                          f'<text x="{mL+6}" y="{mT+13:.1f}" font-size="10" fill="#dc2626">FRAUD zone (&gt; threshold)</text>'
                          f'<text x="{mL+6}" y="{mT+ph-6:.1f}" font-size="10" fill="#16a34a">honest zone (&lt; threshold)</text>')
                 tl = (f'<line x1="{mL}" x2="{mL+pw}" y1="{yt:.1f}" y2="{yt:.1f}" stroke="#0f172a" stroke-dasharray="5 3"/>'
-                      f'<text x="{mL+pw}" y="{yt-3:.1f}" text-anchor="end" font-size="10" fill="#0f172a">threshold {thr:.2f}%</text>')
+                      f'<text x="{mL+pw}" y="{yt-3:.1f}" text-anchor="end" font-size="10" fill="#0f172a">threshold {th:.2f}%</text>')
             return grid, zones, tl
         def _row(head, ser, col, hcls):
-            if not ser: return ""
+            if not ser:
+                return ""
             n = max((len(pn) for _, _, pn in ser), default=1)
             X = lambda i: mL + (i / max(n - 1, 1)) * pw
             grid, zones, tl = _bg()
             dots = ""
             for _lab, _rate, pn in ser:
-                pns = sorted(pn, key=lambda e: e["nonce"])
-                dots += "".join(f'<circle cx="{X(i):.1f}" cy="{Y(_pct(e)):.1f}" r="2" fill="{col}" fill-opacity="0.7"/>' for i, e in enumerate(pns))
+                pns = sorted(pn, key=lambda e: e.get("nonce", 0))
+                dots += "".join(f'<circle cx="{X(i):.1f}" cy="{Y(pct(e)):.1f}" r="2" fill="{col}" fill-opacity="0.7"/>' for i, e in enumerate(pns))
             svg = (f'<svg viewBox="0 0 {W} {H}" width="100%" style="display:block;background:#fff;border:1px solid #e2e8f0;border-radius:6px">{zones}{grid}{tl}{dots}</svg>')
             confs = " · ".join(f'{lab} <b>{rate:.2f}%</b>' for lab, rate, pn in ser)
-            return (f'<div style="margin:.6rem 0"><div style="font-size:.95rem;margin-bottom:.15rem">'
-                    f'honest validator vs <b class={hcls}>{head}</b> &mdash; {confs}'
-                    f'</div>{svg}</div>')
-        panels = (_row("honest producer", hon_ser, "#16a34a", "good-t")
-                  + _row("fraud producer",  fr_ser,  "#dc2626", "bad-t"))
-        def _setup(prof, honest, rate):
-            graph = "cudagraph" if prof.startswith("cg") else "eager"
-            backend = "FlashInfer" if "flashinfer" in prof else "FlashAttn"
-            cls = "good-t" if honest else "bad-t"
-            return (f"<tr><td class={cls}>{'honest' if honest else 'fraud'} producer</td>"
-                    f"<td>{graph}</td><td>{backend}</td><td class=num>{rate:.2f}%</td></tr>")
-        vrow = f'<tr class=hi><td><b>VALIDATOR (fixed)</b></td><td><b>{v_eng}</b></td><td><b>{v_bk}</b></td><td class=num>—</td></tr>'
-        setup_rows = "".join(_setup(prof, honest, rate) for (_l, rate, honest, pn, prof) in rows_pn)
-        setup_tbl = (f'<table><tr><th>role · producer</th><th>engine (graph or not)</th><th>attention backend</th>'
-                     f'<th class=num>mismatch rate</th></tr>{vrow}{setup_rows}</table>')
+            return (f'<div style="margin:.5rem 0"><div style="font-size:.95rem;margin-bottom:.15rem">'
+                    f'honest validator vs <b class={hcls}>{head}</b> &mdash; {confs}</div>{svg}</div>')
+        return _row("honest producer", hon_s, "#16a34a", "good-t") + _row("fraud producer", fr_s, "#dc2626", "bad-t")
+
+    def _vseries():
+        """Vector channel: (honest, fraud) series, each item = (name, config-mean, [per-nonce mean_dist])."""
+        hon_s, fr_s = [], []
+        for v in vals:
+            ds = [e["mean_dist"] for e in (v[6] or []) if e.get("mean_dist") is not None]
+            if not ds:
+                continue
+            (hon_s if v[2] else fr_s).append((prof_name.get(v[4], v[4]), sum(ds) / len(ds), ds))
+        return hon_s, fr_s
+
+    def _logchart(hon_s, fr_s):
+        """ONE per-nonce chart of the ABSOLUTE cosine distance on a log10 y-axis."""
+        allv = [d for s in (hon_s, fr_s) for _n, _r, ds in s for d in ds if d and d > 0]
+        if not allv:
+            return ""
+        hmx = max([r for _n, r, _d in hon_s], default=0.0)
+        fmn = min([r for _n, r, _d in fr_s], default=0.0)
+        th = thresholds.recommend([s[1] for s in hon_s], [s[1] for s in fr_s])
+        # adaptive log bounds: centre on the honest<->fraud threshold — ~2 decades below
+        # it up to the top of the data, so the gap is always framed the same way; tiny
+        # honest values pile at the floor. Fall back to the data range when single-class.
+        hi = 10.0 ** math.ceil(math.log10(max(allv)))
+        lo = (10.0 ** (math.floor(math.log10(th)) - 2)) if (th and th > 0) \
+            else 10.0 ** math.floor(math.log10(min(allv)))
+        if hi <= lo:
+            hi = lo * 10.0
+        W, H = 900.0, 190.0; mL, mR, mT, mB = 58.0, 14.0, 12.0, 22.0
+        pw, ph = W - mL - mR, H - mT - mB
+        span = (math.log10(hi) - math.log10(lo)) or 1.0
+        Y = lambda v: mT + (1 - (math.log10(max(v, lo)) - math.log10(lo)) / span) * ph
+        grid = ""; d = lo
+        while d <= hi * 1.0000001:
+            yy = Y(d)
+            grid += (f'<line x1="{mL}" x2="{mL+pw}" y1="{yy:.1f}" y2="{yy:.1f}" stroke="#eef2f7"/>'
+                     f'<text x="{mL-5}" y="{yy+4:.1f}" text-anchor="end" font-size="10" fill="#94a3b8">{d:.0e}</text>')
+            d *= 10
+        tl = zones = ""
+        if th and lo < th < hi:
+            yt = Y(th)
+            zones = (f'<rect x="{mL}" y="{mT:.1f}" width="{pw}" height="{yt-mT:.1f}" fill="#dc2626" fill-opacity="0.06"/>'
+                     f'<rect x="{mL}" y="{yt:.1f}" width="{pw}" height="{mT+ph-yt:.1f}" fill="#16a34a" fill-opacity="0.06"/>'
+                     f'<text x="{mL+6}" y="{mT+13:.1f}" font-size="10" fill="#dc2626">FRAUD zone</text>'
+                     f'<text x="{mL+6}" y="{mT+ph-6:.1f}" font-size="10" fill="#16a34a">honest zone</text>')
+            tl = (f'<line x1="{mL}" x2="{mL+pw}" y1="{yt:.1f}" y2="{yt:.1f}" stroke="#0f172a" stroke-dasharray="5 3"/>'
+                  f'<text x="{mL+pw}" y="{yt-3:.1f}" text-anchor="end" font-size="10" fill="#0f172a">threshold {th:.1e}</text>')
+        def _row(head, ser, col, hcls):
+            if not ser:
+                return ""
+            n = max((len(ds) for _, _, ds in ser), default=1)
+            X = lambda i: mL + (i / max(n - 1, 1)) * pw
+            dots = ""
+            for _l, _r, ds in ser:
+                dots += "".join(f'<circle cx="{X(i):.1f}" cy="{Y(d):.1f}" r="2" fill="{col}" fill-opacity="0.7"/>' for i, d in enumerate(ds))
+            svg = (f'<svg viewBox="0 0 {W} {H}" width="100%" style="display:block;background:#fff;border:1px solid #e2e8f0;border-radius:6px">{zones}{grid}{tl}{dots}</svg>')
+            confs = " · ".join(f'{l} <b>{r:.1e}</b>' for l, r, ds in ser)
+            return (f'<div style="margin:.5rem 0"><div style="font-size:.95rem;margin-bottom:.15rem">'
+                    f'honest validator vs <b class={hcls}>{head}</b> &mdash; {confs}</div>{svg}</div>')
+        return _row("honest producer", hon_s, "#16a34a", "good-t") + _row("fraud producer", fr_s, "#dc2626", "bad-t")
+
+    hk, fk = _series("n_sphere_mismatches", 3)      # discrete k channel (v[3])
+    hvs, fvs = _vseries()                           # vector channel — absolute cosine distance (v[6])
+    if hk or fk:
+        k_block = f'<div style="font-weight:600;margin:.6rem 0 .1rem">Discrete k — % of steps mismatched</div>{_chart("n_sphere_mismatches", hk, fk)}'
+        v_block = (f'<div style="font-weight:600;margin:1rem 0 .1rem">Vector — cosine distance (log scale)</div>{_logchart(hvs, fvs)}'
+                   if (hvs or fvs) else "")
         cards.append(f"""<div class=card><div class=exp>Experiment 1 — detail</div>
- <h2>Per-nonce separation — honest producer vs fraud producer</h2>
- <p class=lead>The one <b>validator</b> is fixed at <b>{validator_cfg}</b> and re-checks every producer run below — each producer varies its engine (graph or not) and/or backend. The two chart rows then plot each nonce's <b>mismatch rate</b> (%) on a shared scale: <span class=good-t><b>honest producer</b></span> stays in the green zone (below threshold), <span class=bad-t><b>fraud producer</b></span> in the red zone (above).</p>
- {setup_tbl}
- {panels}</div>""")
+ <h2>Per-nonce separation</h2>
+ <p class=lead>Each dot = one nonce. <span class=good-t>honest</span> below the line, <span class=bad-t>fraud</span> above. k as % (linear); vector as cosine distance (log).</p>
+ {k_block}
+ {v_block}</div>""")
 
 # ---- Experiment 3: GSM8K ----
 def gsm(s):

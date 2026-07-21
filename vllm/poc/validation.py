@@ -1,4 +1,5 @@
 """PoC artifact validation logic."""
+import os
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -8,6 +9,13 @@ from vllm.logger import init_logger
 from .data import decode_vector, fraud_test, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
 
 logger = init_logger(__name__)
+
+# Per-step vector-divergence tolerance: a decode step "diverged" if its pre-snap
+# cosine distance exceeds this. Honest cross-HW jitter sits far below it and fraud
+# far above (pilot: ~60x gap), so the exact value is not sensitive — one knob, like
+# VLLM_POC_MARGIN_TAU for the discrete channel. Lets the report show the vector
+# channel as a plain "% of steps diverged" rate, on the SAME scale as the k rate.
+VECTOR_STEP_TOL = float(os.environ.get("VLLM_POC_VECTOR_TOL", "0.01"))
 
 
 def score_vector_channel(
@@ -62,10 +70,13 @@ def score_vector_channel(
             dists.append(1.0 - float(np.dot(vp, vv)) / (np_norm * nv_norm))
         n_bad_total += n_bad
         if dists:
+            n_diverged = sum(1 for d in dists if d > VECTOR_STEP_TOL)
             per_nonce.append({
                 "nonce": a["nonce"],
                 "mean_dist": float(np.mean(dists)),
-                "n_steps_scored": len(dists),
+                "n_diverged": n_diverged,        # steps whose pre-snap vector diverged (> tol)
+                "n_steps": len(dists),           # scored decode steps (parallel to the k channel)
+                "n_steps_scored": len(dists),    # kept for back-compat
                 "n_bad_steps": n_bad,
             })
         else:
@@ -75,6 +86,11 @@ def score_vector_channel(
     return {
         "mean_dist": float(np.mean([e["mean_dist"] for e in per_nonce])),
         "max_nonce_dist": float(max(e["mean_dist"] for e in per_nonce)),
+        # plain, non-expert summary: average "% of steps diverged" per nonce (same
+        # scale as the k-mismatch rate — this is what the community report charts).
+        "diverged_rate": float(np.mean(
+            [e["n_diverged"] / max(e["n_steps"], 1) * 100.0 for e in per_nonce])),
+        "step_tol": VECTOR_STEP_TOL,
         "n_nonces_scored": len(per_nonce),
         "n_nonces_skipped": n_skipped,
         "n_bad_steps_total": n_bad_total,
