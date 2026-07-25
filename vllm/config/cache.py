@@ -188,22 +188,12 @@ class CacheConfig:
     prefill-only."""
 
     poc_vector_artifacts: bool = Field(default=False)
-    """Emit windowed pre-snap sphere vectors (``sph_values_steps``) in PoC
-    artifacts without ``debug``: the prefill point + the first
-    ``poc_vector_artifact_steps`` decode steps, truncated to
-    ``poc_vector_artifact_dim`` leading coordinates. Emission only — the
-    forward, the k-id chain and the verdict are unchanged."""
-
-    poc_vector_artifact_steps: int = Field(default=64, gt=0)
-    """Leading decode steps emitted when ``poc_vector_artifacts`` is on. The
-    early window separates best: honest cross-HW drift compounds along the
-    chain while a weight-substitution signal is full-size from step 1."""
-
-    poc_vector_artifact_dim: int = Field(default=32, gt=0, le=256)
-    """Leading coordinates kept per emitted vector (raw slice of the
-    SPHERE_DIM unit vector; the scorer renormalizes both sides). The 32-D
-    default empirically matches full 256-D detection power. Upper bound =
-    SPHERE_DIM, kept literal to avoid a config->poc import."""
+    """Emit pre-snap sphere vectors (``sph_values_steps``) in PoC artifacts
+    without ``debug``: one vector per step (prefill + every decode step), each a
+    SEEDED ``k_dim``-coordinate pick of the SPHERE_DIM unit vector — the same
+    sampler prefill uses (``random_pick_indices``), so prover and validator select
+    identical coords. Emission only — the forward, the k-id chain and the verdict
+    are unchanged."""
 
     poc_share: float = Field(default=0.5, ge=0.0, le=1.0)
     """Fraction of each scheduler step's token budget PoC may consume; chat gets
@@ -242,8 +232,6 @@ class CacheConfig:
             "poc_share",
             # PoC artifact-emission knobs — post-forward host-side emission only
             "poc_vector_artifacts",
-            "poc_vector_artifact_steps",
-            "poc_vector_artifact_dim",
             # Post-init/derived counters
             "num_gpu_blocks",
             "num_cpu_blocks",

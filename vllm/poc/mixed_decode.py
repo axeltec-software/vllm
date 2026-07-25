@@ -41,32 +41,44 @@ _MARGIN_TAU = float(os.environ.get("VLLM_POC_MARGIN_TAU", "0") or "0")
 POC_DEFER_LIMIT = 4
 
 
-def _vector_artifact_cfg(runner) -> tuple:
-    """(enabled, steps, dim) emission knobs from the engine's CacheConfig.
-    The fallbacks are load-bearing: these files get overlaid onto vLLM trees
-    whose config may predate the fields — then disable, don't raise."""
+def _vector_artifact_cfg(runner) -> bool:
+    """poc_vector_artifacts enabled? The dim is the PoC's own k_dim and the window
+    is every step — no separate knobs (retired poc_vector_artifact_steps/_dim).
+    Fallback is load-bearing: overlaid onto trees whose config predates the field
+    → disable, don't raise."""
     cc = getattr(getattr(runner, "vllm_config", None), "cache_config", None)
-    if cc is None:
-        return False, 64, 32
-    return (bool(getattr(cc, "poc_vector_artifacts", False)),
-            int(getattr(cc, "poc_vector_artifact_steps", 64)),
-            int(getattr(cc, "poc_vector_artifact_dim", 32)))
+    return bool(getattr(cc, "poc_vector_artifacts", False)) if cc is not None else False
 
 
-def keep_q_step(step: int, debug: bool, va_on: bool, va_steps: int) -> bool:
-    """Which decode steps retain their pre-snap slice for emission: all under
-    debug, the leading va_steps window under poc_vector_artifacts. Pure."""
-    return debug or (va_on and step <= va_steps)
+def keep_q_step(step: int, debug: bool, va_on: bool) -> bool:
+    """Which decode steps retain their pre-snap q for emission: every step under
+    debug or poc_vector_artifacts (aligned to the PoC step count — one vector per
+    step, all max_tokens of them). Pure."""
+    return debug or va_on
 
 
-def encode_sph_slices(q_host, debug: bool, va_on: bool, va_dim: int) -> list:
-    """Wire-encode kept slices (one fp16-LE base64 row, vector_b64 codec).
-    Flag mode ships the raw leading va_dim coords — NOT renormalized; the
-    scorer renormalizes both sides. Debug ships full width. Pure."""
+def encode_sph_slices(q_host, block_hash, public_key, nonce, k_dim, debug):
+    """Wire-encode each kept step's q (one fp16-LE base64 row, vector_b64 codec).
+    Non-debug: a SEEDED k_dim-pick of the SPHERE_DIM coords per step — the SAME
+    sampler as prefill (random_pick_indices), NOT a leading slice — so prover and
+    validator select the identical coords from the (identical) step vector. The
+    row's position in q_host IS its step (0 = prefill, 1..max_tokens = decode), so
+    both sides seed the pick on the same (block_hash, public_key, nonce, step).
+    Debug ships full width. Not renormalized; the scorer renormalizes both sides."""
+    import torch
+
     from .data import encode_vector
-    if not debug and va_on:
-        q_host = q_host[:, :va_dim]
-    return [encode_vector(row) for row in q_host]
+    from .gpu_random import random_pick_indices
+    from .sphere import SPHERE_DIM
+    if debug:
+        return [encode_vector(row) for row in q_host]
+    cpu = torch.device("cpu")
+    out = []
+    for step, row in enumerate(q_host):
+        idx = random_pick_indices(
+            block_hash, public_key, [nonce], SPHERE_DIM, k_dim, cpu, step=step)[0].numpy()
+        out.append(encode_vector(row[idx]))
+    return out
 
 
 def slice_sampling_metadata(sm, rows, device):
@@ -205,8 +217,8 @@ class PoCDecodeState:
     n_nan_t: "torch.Tensor | None" = None         # [1] int64 non-finite-step counter (device)
     k_steps_t: list = field(default_factory=list)  # list of [1] int64; cat+tolist at end
     # per-step pre-snap sphere slices (the q whose argmax is sphere_k) for
-    # PoCOutput.sph_values_steps: full trajectory under debug, prefill +
-    # leading poc_vector_artifact_steps window under poc_vector_artifacts.
+    # PoCOutput.sph_values_steps: every step under debug or poc_vector_artifacts
+    # (the seeded k_dim-coord pick is applied at emit — see encode_sph_slices).
     # [1, SPHERE_DIM] floats, index 0 = prefill; device-accumulated like
     # k_steps_t (no per-step host sync), encoded once at emit.
     q_steps_t: list = field(default_factory=list)
@@ -472,7 +484,7 @@ def process_poc_outputs_from_hidden(
         codebook = get_sphere_codebook().to(device=runner.device)
         runner._poc_codebook = codebook
     # engine-static: safe to fetch once per forward
-    va_on, va_steps, va_dim = _vector_artifact_cfg(runner)
+    va_on = _vector_artifact_cfg(runner)
 
     # Decode steps are the hot path; collect them and run ONE batched set of GPU
     # ops for the whole nonce-batch below (was a per-nonce Python loop = B× the
@@ -581,7 +593,7 @@ def process_poc_outputs_from_hidden(
             step = meta['decode_step']
             k_t = k_all[i:i + 1]                               # [1] tensor (view)
             st.k_steps_t.append(k_t)
-            if keep_q_step(step, meta['poc_params'].debug, va_on, va_steps):
+            if keep_q_step(step, meta['poc_params'].debug, va_on):
                 # device-side like k_steps_t — no per-step host sync; clone so
                 # a lone debug row does not pin the whole [B, SPHERE_DIM] batch
                 st.q_steps_t.append(q_all[i:i + 1].detach().clone())
@@ -613,8 +625,10 @@ def process_poc_outputs_from_hidden(
                     # cat on device, then ONE host copy for the whole trajectory
                     # (a per-step .cpu() would sync T+1 times at emit).
                     q_host = torch.cat(st.q_steps_t).cpu().numpy()
+                    pp = meta['poc_params']
                     sph_vals = encode_sph_slices(
-                        q_host, meta['poc_params'].debug, va_on, va_dim)
+                        q_host, pp.block_hash, pp.public_key, pp.nonce,
+                        pp.k_dim, pp.debug)
                 poc_outputs[meta['req_id']] = PoCOutput(
                     nonce=meta['poc_params'].nonce,
                     vector_b64="",

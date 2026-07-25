@@ -136,7 +136,7 @@ class PoCOutput:
     n_nan_steps: int = 0
     # Per-step sphere slices, index 0 = prefill, 1..N = decode steps. Emitted
     # under debug (full trajectory, full SPHERE_DIM) or poc_vector_artifacts
-    # (prefill + leading window, leading poc_vector_artifact_dim coords).
+    # (every step, a seeded k_dim-coord pick of the SPHERE_DIM vector).
     # sph_indices_steps[step] : list of SPHERE_DIM int indices (debug only)
     # sph_values_steps[step]  : base64 fp16-LE pre-snap slice — a raw slice of
     #                           a unit vector, NOT unit itself; renormalize
