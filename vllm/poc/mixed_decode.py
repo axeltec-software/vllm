@@ -213,9 +213,12 @@ class PoCDecodeState:
     base_seeds: "torch.Tensor | None" = None     # [1] int64 per-nonce base (set once)
     prev_k_t: "torch.Tensor | None" = None        # [1] int64, chained on device
     reference_t: "torch.Tensor | None" = None     # [R] int64 uploaded reference
-    mismatch_t: "torch.Tensor | None" = None      # [1] int64 on-device accumulator
-    n_nan_t: "torch.Tensor | None" = None         # [1] int64 non-finite-step counter (device)
     k_steps_t: list = field(default_factory=list)  # list of [1] int64; cat+tolist at end
+    # margin trajectory, parallel to k_steps_t. The mismatch count is DEFERRED to
+    # emit (one batched reduction over k+margin vs the reference) instead of a
+    # per-step accumulate; n_nan is derived at emit from k == -1 (the snap marks
+    # non-finite steps that way). So the hot decode loop does no counter ops.
+    margin_steps_t: list = field(default_factory=list)
     # per-step pre-snap sphere slices (the q whose argmax is sphere_k) for
     # PoCOutput.sph_values_steps: every step under debug or poc_vector_artifacts
     # (the seeded k_dim-coord pick is applied at emit — see encode_sph_slices).
@@ -540,21 +543,16 @@ def process_poc_outputs_from_hidden(
         sph0 = random_pick_indices(
             poc_params.block_hash, poc_params.public_key, [nonce],
             hidden_size, SPHERE_DIM, runner.device)
-        k0_t, bad0, margin0, q0 = _sphere_from_idx(sph0)    # [1]/[1]/[1]/[1,SPHERE_DIM]
+        k0_t, _bad0, margin0, q0 = _sphere_from_idx(sph0)   # [1]/[1]/[1]/[1,SPHERE_DIM]
+        # (nan is derived at emit from k == -1; _bad0 no longer accumulated per step)
         st.k_steps_t = [k0_t]
+        st.margin_steps_t = [margin0]                       # for the deferred mismatch (emit)
         # emission only — forward unchanged (contract: q_steps_t field doc)
         st.q_steps_t = [q0.detach()] if (poc_params.debug or va_on) else []
-        st.mismatch_t = torch.zeros(1, dtype=torch.int64, device=runner.device)
-        st.n_nan_t = bad0.to(torch.int64)                   # [1] non-finite-step counter
         if st.reference is not None:
             st.reference_t = torch.tensor(
                 st.reference, dtype=torch.int64, device=runner.device)
-            ref0 = st.reference_t[0:1]
-            # count a mismatch only if finite (fault != fraud) AND the validator's snap
-            # was confident (margin >= tau; low margin = boundary jitter, not fraud).
-            st.mismatch_t += (
-                (k0_t != ref0) & (k0_t >= 0) & (margin0 >= _MARGIN_TAU)).to(torch.int64)
-            st.prev_k_t = ref0                              # aligned (teacher-forced)
+            st.prev_k_t = st.reference_t[0:1]               # aligned (teacher-forced)
         else:
             st.prev_k_t = k0_t
 
@@ -601,31 +599,36 @@ def process_poc_outputs_from_hidden(
         # per-row clones, just far fewer kernel launches.
         _keep_any = va_on or any(m['poc_params'].debug for m in decode_metas)
         q_clone = q_all.detach().clone() if _keep_any else None
-        bad_i64 = bad_all.to(torch.int64)
         for i, meta in enumerate(decode_metas):
             st = meta['decode_state']
             step = meta['decode_step']
             k_t = k_all[i:i + 1]                               # [1] tensor (view)
             st.k_steps_t.append(k_t)
+            st.margin_steps_t.append(margin_all[i:i + 1])     # deferred mismatch (emit)
             if keep_q_step(step, meta['poc_params'].debug, va_on):
                 st.q_steps_t.append(q_clone[i:i + 1])         # view into the one per-step clone
-            st.n_nan_t += bad_i64[i:i + 1]                     # device accumulate (no sync)
+            # chain only (teacher-forced ref, or free-running k) — no per-step counters
             if st.reference_t is not None and step < st.reference_t.shape[0]:
-                ref = st.reference_t[step:step + 1]
-                # count only finite (fault != fraud) AND confident (margin >= tau;
-                # low margin = boundary jitter, not fraud) disagreements.
-                st.mismatch_t += (
-                    (k_t != ref) & (k_t >= 0)
-                    & (margin_all[i:i + 1] >= _MARGIN_TAU)).to(torch.int64)
-                st.prev_k_t = ref                             # aligned (teacher-forced)
+                st.prev_k_t = st.reference_t[step:step + 1]   # aligned (teacher-forced)
             else:
                 st.prev_k_t = k_t
             if step >= st.max_tokens:
-                # End-of-sequence: ONE host copy of the whole trajectory + count
-                # (emit-once). This single terminal PoCOutput is what the engine drains.
-                k_points = torch.cat(st.k_steps_t).tolist()
-                n_mismatches = int(st.mismatch_t.item())
-                n_nan = int(st.n_nan_t.item())
+                # End-of-sequence: ONE host copy of the trajectory + the DEFERRED
+                # reductions (emit-once). n_nan = non-finite steps (snap marks k=-1);
+                # mismatch = confident (margin>=tau) finite disagreements vs the reference
+                # over the whole k+margin trajectory — identical to the old per-step sum,
+                # just batched here so the hot loop stays counter-free.
+                k_traj = torch.cat(st.k_steps_t)              # [L] int64 on device
+                k_points = k_traj.tolist()
+                n_nan = int((k_traj == -1).sum().item())
+                if st.reference_t is not None:
+                    margin_traj = torch.cat(st.margin_steps_t)
+                    L = min(k_traj.shape[0], st.reference_t.shape[0])
+                    n_mismatches = int((
+                        (k_traj[:L] != st.reference_t[:L]) & (k_traj[:L] >= 0)
+                        & (margin_traj[:L] >= _MARGIN_TAU)).sum().item())
+                else:
+                    n_mismatches = -1
                 if n_nan:
                     logger.warning(
                         "PoC decode nonce %s: %d/%d non-finite hidden step(s) "
