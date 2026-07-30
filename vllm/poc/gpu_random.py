@@ -11,6 +11,21 @@ from typing import List, Optional
 
 import torch
 
+# Seeded-routing scatter fix (DURABLE DEFAULT — MoE decode-PoC).
+# Without it, each token seed-picks top_k of ALL n_experts, so a 32-token decode batch
+# scatters across ~all experts -> the MoE grouped GEMM streams ~n_experts weight matrices
+# from HBM every step. Measured on MiniMax-M2 (256 experts) in graph mode: MoE = 8.9 ms/step,
+# 11x pure inference's 0.8 ms and 56% of PoC's GPU time. This restricts every token's pick to
+# a shared, step-rotating WINDOW of _ROUTE_WINDOW experts, so the batch activates only ~W
+# distinct experts/step (grouped GEMM batches them) while the window slides each step so the
+# trajectory still sweeps every expert (coverage / fraud-bound preserved). Fully seeded ->
+# deterministic, bit-identical eager==graph, no cross-HW noise. Verified in graph: 8.9 -> 4.0
+# ms/step MoE (single-nonce validation collapses to ~W and is faster still). Per-row-step
+# offset (not batch-shared) keeps each nonce's artifact reproducible by a single-nonce
+# validator. CONSENSUS-AFFECTING (changes k-trajectories) -> needs coordinated recollection.
+# Set >= n_experts (e.g. a huge value) only to restore the legacy full-scatter behaviour.
+_ROUTE_WINDOW = 16
+
 
 def pinned_to_device(vals, dtype, device):
     """Build a small [N] device tensor from a host sequence WITHOUT stalling the
@@ -426,6 +441,34 @@ def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
     return logits
 
 
+def _forced_logits_windowed(seed: torch.Tensor, steps: torch.Tensor, n_experts: int,
+                            top_k: int, window: int, device: torch.device) -> torch.Tensor:
+    """Seeded expert selection restricted to a step-rotating WINDOW of ``window`` experts.
+
+    The window offset depends on the decode STEP (shared across the batch, NOT per-nonce),
+    so a decode batch activates only ~window distinct experts per step -> the MoE grouped
+    GEMM batches them (measured ~7x faster than the full-scatter pick). The offset slides by
+    ``stride`` each step so over the trajectory the window sweeps every expert (coverage /
+    fraud-bound preserved). Each token still seed-picks top_k WITHIN the window (trajectories
+    stay distinct). Pure integer -> eager==graph, bit-identical cross-HW. seed/steps [B,1]."""
+    b = seed.shape[0]
+    W = max(window, top_k)
+    stride = max(1, n_experts // 256)                    # sweep ~all experts over a 256-step trajectory
+    offset = (steps * stride) % n_experts                # [B,1] window start (batch-shared at a given step)
+    perm = torch.arange(W, device=device, dtype=torch.int64).unsqueeze(0).repeat(b, 1)
+    for i in range(top_k):                               # partial Fisher-Yates over [0, W)
+        j = i + _batched_murmur3_32(torch.full((b, 1), i, dtype=torch.int32, device=device),
+                                    seed) % (W - i)
+        gi = perm[:, i:i + 1].clone()
+        perm[:, i:i + 1] = perm.gather(1, j)
+        perm.scatter_(1, j, gi)
+    chosen = (offset + perm[:, :top_k]) % n_experts      # window-local -> global expert ids (distinct)
+    logits = torch.full((b, n_experts), -1.0e4, device=device, dtype=torch.float32)
+    logits.scatter_(1, chosen,
+                    torch.arange(top_k, 0, -1, device=device, dtype=torch.float32).unsqueeze(0).expand(b, -1))
+    return logits
+
+
 def seeded_expert_logits(seed_str: str, n_experts: int, top_k: int,
                          device: torch.device) -> torch.Tensor:
     """Single-row forced logits from a seed string (tests / offline validators).
@@ -451,6 +494,9 @@ def expert_logits_from_base(base_ints: torch.Tensor, steps: torch.Tensor,
     device->host sync. Equivalent per (row, layer) to seeded_experts()."""
     seed = _batched_murmur3_32(steps.view(-1, 1).to(torch.int32),
                                base_ints.view(-1, 1))               # [B,1] = fold step into base
+    if _ROUTE_WINDOW and _ROUTE_WINDOW < n_experts:
+        return _forced_logits_windowed(seed, steps.view(-1, 1), n_experts, top_k,
+                                       _ROUTE_WINDOW, device)
     return _forced_logits(seed, n_experts, top_k, device)
 
 

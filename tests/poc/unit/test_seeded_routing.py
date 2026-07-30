@@ -108,15 +108,20 @@ def test_per_nonce_routing_varies():
 
 
 def test_uniform_coverage_no_dead_or_dominating_experts():
+    # Seeded routing now uses a step-rotating WINDOW (gpu_random._ROUTE_WINDOW) so each step
+    # activates only ~W experts, NOT all n -- but the window slides one expert/step, so over a
+    # FULL sweep (>= n steps) every expert is in-window for the same count and the coverage is
+    # still uniform with no dead expert. Assert the security property over that trajectory
+    # length (the real unit: a nonce runs its whole trajectory), not over an arbitrary slice.
     n, k = 64, 8
     counts = torch.zeros(n, dtype=torch.long); trials = 0
     for nn_ in range(40):
-        for s in range(40):
+        for s in range(n):                            # a full window sweep per nonce
             for e in _chosen("deadbeef", nn_, s, 0, n, k):
                 counts[e] += 1
             trials += 1
     expected = trials * k / n
-    assert counts.min() > 0                           # no dead expert
+    assert counts.min() > 0                           # no dead expert (fraud can't skip any)
     assert counts.max() < 2.0 * expected              # none dominates
 
 
