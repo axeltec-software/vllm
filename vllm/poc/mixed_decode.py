@@ -564,40 +564,52 @@ def process_poc_outputs_from_hidden(
     if decode_metas:
         device = runner.device
         H = hidden_states.shape[-1]
-        # Eager tail is the LIVE path. Irene's tail CUDA graph (vllm/poc/tail_cudagraph.py)
-        # is NOT wired in here because (1) it's not a net win — the bottleneck is the per-step
-        # input prep (torch.cat/torch.tensor/gather), not the snap math (see
-        # CUDAGRAPH_POC_TAIL_STEPS.md), and (2) it returns only (k, bad) — not the margin /
-        # q-vectors the margin gate and vector channel now require. record_function label kept
-        # so this tail stays profileable while we attack the real (input-prep) bottleneck.
+        # Post-forward sphere-snap tail. When the tail CUDA graph is captured
+        # (POC_TAIL_CUDAGRAPH=1), it replaces this whole block with ONE graph replay
+        # over stable slot buffers — collapsing the per-step kernel launches that
+        # dominate this eager path (see vllm/poc/tail_cudagraph.py). Artifacts
+        # (k trajectory / q vector / bad) are byte-identical to eager; margin carries
+        # ~1e-7 cuBLAS fp-noise, ~1e4x below the τ gate (harmless to the verdict).
         from torch.autograd.profiler import record_function
-        with record_function("poc_tail_eager_path"):
-            # sync-free host->device: hidden[py_list] and torch.tensor(list, device=cuda)
-            # each block on the forward every step (see pinned_to_device); index_select
-            # with a pinned index avoids it. Values (hence artifacts) are identical.
-            idxs = [m['start_idx'] + m['length'] - 1 for m in decode_metas]
-            lh = hidden_states.index_select(
-                0, pinned_to_device(idxs, torch.long, device)).float()   # [B, H]
-            lh = lh / (lh.norm(dim=-1, keepdim=True) + 1e-8)
-            base_seeds = torch.cat([m['decode_state'].base_seeds for m in decode_metas])
-            prev_k = torch.cat([m['decode_state'].prev_k_t for m in decode_metas])
-            steps = pinned_to_device([m['decode_step'] for m in decode_metas], torch.int64, device)
-            sph = random_pick_indices_gpu(base_seeds, prev_k, steps, H, SPHERE_DIM, device)
-            # snap_with_margin: argmax(NaN) is garbage -> non-finite rows return k=-1
-            # (compute fault, NOT fraud). bad_all/margin_all stay on device (no per-step sync).
-            q_all = project_to_sphere(torch.gather(lh, 1, sph))          # [B, SPHERE_DIM]
-            k_all, bad_all, margin_all = snap_with_margin(q_all, codebook)  # [B] each
+        _tail_mgr = getattr(runner, "_poc_tail_graph_mgr", None)
+        if _tail_mgr is not None and _tail_mgr.ready:
+            with record_function("poc_tail_graph_path"):
+                k_all, bad_all, margin_all, q_all = _tail_mgr.run(hidden_states, decode_metas)
+        else:
+            with record_function("poc_tail_eager_path"):
+                # sync-free host->device: hidden[py_list] and torch.tensor(list, device=cuda)
+                # each block on the forward every step (see pinned_to_device); index_select
+                # with a pinned index avoids it. Values (hence artifacts) are identical.
+                idxs = [m['start_idx'] + m['length'] - 1 for m in decode_metas]
+                lh = hidden_states.index_select(
+                    0, pinned_to_device(idxs, torch.long, device)).float()   # [B, H]
+                lh = lh / (lh.norm(dim=-1, keepdim=True) + 1e-8)
+                base_seeds = torch.cat([m['decode_state'].base_seeds for m in decode_metas])
+                prev_k = torch.cat([m['decode_state'].prev_k_t for m in decode_metas])
+                steps = pinned_to_device([m['decode_step'] for m in decode_metas], torch.int64, device)
+                sph = random_pick_indices_gpu(base_seeds, prev_k, steps, H, SPHERE_DIM, device)
+                # snap_with_margin: argmax(NaN) is garbage -> non-finite rows return k=-1
+                # (compute fault, NOT fraud). bad_all/margin_all stay on device (no per-step sync).
+                q_all = project_to_sphere(torch.gather(lh, 1, sph))          # [B, SPHERE_DIM]
+                k_all, bad_all, margin_all = snap_with_margin(q_all, codebook)  # [B] each
 
+        # Hoist the batched tensor ops OUT of the per-nonce loop: one clone of q and
+        # one int64 cast of bad for the whole batch, instead of B of each (the loop
+        # then only does cheap views + list appends). Values are identical to the
+        # per-row clone/cast. q_clone is shared by this step's kept rows and stays
+        # alive until emit — for va_on (every row kept) that is the same memory as B
+        # per-row clones, just far fewer kernel launches.
+        _keep_any = va_on or any(m['poc_params'].debug for m in decode_metas)
+        q_clone = q_all.detach().clone() if _keep_any else None
+        bad_i64 = bad_all.to(torch.int64)
         for i, meta in enumerate(decode_metas):
             st = meta['decode_state']
             step = meta['decode_step']
             k_t = k_all[i:i + 1]                               # [1] tensor (view)
             st.k_steps_t.append(k_t)
             if keep_q_step(step, meta['poc_params'].debug, va_on):
-                # device-side like k_steps_t — no per-step host sync; clone so
-                # a lone debug row does not pin the whole [B, SPHERE_DIM] batch
-                st.q_steps_t.append(q_all[i:i + 1].detach().clone())
-            st.n_nan_t += bad_all[i:i + 1].to(torch.int64)    # device accumulate (no sync)
+                st.q_steps_t.append(q_clone[i:i + 1])         # view into the one per-step clone
+            st.n_nan_t += bad_i64[i:i + 1]                     # device accumulate (no sync)
             if st.reference_t is not None and step < st.reference_t.shape[0]:
                 ref = st.reference_t[step:step + 1]
                 # count only finite (fault != fraud) AND confident (margin >= tau;

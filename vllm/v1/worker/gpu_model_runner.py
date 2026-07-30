@@ -5075,12 +5075,14 @@ class GPUModelRunner(
                         self.model, _layers, _inner, self.max_num_tokens,
                         self.model_config.get_hidden_size(), self.device, self.dtype)
                     # Post-forward decode-PoC tail (sphere-snap) CUDA graph — captured
-                    # later in capture_model(). OFF by default: the tail graph is not a
-                    # net win (bottleneck is input prep, not the snap) AND the live path
-                    # in mixed_decode.py needs margin/q-vectors the graph doesn't produce.
-                    # Kept behind POC_TAIL_CUDAGRAPH=1 for the ongoing investigation.
-                    # See vllm/poc/tail_cudagraph.py, benchmarks/poc/CUDAGRAPH_POC_TAIL_STEPS.md.
-                    if os.environ.get("POC_TAIL_CUDAGRAPH") == "1":
+                    # in capture_model(). ON by default: collapses the per-step kernel
+                    # launches that dominate the eager tail (~0.8 ms/step, ~2x decode-PoC
+                    # overhead on fast cards). Artifacts (k trajectory / q vector / bad)
+                    # are byte-identical to the eager path; margin carries ~1e-7 cuBLAS
+                    # fp-noise, ~1e4x below the tau gate. Set POC_TAIL_CUDAGRAPH=0 to force
+                    # the eager tail (A/B). Never captured under enforce_eager (capture_model
+                    # returns early there). See vllm/poc/tail_cudagraph.py.
+                    if os.environ.get("POC_TAIL_CUDAGRAPH") != "0":
                         from vllm.poc.sphere import SPHERE_DIM
                         from vllm.poc.tail_cudagraph import PoCTailGraphManager
                         self._poc_tail_graph_mgr = PoCTailGraphManager(

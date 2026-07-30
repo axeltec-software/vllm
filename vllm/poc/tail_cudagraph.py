@@ -52,6 +52,10 @@ class PoCTailGraphManager:
         self.steps_buf = torch.zeros(max_batch_size, dtype=torch.int64, device=device)
         self.k_out_buf = torch.zeros(max_batch_size, dtype=torch.int64, device=device)
         self.bad_out_buf = torch.zeros(max_batch_size, dtype=torch.bool, device=device)
+        # margin (top1-top2 cos) and the pre-snap sphere vector q — the margin gate
+        # and the vector channel both need these, so the graph must emit them too.
+        self.margin_out_buf = torch.zeros(max_batch_size, dtype=torch.float32, device=device)
+        self.q_out_buf = torch.zeros(max_batch_size, sphere_dim, dtype=torch.float32, device=device)
         self.graph: "torch.cuda.CUDAGraph | None" = None
 
     @property
@@ -60,7 +64,7 @@ class PoCTailGraphManager:
 
     def _body(self, codebook: torch.Tensor) -> None:
         from vllm.poc.gpu_random import random_pick_indices_gpu
-        from vllm.poc.sphere import project_to_sphere, snap_with_guard
+        from vllm.poc.sphere import project_to_sphere, snap_with_margin
 
         # Normalize INSIDE the graph (buffer holds raw hidden values written by
         # run()) so replay always reflects whatever's currently in hidden_buf.
@@ -69,10 +73,12 @@ class PoCTailGraphManager:
             self.base_seeds_buf, self.prev_k_buf, self.steps_buf,
             self.hidden_size, self.sphere_dim, self.device,
         )
-        k_all, bad_all = snap_with_guard(
-            project_to_sphere(torch.gather(lh, 1, sph)), codebook)
+        q = project_to_sphere(torch.gather(lh, 1, sph))
+        k_all, bad_all, margin_all = snap_with_margin(q, codebook)
         self.k_out_buf.copy_(k_all)
         self.bad_out_buf.copy_(bad_all)
+        self.margin_out_buf.copy_(margin_all)
+        self.q_out_buf.copy_(q)
 
     def capture(self, codebook: torch.Tensor) -> None:
         """Capture the sphere-snap math once. Buffers hold zeros at this point
@@ -88,12 +94,12 @@ class PoCTailGraphManager:
 
     def run(
         self, hidden_states: torch.Tensor, decode_metas: list[dict],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Write this step's active decode-PoC rows into the persistent buffers
         (keyed by each request's stable PoCMixedDecodeManager slot), replay, and
-        return ``(k_all, bad_all)`` in the SAME order as ``decode_metas`` — a
-        drop-in replacement for the eager
-        ``snap_with_guard(project_to_sphere(...))`` call it replaces; callers
+        return ``(k_all, bad_all, margin_all, q_all)`` in the SAME order as
+        ``decode_metas`` — a drop-in replacement for the eager
+        ``snap_with_margin(project_to_sphere(...))`` block it replaces; callers
         need no other changes."""
         assert self.ready, "PoCTailGraphManager.run() called before capture()"
         idxs = [m['start_idx'] + m['length'] - 1 for m in decode_metas]
@@ -126,4 +132,6 @@ class PoCTailGraphManager:
 
         k_all = self.k_out_buf.index_select(0, slot_idx)
         bad_all = self.bad_out_buf.index_select(0, slot_idx)
-        return k_all, bad_all
+        margin_all = self.margin_out_buf.index_select(0, slot_idx)
+        q_all = self.q_out_buf.index_select(0, slot_idx)
+        return k_all, bad_all, margin_all, q_all
