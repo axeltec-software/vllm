@@ -29,10 +29,12 @@ for i in $(seq 1 90); do
 done
 
 # seq_len=64 matches the reference fidelity run (runs/from_image__RTX4000__…, meta.seq_len=64).
-# Do NOT drop --seq-len: the tool defaults to 256, which quadruples per-nonce prefill and
-# fakes a ~20% overhead that is purely prefill length, not a decode cost (see KB).
+# Do NOT drop --seq-len on EITHER line: the tool defaults to 256, so omitting it on chat gave
+# chat a 4x longer prefill than PoC -> chat tok/s depressed -> overhead ratio (chat/poc)
+# understated -> the gate passed PoC runs it should have failed. Both modes must prefill the
+# same length (see KB: the "20% overhead" was exactly this class of apples-to-oranges).
 POC=$(.venv/bin/python benchmarks/poc/perfomance_nonces.py --mode poc  --url "http://127.0.0.1:$PORT" --target vllm --model "$M" --max-tokens 256 --seq-len 64 2>/dev/null | grep -oE "steps/s=[0-9.]+" | cut -d= -f2)
-CHAT=$(.venv/bin/python benchmarks/poc/perfomance_nonces.py --mode chat --url "http://127.0.0.1:$PORT"               --model "$M" --max-tokens 256 2>/dev/null | grep -oE "tokens/s=[0-9.]+" | cut -d= -f2)
+CHAT=$(.venv/bin/python benchmarks/poc/perfomance_nonces.py --mode chat --url "http://127.0.0.1:$PORT"               --model "$M" --max-tokens 256 --seq-len 64 2>/dev/null | grep -oE "tokens/s=[0-9.]+" | cut -d= -f2)
 kill -9 $SRV 2>/dev/null; reap
 
 echo "commit=$(git rev-parse --short HEAD)  poc_steps_s=$POC  chat_tok_s=$CHAT"

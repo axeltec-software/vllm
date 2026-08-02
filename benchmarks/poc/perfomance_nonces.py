@@ -56,6 +56,19 @@ def run_poc(url, target, model, seq_len, max_tokens, duration, warmup):
     return total, total * (max_tokens + 1), elapsed
 
 
+def _full_trajectories(resp, max_tokens) -> bool:
+    """True if EVERY artifact in the response carries a complete k-trajectory
+    (max_tokens+1 = prefill k0 + one k per decode step). Guards throughput accounting:
+    steps/s credits max_tokens+1 per nonce, so short completions would inflate it.
+    max_tokens==0 is prefill-only (no trajectory) — nothing to verify."""
+    if max_tokens <= 0:
+        return True
+    arts = (resp or {}).get("artifacts") or []
+    if not arts:
+        return False
+    return all(len(a.get("k_points_steps") or []) == max_tokens + 1 for a in arts)
+
+
 def run_poc_pipeline(url, target, model, seq_len, max_tokens, duration, warmup):
     """APPLES-TO-APPLES with run_chat, NO door gap: BATCH worker threads each fire a
     SINGLE-nonce /generate back-to-back, so ~BATCH nonces are always in flight and the
@@ -66,7 +79,7 @@ def run_poc_pipeline(url, target, model, seq_len, max_tokens, duration, warmup):
     Returns (total_nonces, total_steps, elapsed)."""
     import threading
     from concurrent.futures import ThreadPoolExecutor
-    c = {"next": 0, "done": 0}
+    c = {"next": 0, "done": 0, "errors": 0, "short": 0}
     lock = threading.Lock()
     state = {"deadline": 0.0}
 
@@ -75,10 +88,19 @@ def run_poc_pipeline(url, target, model, seq_len, max_tokens, duration, warmup):
             with lock:
                 n = c["next"]; c["next"] += 1
             try:
-                request_generate(url, target=target, model=model, nonces=[n],
-                                 seq_len=seq_len, max_tokens=max_tokens)
+                resp, _ = request_generate(url, target=target, model=model, nonces=[n],
+                                           seq_len=seq_len, max_tokens=max_tokens)
             except Exception:
-                continue  # skip a transient error, keep the pipeline full
+                with lock:
+                    c["errors"] += 1   # counted, not silently swallowed (see _print)
+                continue  # keep the pipeline full
+            # VERIFY THE WORK: throughput is credited as max_tokens+1 steps per nonce, so a
+            # nonce that finished SHORT would inflate steps/s (this is exactly how a capped
+            # batch once reported an impossible 422 nonce/min). Only count full trajectories.
+            if not _full_trajectories(resp, max_tokens):
+                with lock:
+                    c["short"] += 1
+                continue
             with lock:
                 c["done"] += 1
 
@@ -91,10 +113,15 @@ def run_poc_pipeline(url, target, model, seq_len, max_tokens, duration, warmup):
     if warmup:
         phase(warmup)
     with lock:
-        c["done"] = 0
+        c["done"] = c["errors"] = c["short"] = 0
     t0 = time.monotonic()
     phase(duration)
     elapsed = time.monotonic() - t0
+    # Loud, not silent: a run that mostly failed (or returned short trajectories) must not
+    # report a plausible-looking throughput number.
+    if c["errors"] or c["short"]:
+        print(f"  [WARNING] {c['errors']} request errors, {c['short']} SHORT trajectories "
+              f"(expected {max_tokens + 1} steps) — excluded from throughput")
     return c["done"], c["done"] * (max_tokens + 1), elapsed
 
 

@@ -69,7 +69,12 @@ def main():
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     meta = {"model": a.model, "seq_len": a.seq_len, "max_tokens": a.max_tokens,
-            "duration": a.duration, "prefix_caching": "off (required)", "rows": rows}
+            "duration": a.duration,
+            # NOT verified from the server — this script drives a pre-booted --url server, so
+            # prefix caching is whoever typed the boot command's responsibility. Recording a
+            # flat "off" here would be a provenance claim we never checked.
+            "prefix_caching": "unverified (boot flag; MUST be --no-enable-prefix-caching)",
+            "rows": rows}
     out.with_suffix(".json").write_text(json.dumps(meta, indent=2))
     out.with_suffix(".csv").write_text(
         "concurrency,poc_req_min,chat_req_min,poc_over_chat\n" +

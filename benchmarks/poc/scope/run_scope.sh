@@ -69,8 +69,13 @@ boot(){ # model profile [max_model_len]  -> boot one server (own process group);
         # seq_len+max_tokens (<=320) so default 1024; GSM passes a bigger value for its long prompts.
   local model="$1" prof="$2" mml="${3:-1024}"; local lg="$OUT/serve_$(slug "$model")_$prof.log"
   local vart=""; [ "$VECART" = 1 ] && vart="--poc-vector-artifacts"   # windowed continuous vectors (64x32)
+  # --no-enable-prefix-caching: PoC nonces prefill unique seeded vectors and can NEVER hit the
+  # prefix cache; leaving it on (vLLM defaults it ON) lets the chat baseline reuse cached
+  # prefills PoC structurally cannot -> the perf experiment stops being apples-to-apples and
+  # overstates PoC overhead. Must be set here: op_perf drives this server via --url, which
+  # bypasses DEFAULT_POC_SERVE_ARGS in poc_validation.deploy().
   ( cd /tmp && exec setsid env VLLM_POC_MARGIN_TAU="$MTAU" "$PY" -m vllm.entrypoints.openai.api_server --model "$model" --port "$PORT" \
-      --poc-decode --gpu-memory-utilization "$GMU" --max-model-len "$mml" --tensor-parallel-size "$TP" --trust-remote-code \
+      --poc-decode --no-enable-prefix-caching --gpu-memory-utilization "$GMU" --max-model-len "$mml" --tensor-parallel-size "$TP" --trust-remote-code \
       $vart $EXTRA $(prof_args "$prof") ) > "$lg" 2>&1 &
   SRV_PID=$!
   for i in $(seq 1 100); do
