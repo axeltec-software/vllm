@@ -450,16 +450,28 @@ def build_unified_mixed_batch_inputs(
     # whole nonce-batch (per-row identical to the old per-nonce calls).
     if decode_embed_jobs:
         from vllm.poc.gpu_random import generate_decode_inputs_gpu, pinned_to_device
-        base_seeds = torch.cat([j[0].base_seeds for j in decode_embed_jobs])  # [B]
-        prev_k = torch.cat([j[0].prev_k_t for j in decode_embed_jobs])        # [B]
-        # sync-free host->device (pinned, non_blocking): direct torch.tensor(list,
-        # device=cuda) blocks on the forward every step (see pinned_to_device).
-        steps = pinned_to_device([j[1] for j in decode_embed_jobs], torch.int64, runner.device)
-        embeds = generate_decode_inputs_gpu(
-            base_seeds, prev_k, steps,
-            dim=hidden_size, device=runner.device, dtype=runner.dtype)  # [B, 1, H]
-        offs = pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device)
-        unified_embeds.index_copy_(0, offs, embeds[:, 0])   # [B, H] -> rows offs
+        _nat = getattr(runner, "_poc_native", None)
+        if _nat is not None and getattr(_nat, "embed_base", None) is not None:
+            # SYNTH = EMBEDDING: publish per-row (base, prev_k, step); the embedding
+            # wrapper synths input[step] in-graph. No eager RNG, no [B,H] embed copy.
+            n_rows = unified_embeds.shape[0]
+            row_base = torch.zeros(n_rows, dtype=torch.int64, device=runner.device)
+            row_prev_k = torch.full((n_rows,), -1, dtype=torch.int64, device=runner.device)
+            row_step = torch.zeros(n_rows, dtype=torch.int64, device=runner.device)
+            offs = pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device)
+            row_base.index_copy_(0, offs, torch.cat([j[0].base_seeds for j in decode_embed_jobs]))
+            row_prev_k.index_copy_(0, offs, torch.cat([j[0].prev_k_t for j in decode_embed_jobs]))
+            row_step.index_copy_(0, offs, pinned_to_device([j[1] for j in decode_embed_jobs], torch.int64, runner.device))
+            _nat.set_decode_chain(row_base, row_prev_k, row_step)
+        else:
+            base_seeds = torch.cat([j[0].base_seeds for j in decode_embed_jobs])  # [B]
+            prev_k = torch.cat([j[0].prev_k_t for j in decode_embed_jobs])        # [B]
+            steps = pinned_to_device([j[1] for j in decode_embed_jobs], torch.int64, runner.device)
+            embeds = generate_decode_inputs_gpu(
+                base_seeds, prev_k, steps,
+                dim=hidden_size, device=runner.device, dtype=runner.dtype)  # [B, 1, H]
+            offs = pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device)
+            unified_embeds.index_copy_(0, offs, embeds[:, 0])   # [B, H] -> rows offs
 
     return unified_embeds, unified_positions, poc_position_mask, poc_metadata
 
@@ -570,7 +582,23 @@ def process_poc_outputs_from_hidden(
         # ~1e-7 cuBLAS fp-noise, ~1e4x below the τ gate (harmless to the verdict).
         from torch.autograd.profiler import record_function
         _tail_mgr = getattr(runner, "_poc_tail_graph_mgr", None)
-        if _tail_mgr is not None and _tail_mgr.ready:
+        _nat = getattr(runner, "_poc_native", None)
+        _snap_active = (_nat is not None and getattr(_nat, "snap_k", None) is not None
+                        and getattr(_nat, "embed_base", None) is not None)
+        if _snap_active:
+            with record_function("poc_snap_in_forward"):
+                # SNAP = SAMPLING: the final-norm wrapper already snapped every row
+                # IN-GRAPH this forward; just index_select the decode rows. No tail-
+                # graph feed (4 index_copy_/step), no separate replay. Same math/inputs
+                # as the tail (embed_* == decode_state), so artifacts are identical.
+                rows = pinned_to_device(
+                    [m['start_idx'] + m['length'] - 1 for m in decode_metas],
+                    torch.long, device)
+                k_all = _nat.snap_k.index_select(0, rows)
+                bad_all = _nat.snap_bad.index_select(0, rows)
+                margin_all = _nat.snap_margin.index_select(0, rows)
+                q_all = _nat.snap_q.index_select(0, rows)
+        elif _tail_mgr is not None and _tail_mgr.ready:
             with record_function("poc_tail_graph_path"):
                 k_all, bad_all, margin_all, q_all = _tail_mgr.run(hidden_states, decode_metas)
         else:

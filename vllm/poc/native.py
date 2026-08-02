@@ -100,11 +100,20 @@ class PoCEmbeddingWrapper(nn.Module):
     IDs so the graphed input_ids path runs; this injects the real PoC embeds INSIDE
     the graph. Chat rows keep their token embeds (mask False)."""
 
-    def __init__(self, inner: nn.Module, embeds: torch.Tensor, mask: torch.Tensor):
+    def __init__(self, inner: nn.Module, embeds: torch.Tensor, mask: torch.Tensor,
+                 embed_base: torch.Tensor = None, embed_prev_k: torch.Tensor = None,
+                 embed_step: torch.Tensor = None, hidden_size: int = 0):
         super().__init__()
         self.inner = inner
+        self.hidden_size = hidden_size
         self.register_buffer("poc_embeds", embeds, persistent=False)
         self.register_buffer("poc_mask", mask, persistent=False)
+        # SYNTH = EMBEDDING (in-graph): synth the decode input from the chain buffers.
+        self._synth = embed_base is not None
+        if self._synth:
+            self.register_buffer("embed_base", embed_base, persistent=False)
+            self.register_buffer("embed_prev_k", embed_prev_k, persistent=False)
+            self.register_buffer("embed_step", embed_step, persistent=False)
 
     def forward(self, input_ids):
         # PoC rows carry a dummy token id whose embedding is overridden below, but
@@ -117,7 +126,54 @@ class PoCEmbeddingWrapper(nn.Module):
         input_ids = torch.where(m_rows, torch.zeros_like(input_ids), input_ids)
         out = self.inner(input_ids)
         m = m_rows.unsqueeze(-1)
-        return torch.where(m, self.poc_embeds[:n].to(out.dtype), out)
+        if not self._synth:
+            return torch.where(m, self.poc_embeds[:n].to(out.dtype), out)
+        # DECODE rows: synth input[step] IN-GRAPH from (base, prev_k, step) — the SAME
+        # derivation as gpu_random.generate_decode_inputs_gpu, so byte-identical, but
+        # it rides the captured forward (no eager RNG on the host between steps).
+        # prev_k<0 rows (prefill) fall back to the pre-filled embed.
+        from vllm.poc.gpu_random import (
+            _step_seeds, _batched_normal_t, _SALT_DECODE_EMBED)
+        seeds = _step_seeds(self.embed_base[:n], self.embed_step[:n],
+                            self.embed_prev_k[:n], _SALT_DECODE_EMBED)
+        dec = _batched_normal_t(seeds, self.hidden_size, out.device).to(out.dtype)
+        is_dec = (self.embed_prev_k[:n] >= 0).unsqueeze(-1)
+        poc_e = torch.where(is_dec, dec, self.poc_embeds[:n].to(out.dtype))
+        return torch.where(m, poc_e, out)
+
+
+class PoCSnapWrapper(nn.Module):
+    """Wraps the model's FINAL norm. Runs it, then SNAPS the normed last hidden ->
+    sphere_k IN-GRAPH for every row (PoC's 'sampler'), reusing the embed_* seed
+    buffers + codebook and writing per-row k/bad/margin/q to the state's snap_*
+    buffers. Returns the norm output unchanged so the LM head still runs. The runner
+    index_selects the decode rows post-forward — replacing the separate eager
+    PoCTailGraphManager (no per-step index_copy_ feed, no extra graph replay)."""
+
+    def __init__(self, inner: nn.Module, state):
+        super().__init__()
+        self.inner = inner
+        self._st = state
+
+    def forward(self, *args, **kwargs):
+        out = self.inner(*args, **kwargs)
+        h = out[0] if isinstance(out, tuple) else out
+        st = self._st
+        n = h.shape[0]
+        from vllm.poc.gpu_random import random_pick_indices_gpu
+        from vllm.poc.sphere import project_to_sphere, snap_with_margin
+        lh = h.float()
+        lh = lh / (lh.norm(dim=-1, keepdim=True) + 1e-8)
+        sph = random_pick_indices_gpu(
+            st.embed_base[:n], st.embed_prev_k[:n], st.embed_step[:n],
+            st.hidden_size, st.sphere_dim, h.device)
+        q = project_to_sphere(torch.gather(lh, 1, sph))
+        k_all, bad_all, margin_all = snap_with_margin(q, st.codebook)
+        st.snap_k[:n].copy_(k_all)
+        st.snap_bad[:n].copy_(bad_all)
+        st.snap_margin[:n].copy_(margin_all)
+        st.snap_q[:n].copy_(q)
+        return out
 
 
 class PoCRouterWrapper(nn.Module):
@@ -206,12 +262,40 @@ class PoCNativeState:
         self._route_base: list = []                 # per-layer [max_tokens] int64 sha256 base (cached)
         self._base_key: tuple | None = None         # (hashes,nonces) the base was built for
         self._last_route_key: tuple | None = None   # skip refresh if (hashes,nonces,steps) unchanged
+        # PoC-as-a-sampler, part 1: SYNTH = EMBEDDING. The next decode input is the
+        # "embedding" of the sampled sphere_k — synthesized IN-GRAPH in the embedding
+        # wrapper from these per-row buffers, so it rides vLLM's standard per-step
+        # flow with ~zero eager CPU (like chat's token->embed). prev_k<0 = non-decode.
+        self.embed_base = torch.zeros(max_tokens, dtype=torch.int64, device=device)
+        self.embed_prev_k = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
+        self.embed_step = torch.zeros(max_tokens, dtype=torch.int64, device=device)
+        # PoC-as-a-sampler, part 2: SNAP = SAMPLING. A wrapper on the final norm snaps
+        # the last hidden -> sphere_k IN-GRAPH (reusing the embed_* seed buffers + the
+        # codebook), writing per-row k/bad/margin/q here. The runner index_selects the
+        # decode rows post-forward — no separate tail-graph feed (4 index_copy_/step).
+        from .sphere import SPHERE_DIM, get_sphere_codebook
+        self.sphere_dim = SPHERE_DIM
+        self.snap_k = torch.zeros(max_tokens, dtype=torch.int64, device=device)
+        self.snap_bad = torch.zeros(max_tokens, dtype=torch.bool, device=device)
+        self.snap_margin = torch.zeros(max_tokens, dtype=torch.float32, device=device)
+        self.snap_q = torch.zeros(max_tokens, SPHERE_DIM, dtype=torch.float32, device=device)
+        self.codebook = get_sphere_codebook().to(device=device).float().contiguous()
 
     def set_embeds(self, row_embeds: torch.Tensor) -> None:
         """Write the PoC rows' input embeds into the buffer (in place)."""
         n = row_embeds.shape[0]
         self.embeds[:n].copy_(row_embeds)
         _assert_replicated_across_tp(self.embeds[:n], "embeds")
+
+    def set_decode_chain(self, row_base: torch.Tensor, row_prev_k: torch.Tensor,
+                         row_step: torch.Tensor) -> None:
+        """Publish per-row (base, prev_k, step) so the embedding wrapper synths the
+        decode input IN-GRAPH (like set_routing does for the router). Cheap [n]
+        uploads; rows with prev_k<0 are non-decode (prefill/chat)."""
+        n = row_prev_k.shape[0]
+        self.embed_base[:n].copy_(row_base)
+        self.embed_prev_k[:n].copy_(row_prev_k)
+        self.embed_step[:n].copy_(row_step)
 
     # Device-side cache bound: per-nonce seeding adds one entry per (block_hash,
     # nonce), so a 128-nonce round is ~128 entries. Entries are stored in the
@@ -330,7 +414,11 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
         layers[i] = PoCLayerWrapper(layer, state.vectors[i], state.mask)
     if embed_owner is not None and hasattr(embed_owner, "embed_tokens"):
         embed_owner.embed_tokens = PoCEmbeddingWrapper(
-            embed_owner.embed_tokens, state.embeds, state.mask)
+            embed_owner.embed_tokens, state.embeds, state.mask,
+            state.embed_base, state.embed_prev_k, state.embed_step, hidden_size)
+    # SNAP = SAMPLING: wrap the final norm so PoC's snap rides the captured forward.
+    if embed_owner is not None and hasattr(embed_owner, "norm"):
+        embed_owner.norm = PoCSnapWrapper(embed_owner.norm, state)
     # Seeded-routing is MANDATORY for MoE — part of the PoC algorithm, not a toggle.
     # Natural MoE top-k reads the noise-prone hidden, so cross-HW/backend drift flips
     # the k-th expert and inflates the honest floor; seeding the experts from

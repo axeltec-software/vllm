@@ -156,15 +156,14 @@ def generate_inputs(
     device: torch.device,
     dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    """Generate deterministic input embeddings for PoC."""
-    batch_size = len(nonces)
-    result = torch.empty(batch_size, seq_len, dim, device=device, dtype=dtype)
-    for i, nonce in enumerate(nonces):
-        seed_str = f"{block_hash}_{public_key}_nonce{nonce}"
-        seed = _seed_from_string(seed_str)
-        normal = _normal(seed, seq_len * dim, device)
-        result[i] = normal.view(seq_len, dim).to(dtype)
-    return result
+    """Generate deterministic input embeddings for PoC.
+
+    Batched: ONE _batched_normal over all nonces instead of a serial per-nonce
+    Python loop (which was ~B sequential big RNGs on the prefill critical path).
+    Per-row identical to the old loop (same seed -> same murmur -> same normals)."""
+    seeds = [_seed_from_string(f"{block_hash}_{public_key}_nonce{n}") for n in nonces]
+    normals = _batched_normal(seeds, seq_len * dim, device)  # [B, seq_len*dim]
+    return normals.view(len(nonces), seq_len, dim).to(dtype)
 
 
 def generate_inputs_concat_murmur(
