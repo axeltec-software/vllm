@@ -3932,9 +3932,6 @@ class GPUModelRunner(
                 # here means "the batch contains PoC rows" (chat may or may not be
                 # present too).
                 is_mixed_batch = bool(poc_requests)
-
-                logger.debug(f"Batch detection: poc_reqs={len(poc_requests)}, "
-                            f"chat_reqs={len(chat_requests)}, mixed={is_mixed_batch}")
             else:
                 poc_requests = []
                 chat_requests = list(self.requests.values())
@@ -4141,8 +4138,6 @@ class GPUModelRunner(
             poc_metadata = None
 
             if is_mixed_batch and poc_req_ids and get_pp_group().is_first_rank:
-                logger.info(f"MIXED BATCH: {num_scheduled_tokens} total tokens, "
-                           f"{len(poc_req_ids)} PoC requests - preserving scheduler order")
                 (
                     unified_embeds,
                     unified_positions,
