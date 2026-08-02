@@ -175,9 +175,11 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
-    poc_max_batch_size: int = Field(default=32, gt=0)
+    poc_max_batch_size: int = Field(default=0, ge=0)
     """Maximum number of PoC (Proof of Compute) nonces processed in a single
-    forward pass. Caps the per-step PoC batch; extra nonces defer."""
+    forward pass. 0 = AUTO: resolved to max_num_seqs in VllmConfig.__post_init__,
+    so PoC scales with the machine's own concurrency limit (a fixed cap here would
+    throttle PoC below what the box can serve for inference). Set >0 to override."""
 
     poc_seq_len: int = Field(default=256, gt=0)
     """Input sequence length for PoC forward passes. Must match the seq_len

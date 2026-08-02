@@ -177,6 +177,14 @@ def poc_share_budget(poc_share: float, token_budget: int) -> int:
     return int(poc_share * token_budget)
 
 
+def resolve_poc_max_batch_size(configured: int, max_num_seqs: int) -> int:
+    """The per-step PoC nonce cap. `configured` == 0 means AUTO -> use the engine's
+    own concurrency limit (max_num_seqs), so PoC fills the batch like inference does
+    instead of being pinned to a fixed constant that throttles it on bigger machines.
+    Any explicit >0 value is honored verbatim. Pure (unit-testable)."""
+    return max_num_seqs if configured == 0 else configured
+
+
 def poc_alloc_footprint(poc_params, num_new_tokens: int) -> int:
     """Dynamic-KV blocks to allocate: the pure path runs the whole decode loop in
     one step so it allocates seq_len+max_tokens upfront; the mixed path allocates
@@ -574,14 +582,11 @@ def process_poc_outputs_from_hidden(
     if decode_metas:
         device = runner.device
         H = hidden_states.shape[-1]
-        # Post-forward sphere-snap tail. When the tail CUDA graph is captured
-        # (POC_TAIL_CUDAGRAPH=1), it replaces this whole block with ONE graph replay
-        # over stable slot buffers — collapsing the per-step kernel launches that
-        # dominate this eager path (see vllm/poc/tail_cudagraph.py). Artifacts
-        # (k trajectory / q vector / bad) are byte-identical to eager; margin carries
-        # ~1e-7 cuBLAS fp-noise, ~1e4x below the τ gate (harmless to the verdict).
+        # Post-forward sphere-snap. The final-norm wrapper snapped every row IN-GRAPH
+        # this forward, so we just index_select the decode rows (no per-step eager
+        # tail). The eager path below is the fallback for models without native PoC
+        # wrappers (_snap_active False).
         from torch.autograd.profiler import record_function
-        _tail_mgr = getattr(runner, "_poc_tail_graph_mgr", None)
         _nat = getattr(runner, "_poc_native", None)
         _snap_active = (_nat is not None and getattr(_nat, "snap_k", None) is not None
                         and getattr(_nat, "embed_base", None) is not None)
@@ -598,9 +603,6 @@ def process_poc_outputs_from_hidden(
                 bad_all = _nat.snap_bad.index_select(0, rows)
                 margin_all = _nat.snap_margin.index_select(0, rows)
                 q_all = _nat.snap_q.index_select(0, rows)
-        elif _tail_mgr is not None and _tail_mgr.ready:
-            with record_function("poc_tail_graph_path"):
-                k_all, bad_all, margin_all, q_all = _tail_mgr.run(hidden_states, decode_metas)
         else:
             with record_function("poc_tail_eager_path"):
                 # sync-free host->device: hidden[py_list] and torch.tensor(list, device=cuda)

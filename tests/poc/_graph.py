@@ -48,44 +48,6 @@ def count_graph_launches(trace_path: str) -> int:
                if isinstance(e, dict) and "cudaGraphLaunch" in str(e.get("name", "")))
 
 
-def count_tail_graph_launches(trace_path: str) -> int:
-    """Number of cudaGraphLaunch events specifically attributable to the
-    decode-PoC post-processing-tail graph (vllm/poc/tail_cudagraph.py), as
-    opposed to the main model-forward graph.
-
-    ``count_graph_launches`` alone can't tell these apart — the model forward
-    is graphed too (via the native inline reflection wrappers), so a nonzero
-    total proves SOME graph replayed during a PoC request, not specifically
-    that the tail is. PoCTailGraphManager.run() wraps its ``graph.replay()``
-    call in a ``record_function(POC_TAIL_GRAPH_REPLAY_LABEL)`` span; this
-    counts cudaGraphLaunch events whose timestamp falls inside that span, on
-    the same thread (both are 'X'-phase complete events with ts+dur in the
-    Chrome trace format)."""
-    from vllm.poc.tail_cudagraph import POC_TAIL_GRAPH_REPLAY_LABEL
-
-    events = load_trace_events(trace_path)
-    spans = [
-        (e["ts"], e["ts"] + e.get("dur", 0), e.get("tid"))
-        for e in events
-        if isinstance(e, dict) and e.get("name") == POC_TAIL_GRAPH_REPLAY_LABEL
-        and e.get("ph") == "X"
-    ]
-    if not spans:
-        return 0
-    count = 0
-    for e in events:
-        if not (isinstance(e, dict) and "cudaGraphLaunch" in str(e.get("name", ""))):
-            continue
-        ts, tid = e.get("ts"), e.get("tid")
-        if ts is None:
-            continue
-        for start, end, span_tid in spans:
-            if span_tid == tid and start <= ts <= end:
-                count += 1
-                break
-    return count
-
-
 def profile_poc_request(server_extra_args=None, max_tokens: int = 8,
                         prof_dir: str = "/tmp/poc_prof", cgmode: str | None = None):
     """Boot a PoC server with the torch profiler, run ONE PoC request under

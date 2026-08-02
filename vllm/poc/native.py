@@ -147,8 +147,8 @@ class PoCSnapWrapper(nn.Module):
     sphere_k IN-GRAPH for every row (PoC's 'sampler'), reusing the embed_* seed
     buffers + codebook and writing per-row k/bad/margin/q to the state's snap_*
     buffers. Returns the norm output unchanged so the LM head still runs. The runner
-    index_selects the decode rows post-forward — replacing the separate eager
-    PoCTailGraphManager (no per-step index_copy_ feed, no extra graph replay)."""
+    index_selects the decode rows post-forward — no per-step index_copy_ feed, no
+    separate tail graph replay (this in-graph snap replaced the old eager tail)."""
 
     def __init__(self, inner: nn.Module, state):
         super().__init__()

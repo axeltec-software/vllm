@@ -7,7 +7,7 @@ counts would collapse. The trace `cudaGraphLaunch` count is the objective signal
 """
 import pytest
 
-from tests.poc._graph import count_tail_graph_launches, profile_poc_request
+from tests.poc._graph import profile_poc_request
 
 
 @pytest.mark.integration
@@ -18,28 +18,6 @@ def test_decode_runs_through_cudagraph():
     assert total > 0, (
         f"decode PoC ran with ZERO cudaGraphLaunch — not graphed (got {total}). "
         f"PoC fell off vLLM's captured-graph path.")
-
-
-@pytest.mark.integration
-@pytest.mark.skip(reason="tail-graph live replay is shelved: not a net win (bottleneck "
-                         "is input prep, not the snap) and it can't produce the margin/"
-                         "q-vectors the margin gate + vector channel need. Re-enable with "
-                         "POC_TAIL_CUDAGRAPH=1 once the tail is reworked — see "
-                         "benchmarks/poc/CUDAGRAPH_POC_TAIL_STEPS.md.")
-def test_decode_poc_tail_runs_through_its_own_cudagraph():
-    """A nonzero total (above) only proves SOME graph replayed during a PoC
-    request — the model forward is graphed via the native inline reflection
-    path regardless of the post-processing tail (vllm/poc/tail_cudagraph.py).
-    This asserts the tail graph SPECIFICALLY replayed, closing the coverage
-    gap CUDAGRAPH_POC_TAIL_STEPS.md flagged: attribute cudaGraphLaunch events
-    to the tail graph via its record_function-labeled replay span."""
-    total, traces = profile_poc_request(max_tokens=16, prof_dir="/tmp/poc_prof_cg_tail")
-    assert traces, "no profiler trace produced (VLLM_TORCH_PROFILER_DIR unsupported?)"
-    tail_total = sum(count_tail_graph_launches(t) for t in traces)
-    assert tail_total > 0, (
-        f"decode PoC's post-processing tail ran with ZERO cudaGraphLaunch "
-        f"attributable to PoCTailGraphManager (got {tail_total} of {total} total "
-        f"launches) — the tail fell back to eager (or was never captured).")
 
 
 @pytest.mark.integration
