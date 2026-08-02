@@ -30,8 +30,8 @@ from poc_validation import (  # noqa: E402
 )
 
 DEFAULT_MODEL = "RedHatAI/Qwen2.5-7B-Instruct-quantized.w8a16"
-BATCH = 32  # production: ML-node default batch_size + --poc-max-batch-size cap;
-            # also the chat concurrency, so req/min lines up with nonce/min.
+BATCH = 32  # concurrency = PoC nonces-in-flight = chat concurrent requests, so
+            # req/min lines up with nonce/min. Override with --concurrency (batch sweep).
 
 
 def run_poc(url, target, model, seq_len, max_tokens, duration, warmup):
@@ -237,6 +237,7 @@ def _save_path(stem, mode, multi):
 
 
 def main():
+    global BATCH
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["poc", "chat", "both"], default="poc")
@@ -250,12 +251,15 @@ def main():
                     help="pipeline=32 continuous single-nonce workers, NO gap, "
                          "apples-to-apples with chat (default). serial=one 32-nonce "
                          "request then wait (production load; has an inter-batch gap).")
+    ap.add_argument("--concurrency", type=int, default=BATCH,
+                    help="nonces-in-flight = chat concurrent requests (batch sweep knob).")
     ap.add_argument("--split", action="store_true",
                     help="report prefill vs decode/step separately (concurrency-1, "
                          "wall-clock, max_tokens=1 vs --max-tokens). Direct, no throughput fit.")
     ap.add_argument("--split-samples", type=int, default=5)
     ap.add_argument("--save")
     a = ap.parse_args()
+    BATCH = a.concurrency                        # so req/min == nonce/min at this batch
 
     modes = ["poc", "chat"] if a.mode == "both" else [a.mode]
     with deploy_from_args(a, a.model) as (url, srv):  # one server lifetime for all modes
