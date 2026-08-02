@@ -98,31 +98,43 @@ def run_poc_pipeline(url, target, model, seq_len, max_tokens, duration, warmup):
     return c["done"], c["done"] * (max_tokens + 1), elapsed
 
 
-async def _chat_one(client, url, model, max_tokens, idx):
+def _chat_prompt(prompt_len, idx):
+    """Raw prompt of ~prompt_len tokens, UNIQUE per request (leading idx) so
+    concurrent workers never share a prefix-cache hit that would fake-cheapen the
+    prefill — matching PoC, where every nonce prefills its own vector. Uses raw
+    /v1/completions (NOT chat), so there is no chat-template overhead: token count
+    == prompt_len, aligned 1:1 with PoC's seq_len prefill (apples-to-apples)."""
+    n = max(1, prompt_len - 1)
+    return f"{idx} " + "word " * n            # "word" == 1 token -> ~prompt_len tokens
+
+
+async def _chat_one(client, url, model, max_tokens, idx, prompt_len):
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": f"Write a long detailed essay about topic number {idx}."}],
+        "prompt": _chat_prompt(prompt_len, idx),   # raw completions: no chat template
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "ignore_eos": True,  # force exactly max_tokens decode steps (fair tok/s)
     }
-    r = await client.post(f"{url}/v1/chat/completions", json=body)
+    r = await client.post(f"{url}/v1/completions", json=body)
     r.raise_for_status()
-    return r.json().get("usage", {}).get("completion_tokens", 0)
+    u = r.json().get("usage", {})
+    return u.get("completion_tokens", 0), u.get("prompt_tokens", 0)
 
 
-async def _run_chat(url, model, max_tokens, duration, warmup, concurrency):
+async def _run_chat(url, model, max_tokens, duration, warmup, concurrency, prompt_len):
     import httpx
-    counters = {"req": 0, "tok": 0, "idx": 0}
+    counters = {"req": 0, "tok": 0, "idx": 0, "ptok": 0}
 
     async def worker(client, deadline):
         while time.monotonic() < deadline:
             i = counters["idx"]; counters["idx"] += 1
-            tok = await _chat_one(client, url, model, max_tokens, i)
-            counters["req"] += 1; counters["tok"] += tok
+            tok, ptok = await _chat_one(client, url, model, max_tokens, i, prompt_len)
+            counters["req"] += 1; counters["tok"] += tok; counters["ptok"] = ptok
 
     async with httpx.AsyncClient(timeout=600) as client:
-        await asyncio.gather(*[_chat_one(client, url, model, 8, -1) for _ in range(concurrency)])  # warmup
+        await asyncio.gather(*[_chat_one(client, url, model, 8, -1 - k, prompt_len)
+                               for k in range(concurrency)])  # warmup (unique idx)
         if warmup:
             wend = time.monotonic() + warmup
             await asyncio.gather(*[worker(client, wend) for _ in range(concurrency)])
@@ -130,11 +142,68 @@ async def _run_chat(url, model, max_tokens, duration, warmup, concurrency):
         t0 = time.monotonic(); deadline = t0 + duration
         await asyncio.gather(*[worker(client, deadline) for _ in range(concurrency)])
         elapsed = time.monotonic() - t0
+    print(f"  [chat prefill: prompt_tokens={counters['ptok']}]")
     return counters["req"], counters["tok"], elapsed
 
 
-def run_chat(url, model, max_tokens, duration, warmup):
-    return asyncio.run(_run_chat(url, model, max_tokens, duration, warmup, BATCH))
+def run_chat(url, model, max_tokens, duration, warmup, seq_len):
+    return asyncio.run(_run_chat(url, model, max_tokens, duration, warmup, BATCH, seq_len))
+
+
+def _time_poc_once(url, target, model, seq_len, max_tokens, nonce):
+    t0 = time.monotonic()
+    request_generate(url, target=target, model=model, nonces=[nonce],
+                     seq_len=seq_len, max_tokens=max_tokens)
+    return time.monotonic() - t0
+
+
+def _chat_stream(url, model, seq_len, max_tokens, idx):
+    """Streamed chat completion -> (ttft_s, total_s). TTFT = wall time to the FIRST
+    streamed token = prefill cost (direct). total-ttft over the rest = decode."""
+    import httpx
+    body = {"model": model, "prompt": _chat_prompt(seq_len, idx), "max_tokens": max_tokens,
+            "temperature": 0.0, "ignore_eos": True, "stream": True}
+    t0 = time.monotonic(); ttft = None; last = t0
+    with httpx.stream("POST", f"{url}/v1/completions", json=body, timeout=600) as r:
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if not line.startswith("data:") or line.strip() == "data: [DONE]":
+                continue
+            now = time.monotonic()
+            if ttft is None:
+                ttft = now - t0
+            last = now
+    return ttft, last - t0
+
+
+def run_split(mode, url, target, model, seq_len, decode_steps, samples=5):
+    """DIRECT prefill/decode split — concurrency 1, wall-clock, NO Little's-law / no
+    regression fit. Prefill and decode are measured directly, per mode:
+      chat: STREAM one request -> prefill = TTFT (time to first token);
+            decode/step = (total - TTFT) / (decode_steps - 1).
+      poc:  /generate can't stream, so prefill = a max_tokens=0 (prefill-only) request;
+            decode/step = (t[decode_steps] - t[prefill-only]) / decode_steps.
+    Median over `samples` (unique nonce/idx each -> no cache reuse)."""
+    import statistics
+    if mode == "poc":
+        def prefill_i(i): return _time_poc_once(url, target, model, seq_len, 0, 100000 + i)
+        def full_i(i):    return _time_poc_once(url, target, model, seq_len, decode_steps, 200000 + i)
+        _time_poc_once(url, target, model, seq_len, decode_steps, 1)     # warmup
+        pf = statistics.median([prefill_i(i) for i in range(samples)])
+        fu = statistics.median([full_i(i) for i in range(samples)])
+        per_step = (fu - pf) / decode_steps
+        return {"mode": mode, "prefill_ms": round(pf * 1000, 1),
+                "decode_ms_per_step": round(per_step * 1000, 3),
+                "seq_len": seq_len, "decode_steps": decode_steps}
+    # chat: streaming TTFT
+    _chat_stream(url, model, seq_len, decode_steps, 1)                   # warmup
+    ttfts, decs = [], []
+    for i in range(samples):
+        ttft, total = _chat_stream(url, model, seq_len, decode_steps, 100000 + i)
+        ttfts.append(ttft); decs.append((total - ttft) / max(1, decode_steps - 1))
+    return {"mode": mode, "prefill_ms": round(statistics.median(ttfts) * 1000, 1),
+            "decode_ms_per_step": round(statistics.median(decs) * 1000, 3),
+            "seq_len": seq_len, "decode_steps": decode_steps}
 
 
 def _results(mode, total_req, work, elapsed, max_tokens):
@@ -181,18 +250,31 @@ def main():
                     help="pipeline=32 continuous single-nonce workers, NO gap, "
                          "apples-to-apples with chat (default). serial=one 32-nonce "
                          "request then wait (production load; has an inter-batch gap).")
+    ap.add_argument("--split", action="store_true",
+                    help="report prefill vs decode/step separately (concurrency-1, "
+                         "wall-clock, max_tokens=1 vs --max-tokens). Direct, no throughput fit.")
+    ap.add_argument("--split-samples", type=int, default=5)
     ap.add_argument("--save")
     a = ap.parse_args()
 
     modes = ["poc", "chat"] if a.mode == "both" else [a.mode]
     with deploy_from_args(a, a.model) as (url, srv):  # one server lifetime for all modes
+        if a.split:
+            print(f"# prefill/decode split (concurrency 1, prefill={a.seq_len} tok, "
+                  f"decode={a.max_tokens} steps, median of {a.split_samples})")
+            for mode in modes:
+                s = run_split(mode, url, a.target, a.model, a.seq_len, a.max_tokens, a.split_samples)
+                src = "TTFT stream" if mode == "chat" else "max_tokens=0"
+                print(f"{mode:4s}: prefill={s['prefill_ms']:8.1f} ms ({src})   "
+                      f"decode={s['decode_ms_per_step']:6.3f} ms/step")
+            return
         for mode in modes:
             if mode == "poc":
                 poc_fn = run_poc_pipeline if a.poc_load == "pipeline" else run_poc
                 total, work, elapsed = poc_fn(url, a.target, a.model, a.seq_len,
                                               a.max_tokens, a.duration, a.warmup)
             else:
-                total, work, elapsed = run_chat(url, a.model, a.max_tokens, a.duration, a.warmup)
+                total, work, elapsed = run_chat(url, a.model, a.max_tokens, a.duration, a.warmup, a.seq_len)
             res = _results(mode, total, work, elapsed, a.max_tokens)
             if mode == "poc":
                 res["poc_load"] = a.poc_load   # serial (production) vs pipeline (fair)

@@ -100,7 +100,12 @@ def remote_config(url: str, want_backend: Optional[str], eager: bool) -> Dict[st
 POC_PREFIX = {"vllm": "/api/v1/pow", "mlnode": "/api/v1/inference/pow"}
 
 # vLLM serve flags PoC needs (used for both local boot and remote ML-node deploy).
-DEFAULT_POC_SERVE_ARGS = ["--poc-decode",
+# Prefix caching OFF: every PoC nonce prefills its OWN unique seeded vector, so PoC
+# can never hit the prefix cache. Leaving it on lets the chat baseline share prefixes
+# and get near-free prefills PoC structurally cannot -> the perf comparison stops being
+# apples-to-apples (it made chat look ~30% faster at 256+256, faking a PoC "overhead").
+# Off = both sides pay a real prefill -> the true, uncached cost.
+DEFAULT_POC_SERVE_ARGS = ["--poc-decode", "--no-enable-prefix-caching",
                           "--gpu-memory-utilization", "0.8", "--max-model-len", "1024"]
 
 # Named engine profiles (graph/eager, attention backend, env) live in poc_configs.json
