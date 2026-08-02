@@ -27,7 +27,13 @@ POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5
 POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
 POC_CHAT_BUSY_BACKOFF_SEC = 0.05
 POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
-POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "32"))
+# 0 = NO client-side chunking: submit every nonce at once and let the ENGINE batch them
+# (it caps the per-step PoC batch at poc_max_batch_size, which auto-scales to max_num_seqs).
+# A nonzero value chunks the submission and awaits each chunk SEQUENTIALLY, so it pins
+# in-flight nonces to that number regardless of what the engine can serve -- the old
+# hardcoded 32 throttled PoC to 32 concurrent sequences on every machine while inference
+# scaled to hundreds. Override only to deliberately limit concurrency.
+POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "0"))
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
 _poc_generation_active: bool = False
@@ -298,8 +304,14 @@ async def _generation_loop(
         group_id=config["group_id"],
         n_groups=config["n_groups"],
     )
+    # Continuous mining pulls a round of nonces per iteration. 0 = AUTO -> ask the ENGINE
+    # how many PoC sequences it can hold (poc_max_batch_size, auto-scaled to max_num_seqs)
+    # instead of a client-side constant, so a bigger machine mines a bigger round.
     batch_size = config["batch_size"]
-    
+    if not batch_size:
+        cc = getattr(getattr(engine_client, "vllm_config", None), "cache_config", None)
+        batch_size = getattr(cc, "poc_max_batch_size", 0) or 32
+
     start_time = time.time()
     stats["start_time"] = start_time
     stats["total_processed"] = 0
@@ -524,16 +536,18 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         await asyncio.sleep(0.1)
     
     total_nonces = len(body.nonces)
-    n_chunks = (total_nonces + body.batch_size - 1) // body.batch_size
+    _step = body.batch_size or total_nonces or 1   # 0 = submit all; engine batches
+    n_chunks = (total_nonces + _step - 1) // _step
     logger.info(f"PoC /generate: {total_nonces} nonces, batch_size={body.batch_size}, chunks={n_chunks}")
     
     start_time = time.time()
     computed_artifacts = []
     poc_decode = getattr(request.app.state, "poc_decode", False)
 
-    for i in range(0, total_nonces, body.batch_size):
-        chunk = body.nonces[i:i + body.batch_size]
-        chunk_idx = i // body.batch_size
+    step = body.batch_size or total_nonces   # 0 = one submission, engine does the batching
+    for i in range(0, total_nonces, step):
+        chunk = body.nonces[i:i + step]
+        chunk_idx = i // step
 
         def check_cancelled():
             return False

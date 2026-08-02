@@ -302,15 +302,20 @@ class GenerateQueue:
     async def _process_job(self, job: GenerateJob) -> Dict[str, Any]:
         """Process a single generate job."""
         total_nonces = len(job.nonces)
-        n_chunks = (total_nonces + job.batch_size - 1) // job.batch_size
+        # batch_size 0 = no client-side chunking: submit every nonce at once and let the
+        # ENGINE batch them (capped per step by poc_max_batch_size, which auto-scales to
+        # max_num_seqs). Chunking here awaits each chunk SEQUENTIALLY, pinning in-flight
+        # nonces to the chunk size no matter what the engine can serve.
+        step = job.batch_size or total_nonces
+        n_chunks = (total_nonces + step - 1) // step
         logger.info(f"PoC queue job {job.request_id[:8]}: {total_nonces} nonces, batch_size={job.batch_size}, chunks={n_chunks}")
-        
+
         start_time = time.time()
         computed_artifacts = []
-        
-        for i in range(0, total_nonces, job.batch_size):
-            chunk = job.nonces[i:i + job.batch_size]
-            chunk_idx = i // job.batch_size
+
+        for i in range(0, total_nonces, step):
+            chunk = job.nonces[i:i + step]
+            chunk_idx = i // step
 
             if self._stop_event.is_set():
                 raise RuntimeError("Job cancelled")
