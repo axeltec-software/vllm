@@ -76,8 +76,32 @@ def separation(recs):
         print(f"{_short(_config(meta),18):<18}  {_short(v,28):<28}  {_short(p,28):<28}  "
               f"{res['rate']*100:>7.3f}%  {str(fr):>6}  {('honest' if honest else 'fraud'):<7}  "
               f"{_gpu(meta,20):<20}{flag}")
-    print(f"\nSEPARATION: {'PASS' if ok else 'FAIL'}  "
-          f"(honest must be fraud=False, fraud must be fraud=True)")
+    print(f"\nfixed-threshold verdict: {'PASS' if ok else 'FAIL'}"
+          "  (server's inline `rate > p_mismatch`, default 0.1 — CRUDE:"
+          " p_mismatch is a request parameter, not a calibrated acceptance line)")
+
+    # The real separation measure: computed from the per-nonce scores, same math the
+    # vector channel uses (thresholds.py). AUC says whether honest and fraud are even
+    # separable; `recommend` reads the acceptance line off the data instead of assuming
+    # one. A fixed p_mismatch tuned for a coarse pair (INT4-vs-INT8 fraud lands ~34%)
+    # silently mislabels a subtle pair (FP8-vs-bf16 lands ~2%) — hence both are printed.
+    import thresholds
+    honest_s, fraud_s = [], []
+    for meta, res in vals:
+        honest = res.get("honest", res["validator_model"] == res["prover_model"])
+        for p in res.get("per_nonce") or []:
+            n = p.get("n_steps") or 0
+            if n:
+                (honest_s if honest else fraud_s).append(p.get("n_sphere_mismatches", 0) / n)
+    if honest_s and fraud_s:
+        a = thresholds.auc(honest_s, fraud_s)
+        rec = thresholds.recommend(honest_s, fraud_s)
+        print(f"per-nonce separation:    AUC={a:.3f} (1.0=separable, 0.5=indistinguishable)  "
+              f"worst-honest={max(honest_s)*100:.3f}%  best-fraud={min(fraud_s)*100:.3f}%"
+              + (f"  recommended-line={rec*100:.3f}%" if rec else ""))
+        if a is not None and a < 1.0:
+            print("  NOTE: honest and fraud OVERLAP per-nonce — no threshold separates them "
+                  "cleanly on this pair.")
 
 
 def gsm8k_table(recs):
