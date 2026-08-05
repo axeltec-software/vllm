@@ -283,7 +283,12 @@ def request_generate(
     seq_len: int = 256,
     max_tokens: int = 0,
     k_dim: int = 12,
-    batch_size: int = 32,
+    # 0 = let the ENGINE batch the whole nonce list (it caps per step at
+    # poc_max_batch_size, which auto-scales to max_num_seqs). A nonzero value makes the
+    # server chunk the submission and await each chunk SEQUENTIALLY -- the old default of
+    # 32 silently pinned in-flight nonces to 32 no matter what the box could serve, so a
+    # collect.py run with --nonces 64 executed as two serial waves.
+    batch_size: int = 0,
     enforced_k: Optional[Dict[int, List[int]]] = None,
     validation: Optional[List[Dict]] = None,
     dist_threshold: float = 0.02,

@@ -44,7 +44,7 @@ def cmd_generate(a):
     nps = len(nonces) / secs if secs else 0.0
     meta = {"role": "generate", "model": a.model, "seq_len": a.seq_len,
             "max_tokens": a.max_tokens, "k_dim": KDIM, "block_hash": BH, "public_key": PK,
-            "codebook_hash": CODEBOOK_HASH, "nonces": nonces, "batch_size": 32,
+            "codebook_hash": CODEBOOK_HASH, "nonces": nonces, "batch_size": 0,
             "per_nonce_reflection": a.per_nonce_reflection, **a.prov}
     save_run(a.save, meta, arts,
              results={"nonces_per_s": round(nps, 3), "steps_per_s": round(nps * (a.max_tokens + 1), 1),
@@ -75,7 +75,7 @@ def cmd_validate(a):
             "seq_len": seq, "max_tokens": mt, "k_dim": rmeta["k_dim"], "block_hash": rmeta["block_hash"],
             "public_key": rmeta["public_key"], "codebook_hash": rmeta.get("codebook_hash", CODEBOOK_HASH),
             "prover_gpu": rmeta.get("gpu"),  # HW the ref was generated on (cross-HW: != this validator's gpu)
-            "nonces": nonces, "batch_size": 32, "ref": a.ref,
+            "nonces": nonces, "batch_size": 0, "ref": a.ref,
             "prover_engine": rmeta.get("engine"), "prover_profile": rmeta.get("profile"), **a.prov}
     save_run(a.save, meta, resp.get("artifacts", []),
              results={"validator_model": a.model, "prover_model": rmeta["model"], "honest": honest,
@@ -97,7 +97,8 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--ref", help="validate: generated file supplying the k-trajectory")
     add_engine_args(ap)
-    # Defaults mirror production (vllm/config/cache.py): poc_max_batch_size=32,
+    # Defaults mirror production (vllm/config/cache.py): poc_max_batch_size=0 (AUTO ->
+    # max_num_seqs; it was a hardcoded 32, which throttled PoC on every machine),
     # poc_seq_len=256, poc_max_tokens=256. seq_len is PREFILL length only; decode
     # adds max_tokens on top, so the engine allocates seq_len+max_tokens KV upfront
     # (mixed_decode.py) and seq_len+max_tokens must stay <= --max-model-len (1024).

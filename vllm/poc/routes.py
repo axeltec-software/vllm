@@ -309,8 +309,17 @@ async def _generation_loop(
     # instead of a client-side constant, so a bigger machine mines a bigger round.
     batch_size = config["batch_size"]
     if not batch_size:
-        cc = getattr(getattr(engine_client, "vllm_config", None), "cache_config", None)
-        batch_size = getattr(cc, "poc_max_batch_size", 0) or 32
+        vc = getattr(engine_client, "vllm_config", None)
+        cc = getattr(vc, "cache_config", None)
+        sc = getattr(vc, "scheduler_config", None)
+        # poc_max_batch_size is resolved to max_num_seqs at startup; fall back to
+        # max_num_seqs itself rather than a constant, so an unreadable cache_config
+        # can never silently re-impose a fixed round size on a big machine.
+        batch_size = (getattr(cc, "poc_max_batch_size", 0)
+                      or getattr(sc, "max_num_seqs", 0))
+        if not batch_size:
+            logger.warning("PoC mining: engine config unreadable, defaulting round to 32")
+            batch_size = 32
 
     start_time = time.time()
     stats["start_time"] = start_time
