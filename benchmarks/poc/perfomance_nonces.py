@@ -156,12 +156,26 @@ async def _run_chat(url, model, max_tokens, duration, warmup, concurrency, promp
     async def worker(client, deadline):
         while time.monotonic() < deadline:
             i = counters["idx"]; counters["idx"] += 1
-            tok, ptok = await _chat_one(client, url, model, max_tokens, i, prompt_len)
+            try:
+                tok, ptok = await _chat_one(client, url, model, max_tokens, i, prompt_len)
+            except Exception:
+                continue   # transient ReadError under a full pool must not kill the run
             counters["req"] += 1; counters["tok"] += tok; counters["ptok"] = ptok
 
-    async with httpx.AsyncClient(timeout=600) as client:
+    # httpx defaults cap the pool at 100 connections, so above --concurrency 100
+    # the extra workers silently WAIT for a pooled connection: the engine never
+    # sees more than 100 in flight (metrics: running pins at exactly 100) while
+    # the tool reports the nominal concurrency. Limits must live ON the transport
+    # (a bare transport= would rebuild default limits and override client limits).
+    # retries + tolerant warmup absorb the transient ReadErrors a 256+ connection
+    # storm produces against a single uvicorn.
+    _lim = httpx.Limits(max_connections=concurrency + 8,
+                        max_keepalive_connections=concurrency + 8)
+    _tr = httpx.AsyncHTTPTransport(retries=5, limits=_lim)
+    async with httpx.AsyncClient(timeout=600, transport=_tr) as client:
         await asyncio.gather(*[_chat_one(client, url, model, 8, -1 - k, prompt_len)
-                               for k in range(concurrency)])  # warmup (unique idx)
+                               for k in range(concurrency)],
+                             return_exceptions=True)  # warmup (unique idx)
         if warmup:
             wend = time.monotonic() + warmup
             await asyncio.gather(*[worker(client, wend) for _ in range(concurrency)])
