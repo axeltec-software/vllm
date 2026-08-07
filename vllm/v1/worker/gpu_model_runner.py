@@ -5063,7 +5063,8 @@ class GPUModelRunner(
                 if _layers is not None:
                     self._poc_native = attach_native_poc(
                         self.model, _layers, _inner, self.max_num_tokens,
-                        self.model_config.get_hidden_size(), self.device, self.dtype)
+                        self.model_config.get_hidden_size(), self.device, self.dtype,
+                        route_window=self.vllm_config.cache_config.poc_route_window)
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)

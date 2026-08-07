@@ -525,6 +525,8 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             seq_len=body.params.seq_len,
             k_dim=body.params.k_dim,
             batch_size=body.batch_size,
+            route_window=getattr(getattr(getattr(engine_client, "vllm_config", None),
+                                         "cache_config", None), "poc_route_window", 16),
             poc_stronger_rng=body.poc_stronger_rng,
             poc_decode=getattr(request.app.state, "poc_decode", False),
             max_tokens=body.params.max_tokens,
@@ -605,7 +607,10 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             "status": "completed",
             "request_id": str(uuid.uuid4()),
             "artifacts": computed_artifacts,
-            "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le"},
+            "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le",
+                         "route_window": getattr(getattr(getattr(engine_client,
+                             "vllm_config", None), "cache_config", None),
+                             "poc_route_window", 16)},
         }
     
     validation_result = run_validation(

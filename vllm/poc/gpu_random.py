@@ -11,6 +11,10 @@ from typing import List, Optional
 
 import torch
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 # Seeded-routing scatter fix (DURABLE DEFAULT — MoE decode-PoC).
 # Without it, each token seed-picks top_k of ALL n_experts, so a 32-token decode batch
 # scatters across ~all experts -> the MoE grouped GEMM streams ~n_experts weight matrices
@@ -24,7 +28,22 @@ import torch
 # offset (not batch-shared) keeps each nonce's artifact reproducible by a single-nonce
 # validator. CONSENSUS-AFFECTING (changes k-trajectories) -> needs coordinated recollection.
 # Set >= n_experts (e.g. a huge value) only to restore the legacy full-scatter behaviour.
+# CONSENSUS-AFFECTING: changing it changes the k-trajectories. Configured via the
+# broadcast engine config (--poc-route-window -> CacheConfig.poc_route_window), pushed
+# here once per worker by set_route_window() at model attach (native.attach_native_poc),
+# BEFORE graph capture -> one value across all TP workers, no env-propagation gap.
+# Default 16 == the legacy baked value, so an un-set config is byte-identical.
 _ROUTE_WINDOW = 16
+
+
+def set_route_window(n: int) -> None:
+    """Push the MoE seeded-routing window from the broadcast engine config into the
+    module global, once per worker before graph capture. Logged so a per-worker
+    mismatch (a config value that didn't reach a worker) shows: grep "PoC route window"."""
+    global _ROUTE_WINDOW
+    _ROUTE_WINDOW = int(n)
+    logger.info("PoC route window = %d (--poc-route-window); CONSENSUS-AFFECTING, "
+                "must match on all nodes/workers.", _ROUTE_WINDOW)
 
 
 def pinned_to_device(vals, dtype, device):

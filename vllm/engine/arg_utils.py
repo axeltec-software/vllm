@@ -674,6 +674,7 @@ class EngineArgs:
     poc_max_tokens: int = get_field(CacheConfig, "poc_max_tokens")
     poc_share: float = get_field(CacheConfig, "poc_share")
     poc_vector_artifacts: bool = get_field(CacheConfig, "poc_vector_artifacts")
+    poc_route_window: int = get_field(CacheConfig, "poc_route_window")
 
     shutdown_timeout: int = 0
 
@@ -1126,6 +1127,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--poc-share", **cache_kwargs["poc_share"]
+        )
+        cache_group.add_argument(
+            "--poc-route-window", **cache_kwargs["poc_route_window"]
         )
 
         # Model weight offload related configs
@@ -1693,6 +1697,7 @@ class EngineArgs:
             poc_max_tokens=self.poc_max_tokens,
             poc_share=self.poc_share,
             poc_vector_artifacts=self.poc_vector_artifacts,
+            poc_route_window=self.poc_route_window,
         )
 
         # TurboQuant: auto-skip first/last 2 layers (boundary protection).

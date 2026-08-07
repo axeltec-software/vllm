@@ -117,6 +117,7 @@ class GenerateJob:
     seq_len: int
     k_dim: int
     batch_size: int
+    route_window: int = 16  # MoE seeded-routing window used; recorded in artifact encoding
     poc_stronger_rng: bool = False
     poc_decode: bool = False
     max_tokens: int = 0
@@ -354,7 +355,8 @@ class GenerateQueue:
                 "status": "completed",
                 "request_id": job.request_id,
                 "artifacts": computed_artifacts,
-                "encoding": {"dtype": "f16", "k_dim": job.k_dim, "endian": "le"},
+                "encoding": {"dtype": "f16", "k_dim": job.k_dim, "endian": "le",
+                             "route_window": job.route_window},
             }
         
         validation_result = run_validation(

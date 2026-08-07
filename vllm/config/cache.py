@@ -202,6 +202,14 @@ class CacheConfig:
     the rest. Explicit knob over the chat<->PoC mix: 1.0 = PoC greedy, 0.0 = chat
     only (PoC paused), 0.5 = even split. Prevents PoC from starving chat."""
 
+    poc_route_window: int = Field(default=16, ge=0)
+    """MoE seeded-routing window: each decode step restricts every PoC token's expert
+    pick to a shared, step-rotating window of this many experts (grouped-GEMM friendly),
+    while the window slides so the trajectory still sweeps all experts. 16 = default;
+    0 or >= n_experts = legacy full scatter. CONSENSUS-AFFECTING: changes the
+    k-trajectories, so every node/worker must run the same value -- it is part of the
+    graph hash and is broadcast to all TP workers via the engine config (no env gap)."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
