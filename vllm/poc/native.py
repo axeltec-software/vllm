@@ -288,15 +288,23 @@ class PoCNativeState:
         self.embeds[:n].copy_(row_embeds)
         _assert_replicated_across_tp(self.embeds[:n], "embeds")
 
-    def set_decode_chain(self, row_base: torch.Tensor, row_prev_k: torch.Tensor,
-                         row_step: torch.Tensor) -> None:
+    def set_decode_chain(self, offs: torch.Tensor = None, base: torch.Tensor = None,
+                         prev_k: torch.Tensor = None, step: torch.Tensor = None) -> None:
         """Publish per-row (base, prev_k, step) so the embedding wrapper synths the
         decode input IN-GRAPH (like set_routing does for the router). Cheap [n]
-        uploads; rows with prev_k<0 are non-decode (prefill/chat)."""
-        n = row_prev_k.shape[0]
-        self.embed_base[:n].copy_(row_base)
-        self.embed_prev_k[:n].copy_(row_prev_k)
-        self.embed_step[:n].copy_(row_step)
+        uploads; rows with prev_k<0 are non-decode (prefill/chat).
+
+        prev_k alone decides whether a row is synthesized, the buffer is persistent
+        and the captured graph reads it whole. So clear it on EVERY forward before
+        scattering this batch: rows left by an earlier batch, or by cudagraph
+        padding, would otherwise be synthesized as decode. Call with no arguments
+        when the forward has no decode rows."""
+        self.embed_prev_k.fill_(-1)
+        if offs is None:
+            return
+        self.embed_base.index_copy_(0, offs, base)
+        self.embed_prev_k.index_copy_(0, offs, prev_k)
+        self.embed_step.index_copy_(0, offs, step)
 
     # Device-side cache bound: per-nonce seeding adds one entry per (block_hash,
     # nonce), so a 128-nonce round is ~128 entries. Entries are stored in the
