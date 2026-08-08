@@ -456,30 +456,28 @@ def build_unified_mixed_batch_inputs(
 
     # Batched decode-step embeddings: one generate_decode_inputs_gpu call for the
     # whole nonce-batch (per-row identical to the old per-nonce calls).
-    if decode_embed_jobs:
-        from vllm.poc.gpu_random import generate_decode_inputs_gpu, pinned_to_device
-        _nat = getattr(runner, "_poc_native", None)
-        if _nat is not None and getattr(_nat, "embed_base", None) is not None:
-            # SYNTH = EMBEDDING: publish per-row (base, prev_k, step); the embedding
-            # wrapper synths input[step] in-graph. No eager RNG, no [B,H] embed copy.
-            n_rows = unified_embeds.shape[0]
-            row_base = torch.zeros(n_rows, dtype=torch.int64, device=runner.device)
-            row_prev_k = torch.full((n_rows,), -1, dtype=torch.int64, device=runner.device)
-            row_step = torch.zeros(n_rows, dtype=torch.int64, device=runner.device)
-            offs = pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device)
-            row_base.index_copy_(0, offs, torch.cat([j[0].base_seeds for j in decode_embed_jobs]))
-            row_prev_k.index_copy_(0, offs, torch.cat([j[0].prev_k_t for j in decode_embed_jobs]))
-            row_step.index_copy_(0, offs, pinned_to_device([j[1] for j in decode_embed_jobs], torch.int64, runner.device))
-            _nat.set_decode_chain(row_base, row_prev_k, row_step)
+    from vllm.poc.gpu_random import generate_decode_inputs_gpu, pinned_to_device
+    _nat = getattr(runner, "_poc_native", None)
+    if _nat is not None and getattr(_nat, "embed_base", None) is not None:
+        # SYNTH = EMBEDDING: publish per-row (base, prev_k, step); the embedding
+        # wrapper synths input[step] in-graph. No eager RNG, no [B,H] embed copy.
+        if decode_embed_jobs:
+            _nat.set_decode_chain(
+                offs=pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device),
+                base=torch.cat([j[0].base_seeds for j in decode_embed_jobs]),
+                prev_k=torch.cat([j[0].prev_k_t for j in decode_embed_jobs]),
+                step=pinned_to_device([j[1] for j in decode_embed_jobs], torch.int64, runner.device))
         else:
-            base_seeds = torch.cat([j[0].base_seeds for j in decode_embed_jobs])  # [B]
-            prev_k = torch.cat([j[0].prev_k_t for j in decode_embed_jobs])        # [B]
-            steps = pinned_to_device([j[1] for j in decode_embed_jobs], torch.int64, runner.device)
-            embeds = generate_decode_inputs_gpu(
-                base_seeds, prev_k, steps,
-                dim=hidden_size, device=runner.device, dtype=runner.dtype)  # [B, 1, H]
-            offs = pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device)
-            unified_embeds.index_copy_(0, offs, embeds[:, 0])   # [B, H] -> rows offs
+            _nat.set_decode_chain()          # no decode rows in this forward
+    elif decode_embed_jobs:
+        base_seeds = torch.cat([j[0].base_seeds for j in decode_embed_jobs])  # [B]
+        prev_k = torch.cat([j[0].prev_k_t for j in decode_embed_jobs])        # [B]
+        steps = pinned_to_device([j[1] for j in decode_embed_jobs], torch.int64, runner.device)
+        embeds = generate_decode_inputs_gpu(
+            base_seeds, prev_k, steps,
+            dim=hidden_size, device=runner.device, dtype=runner.dtype)  # [B, 1, H]
+        offs = pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device)
+        unified_embeds.index_copy_(0, offs, embeds[:, 0])   # [B, H] -> rows offs
 
     return unified_embeds, unified_positions, poc_position_mask, poc_metadata
 
