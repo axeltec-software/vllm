@@ -177,12 +177,36 @@ def poc_share_budget(poc_share: float, token_budget: int) -> int:
     return int(poc_share * token_budget)
 
 
-def resolve_poc_max_batch_size(configured: int, max_num_seqs: int) -> int:
-    """The per-step PoC nonce cap. `configured` == 0 means AUTO -> use the engine's
-    own concurrency limit (max_num_seqs), so PoC fills the batch like inference does
-    instead of being pinned to a fixed constant that throttles it on bigger machines.
-    Any explicit >0 value is honored verbatim. Pure (unit-testable)."""
-    return max_num_seqs if configured == 0 else configured
+def poc_kv_capacity(num_gpu_blocks, block_size, seq_len: int,
+                    max_tokens: int) -> int:
+    """How many PoC nonces the KV pool can physically hold.
+
+    A nonce reserves its whole footprint (seq_len prefill + max_tokens decode)
+    for the entire trajectory, so admitting more than the pool fits livelocks:
+    every row needs its full allocation to progress, and preempting one to feed
+    another just cycles. Returns 0 when the pool size is not yet known (the
+    engine computes num_gpu_blocks from free memory AFTER config init), which
+    callers read as "no KV-derived bound available". Pure (unit-testable)."""
+    if not num_gpu_blocks or not block_size:
+        return 0
+    per_nonce = max(1, seq_len + max_tokens)
+    return int(num_gpu_blocks) * int(block_size) // per_nonce
+
+
+def resolve_poc_max_batch_size(configured: int, max_num_seqs: int,
+                               kv_capacity: int = 0) -> int:
+    """The per-step PoC nonce cap.
+
+    `configured` > 0 is honored verbatim. AUTO (0) takes the engine's own
+    concurrency limit, clamped by what the KV pool actually holds: max_num_seqs
+    is a scheduler knob with no memory awareness, and chat survives
+    oversubscription only because its requests grow token-by-token and can be
+    preempted -- PoC's fixed upfront footprint cannot. Pure (unit-testable)."""
+    if configured:
+        return configured
+    if kv_capacity > 0:
+        return min(max_num_seqs, kv_capacity)
+    return max_num_seqs
 
 
 def poc_alloc_footprint(poc_params, num_new_tokens: int) -> int:
@@ -273,10 +297,22 @@ class PoCMixedDecodeManager:
 
 
 def get_decode_manager(runner) -> "PoCMixedDecodeManager":
-    """Lazily get/create the per-runner mixed-decode manager."""
+    """Lazily get/create the per-runner mixed-decode manager.
+
+    Pool size resolves like the scheduler's admission cap: the config value is
+    0 (AUTO) until resolved, so sizing from the raw field would create an EMPTY
+    pool -- every allocate fails, decode state never exists, and the prefill
+    step emits a pure-path artifact instead of starting the chain."""
     mgr = getattr(runner, "_poc_mixed_decode_mgr", None)
     if mgr is None:
-        mgr = PoCMixedDecodeManager(runner.cache_config.poc_max_batch_size)
+        cc = runner.cache_config
+        sc = runner.vllm_config.scheduler_config
+        cap = resolve_poc_max_batch_size(
+            cc.poc_max_batch_size, sc.max_num_seqs,
+            poc_kv_capacity(
+                getattr(cc, "num_gpu_blocks", 0), getattr(cc, "block_size", 0),
+                cc.poc_seq_len, cc.poc_max_tokens))
+        mgr = PoCMixedDecodeManager(cap)
         runner._poc_mixed_decode_mgr = mgr
     return mgr
 
@@ -588,6 +624,10 @@ def process_poc_outputs_from_hidden(
         _nat = getattr(runner, "_poc_native", None)
         _snap_active = (_nat is not None and getattr(_nat, "snap_k", None) is not None
                         and getattr(_nat, "embed_base", None) is not None)
+        # Does ANY row keep its pre-snap q (vector artifacts / debug)? Needed before the
+        # snap so the snap-active path can skip pulling snap_q when nothing keeps it — on
+        # the honest hot path q is dead, so that index_select is a wasted launch/step.
+        _keep_any = va_on or any(m['poc_params'].debug for m in decode_metas)
         if _snap_active:
             with record_function("poc_snap_in_forward"):
                 # SNAP = SAMPLING: the final-norm wrapper already snapped every row
@@ -598,9 +638,12 @@ def process_poc_outputs_from_hidden(
                     [m['start_idx'] + m['length'] - 1 for m in decode_metas],
                     torch.long, device)
                 k_all = _nat.snap_k.index_select(0, rows)
-                bad_all = _nat.snap_bad.index_select(0, rows)
                 margin_all = _nat.snap_margin.index_select(0, rows)
-                q_all = _nat.snap_q.index_select(0, rows)
+                # snap_bad is never read here (n_nan is derived at emit from k == -1),
+                # and snap_q only feeds kept q artifacts. Both were dead index_select
+                # launches on the honest hot path -> pull snap_q only when kept, skip
+                # snap_bad entirely. Artifacts byte-identical (unused values).
+                q_all = _nat.snap_q.index_select(0, rows) if _keep_any else None
         else:
             with record_function("poc_tail_eager_path"):
                 # sync-free host->device: hidden[py_list] and torch.tensor(list, device=cuda)
@@ -619,13 +662,9 @@ def process_poc_outputs_from_hidden(
                 q_all = project_to_sphere(torch.gather(lh, 1, sph))          # [B, SPHERE_DIM]
                 k_all, bad_all, margin_all = snap_with_margin(q_all, codebook)  # [B] each
 
-        # Hoist the batched tensor ops OUT of the per-nonce loop: one clone of q and
-        # one int64 cast of bad for the whole batch, instead of B of each (the loop
-        # then only does cheap views + list appends). Values are identical to the
-        # per-row clone/cast. q_clone is shared by this step's kept rows and stays
-        # alive until emit — for va_on (every row kept) that is the same memory as B
-        # per-row clones, just far fewer kernel launches.
-        _keep_any = va_on or any(m['poc_params'].debug for m in decode_metas)
+        # q_clone: one clone of q for the whole batch (the loop then only does cheap
+        # views + list appends). Shared by this step's kept rows, alive until emit.
+        # (_keep_any computed above, before the snap, to gate the snap_q pull.)
         q_clone = q_all.detach().clone() if _keep_any else None
         for i, meta in enumerate(decode_metas):
             st = meta['decode_state']

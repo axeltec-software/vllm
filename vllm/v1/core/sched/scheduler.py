@@ -397,10 +397,19 @@ class Scheduler(SchedulerInterface):
         poc_decode_pending = False
         from vllm.poc.mixed_decode import (
             decode_only_mixing_gate, poc_step_num_tokens, poc_alloc_footprint,
-            poc_share_budget,
+            poc_share_budget, poc_kv_capacity, resolve_poc_max_batch_size,
         )
         # Cap the PoC batch to poc_max_batch_size; extra PoC requests defer.
-        poc_max_batch = self.cache_config.poc_max_batch_size
+        # Resolved here, not at config init: num_gpu_blocks is only known once
+        # the engine has profiled free memory and built the KV pool.
+        poc_max_batch = resolve_poc_max_batch_size(
+            self.cache_config.poc_max_batch_size,
+            self.scheduler_config.max_num_seqs,
+            poc_kv_capacity(
+                getattr(self.cache_config, "num_gpu_blocks", 0),
+                getattr(self.cache_config, "block_size", 0),
+                self.cache_config.poc_seq_len,
+                self.cache_config.poc_max_tokens))
         poc_scheduled = 0
         # poc_share: PoC's slice of the step token budget; chat draws from the
         # full budget (the chat<->PoC mix knob).
