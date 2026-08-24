@@ -22,8 +22,10 @@ from vllm.poc.mixed_decode import (
     POC_DEFER_LIMIT,
     decode_only_mixing_gate,
     poc_alloc_footprint,
+    poc_kv_capacity,
     poc_share_budget,
     poc_step_num_tokens,
+    resolve_poc_max_batch_size,
 )
 
 if TYPE_CHECKING:
@@ -45,7 +47,18 @@ class PoCAdmission:
             return
 
         cache_config = scheduler.cache_config
-        self._max_batch = cache_config.poc_max_batch_size
+        # Resolve here, not at config init: num_gpu_blocks is only known once
+        # the engine has profiled free memory and built the KV pool.
+        self._max_batch = resolve_poc_max_batch_size(
+            cache_config.poc_max_batch_size,
+            scheduler.scheduler_config.max_num_seqs,
+            poc_kv_capacity(
+                getattr(cache_config, "num_gpu_blocks", 0),
+                getattr(cache_config, "block_size", 0),
+                cache_config.poc_seq_len,
+                cache_config.poc_max_tokens,
+            ),
+        )
         self._token_budget = poc_share_budget(cache_config.poc_share, token_budget)
         self._scheduled = 0
         self._tokens = 0

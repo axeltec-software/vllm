@@ -877,17 +877,6 @@ class VllmConfig:
 
         self.try_verify_and_update_config()
 
-        # PoC: poc_max_batch_size == 0 means AUTO -> scale the per-step PoC nonce
-        # cap with the machine's own concurrency limit (max_num_seqs) so PoC fills
-        # the batch like inference does. Explicit >0 overrides.
-        if self.cache_config is not None and self.scheduler_config is not None:
-            from vllm.poc.mixed_decode import resolve_poc_max_batch_size
-
-            self.cache_config.poc_max_batch_size = resolve_poc_max_batch_size(
-                self.cache_config.poc_max_batch_size,
-                self.scheduler_config.max_num_seqs,
-            )
-
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(self.load_config)

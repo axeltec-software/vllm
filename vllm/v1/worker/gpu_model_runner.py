@@ -4087,8 +4087,10 @@ class GPUModelRunner(
 
         # PoC mixed-batch bridge (no-op when the step holds no PoC rows).
         if getattr(self, "_poc_bridge", None) is None:
-            from vllm.poc.runner_bridge import PoCRunnerBridge
-            self._poc_bridge = PoCRunnerBridge(self)
+            from vllm.poc.dispatch import poc_module
+            self._poc_bridge = poc_module(
+                "vllm.poc.runner_bridge",
+                "gonka_poc.mixed.bridge").PoCRunnerBridge(self)
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -5259,6 +5261,14 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
+                # PoC transforms attach BEFORE compilation/capture (0.20 parity).
+                if getattr(self, "_poc_bridge", None) is None:
+                    from vllm.poc.dispatch import poc_module
+
+                    self._poc_bridge = poc_module(
+                        "vllm.poc.runner_bridge",
+                        "gonka_poc.mixed.bridge").PoCRunnerBridge(self)
+                self._poc_bridge.load(self.model)
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):
@@ -5385,10 +5395,6 @@ class GPUModelRunner(
             and cudagraph_mode != CUDAGraphMode.NONE
             and not self.parallel_config.use_ubatching
         ):
-            if getattr(self, "_poc_bridge", None) is None:
-                from vllm.poc.runner_bridge import PoCRunnerBridge
-                self._poc_bridge = PoCRunnerBridge(self)
-            self._poc_bridge.load(self.model)
             self.model = BreakableCUDAGraphWrapper(self.model, self.vllm_config)
             drafter = getattr(self, "drafter", None)
             if drafter is not None and hasattr(drafter, "model"):

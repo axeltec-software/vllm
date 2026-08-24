@@ -23,6 +23,36 @@ logger = init_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/pow", tags=["PoC"])
 
+def _server_engine() -> dict:
+    """Engine identity of the SERVING box: version/commit, attention backend,
+    cudagraph mode. Server truth — never recorded client-side."""
+    out = {}
+    try:
+        import vllm
+        out["vllm_version"] = getattr(vllm, "__version__", "?")
+    except Exception:
+        pass
+    try:
+        import os
+        out["attention_backend"] = os.environ.get("VLLM_ATTENTION_BACKEND", "auto")
+        out["v2_runner"] = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "?")
+    except Exception:
+        pass
+    return out
+
+
+def _server_gpu() -> str:
+    """The SERVING box's GPU — provenance must name the machine that computed
+    the artifacts, not whatever client collected them."""
+    try:
+        import torch
+        n = torch.cuda.device_count()
+        return f"{n}x{torch.cuda.get_device_name(0)}" if n else "cpu"
+    except Exception:
+        return "?"
+
+
+
 POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5"))
 POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
 POC_CHAT_BUSY_BACKOFF_SEC = 0.05
@@ -526,7 +556,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             k_dim=body.params.k_dim,
             batch_size=body.batch_size,
             route_window=getattr(getattr(getattr(engine_client, "vllm_config", None),
-                                         "cache_config", None), "poc_route_window", 16),
+                                         "cache_config", None), "poc_route_window", 256),
             poc_stronger_rng=body.poc_stronger_rng,
             poc_decode=getattr(request.app.state, "poc_decode", False),
             max_tokens=body.params.max_tokens,
@@ -610,7 +640,9 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le",
                          "route_window": getattr(getattr(getattr(engine_client,
                              "vllm_config", None), "cache_config", None),
-                             "poc_route_window", 16)},
+                             "poc_route_window", 256)},
+            "server_gpu": _server_gpu(),
+            "server_engine": _server_engine(),
         }
     
     validation_result = run_validation(
@@ -634,6 +666,8 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         # client can pair them with the prover's for offline vector-channel analysis;
         # verdict-only response otherwise (unchanged).
         "artifacts": computed_artifacts if body.debug else [],
+        "server_gpu": _server_gpu(),
+            "server_engine": _server_engine(),
         **validation_result,
     }
 

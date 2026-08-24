@@ -17,6 +17,10 @@ import os
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 from .gpu_random import (expert_logits_from_base, generate_householder_vector,
                          route_base_seed, _seed_from_string, pinned_to_device,
                          set_route_window)
@@ -67,6 +71,34 @@ def _reflect(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tens
     return torch.where(mask, transformed, x)
 
 
+def _install_poc_patch(module: nn.Module, wrapper: nn.Module) -> None:
+    """Class-level forward patch. torch.compile traces the CLASS forward, so
+    instance ``obj.forward = ...`` assignments are ignored inside compiled
+    regions (decode snaps read zeros exactly this way). The class forward
+    dispatches to the instance's wrapper when present; untouched instances of
+    the same class keep original behaviour. The wrapper calls the ORIGINAL
+    class forward, captured once per class."""
+    import functools
+
+    cls = type(module)
+    if "_poc_orig_forward" not in cls.__dict__:
+        orig = cls.forward
+        cls._poc_orig_forward = orig
+
+        def _poc_forward(self, *args, **kwargs):
+            w = getattr(self, "_poc_wrap", None)
+            if w is not None:
+                return w.forward(*args, **kwargs)
+            return cls._poc_orig_forward(self, *args, **kwargs)
+
+        cls.forward = _poc_forward
+    wrapper._inner_call = functools.partial(
+        cls.__dict__["_poc_orig_forward"], module)
+    # object.__setattr__: keep the wrapper out of nn.Module submodule
+    # registration (wrapper.inner already points back at module — a cycle).
+    object.__setattr__(module, "_poc_wrap", wrapper)
+
+
 class PoCLayerWrapper(nn.Module):
     """Wraps one decoder layer; reflects its output hidden + residual on PoC rows.
     ``v`` is this layer's reflection vector; ``mask`` is the shared per-row PoC mask
@@ -77,9 +109,10 @@ class PoCLayerWrapper(nn.Module):
         self.inner = inner
         self.register_buffer("poc_v", v, persistent=False)
         self.register_buffer("poc_mask", mask, persistent=False)
+        self._inner_call = inner.forward
 
     def forward(self, *args, **kwargs):
-        out = self.inner(*args, **kwargs)
+        out = self._inner_call(*args, **kwargs)
         if isinstance(out, tuple):
             hidden = out[0]
             n = hidden.shape[0]
@@ -115,6 +148,7 @@ class PoCEmbeddingWrapper(nn.Module):
             self.register_buffer("embed_base", embed_base, persistent=False)
             self.register_buffer("embed_prev_k", embed_prev_k, persistent=False)
             self.register_buffer("embed_step", embed_step, persistent=False)
+        self._inner_call = inner.forward
 
     def forward(self, input_ids):
         # PoC rows carry a dummy token id whose embedding is overridden below, but
@@ -125,7 +159,7 @@ class PoCEmbeddingWrapper(nn.Module):
         m_rows = self.poc_mask[:n]
         # On-device clamp (no host sync): masked rows -> 0, chat rows unchanged.
         input_ids = torch.where(m_rows, torch.zeros_like(input_ids), input_ids)
-        out = self.inner(input_ids)
+        out = self._inner_call(input_ids)
         m = m_rows.unsqueeze(-1)
         if not self._synth:
             return torch.where(m, self.poc_embeds[:n].to(out.dtype), out)
@@ -155,9 +189,10 @@ class PoCSnapWrapper(nn.Module):
         super().__init__()
         self.inner = inner
         self._st = state
+        self._inner_call = inner.forward
 
     def forward(self, *args, **kwargs):
-        out = self.inner(*args, **kwargs)
+        out = self._inner_call(*args, **kwargs)
         h = out[0] if isinstance(out, tuple) else out
         st = self._st
         n = h.shape[0]
@@ -175,6 +210,24 @@ class PoCSnapWrapper(nn.Module):
         st.snap_margin[:n].copy_(margin_all)
         st.snap_q[:n].copy_(q)
         return out
+
+
+def _experts_meta(experts) -> tuple:
+    """(num_experts, top_k, n_group, topk_group) across vLLM minors: 0.20
+    exposes the first two directly on FusedMoE; 0.25 moved them into
+    ``moe_config`` (``experts_per_token``) and keeps the grouped-top-k params
+    (DeepSeek family) on the runner's router. Flat routers report
+    n_group=topk_group=1 (the grouped formula degenerates away). A
+    gate+experts module we cannot read is a HARD error — a silently unseeded
+    router re-opens the MoE honest-floor hole."""
+    if hasattr(experts, "top_k"):
+        return int(experts.global_num_experts), int(experts.top_k)
+    cfg = getattr(experts, "moe_config", None)
+    if cfg is not None:
+        return int(cfg.num_experts), int(cfg.experts_per_token)
+    raise RuntimeError(
+        f"PoC seeded routing: cannot read expert meta from {type(experts)}; "
+        "vLLM moved the FusedMoE attributes again — extend _experts_meta")
 
 
 class PoCRouterWrapper(nn.Module):
@@ -214,7 +267,7 @@ class PoCRouterWrapper(nn.Module):
             return getattr(super().__getattr__("inner"), name)
 
     def forward(self, *args, **kwargs):
-        out = self.inner(*args, **kwargs)
+        out = self._inner_call(*args, **kwargs)
         logits = out[0] if isinstance(out, tuple) else out
         n = logits.shape[0]
         m = self.poc_mask[:n].unsqueeze(-1)
@@ -223,6 +276,64 @@ class PoCRouterWrapper(nn.Module):
             self.n_experts, self.top_k, logits.device).to(logits.dtype)
         logits = torch.where(m, forced, logits)
         return (logits, *out[1:]) if isinstance(out, tuple) else logits
+
+
+class PoCSelectOverride:
+    """Overrides the ROUTER SELECTION OUTPUT for PoC rows: seeded expert ids
+    and ladder-softmax weights are written directly over whatever the engine
+    selected. The engine's selection math (scoring functions, grouped stages,
+    e_score_correction_bias, backend top-k kernels) still runs for chat rows
+    but is DISCARDED for PoC rows — selection is skipped, not reproduced, so
+    none of its numerics can perturb the seeded choice. In-graph: ids/weights
+    derive from the live route buffers via integer topk over the forced
+    ladder (distinct values — no ties, backend-independent)."""
+
+    def __init__(self, route_base: torch.Tensor, route_step: torch.Tensor,
+                 n_experts: int, top_k: int, mask: torch.Tensor):
+        self.poc_route_base = route_base
+        self.poc_route_step = route_step
+        self.n_experts = n_experts
+        self.top_k = top_k
+        self.poc_mask = mask
+        self._inner_call = None  # bound by _install_poc_select_patch
+
+    def select_experts(self, *args, **kwargs):
+        weights, ids = self._inner_call(*args, **kwargs)
+        # router_logits for masked rows already carry the forced ladder (the
+        # gate wrapper runs first) — derive ids/weights from THEM instead of
+        # recomputing the seed math: ladder values are distinct, so topk is
+        # deterministic; unmasked rows' results are discarded by the where.
+        logits = kwargs.get("router_logits",
+                            args[1] if len(args) > 1 else None)
+        n = ids.shape[0]
+        ladder, seed_ids = torch.topk(logits.float(), self.top_k)
+        seed_w = torch.softmax(ladder, dim=-1)
+        m = self.poc_mask[:n].unsqueeze(-1)
+        ids = torch.where(m, seed_ids.to(ids.dtype), ids)
+        weights = torch.where(m, seed_w.to(weights.dtype), weights)
+        return weights, ids
+
+
+def _install_poc_select_patch(router, override: "PoCSelectOverride") -> None:
+    """Class-level patch of ``select_experts`` (same rationale as
+    _install_poc_patch: compiled regions trace the class method)."""
+    import functools
+
+    cls = type(router)
+    if "_poc_orig_select" not in cls.__dict__:
+        orig = cls.select_experts
+        cls._poc_orig_select = orig
+
+        def _poc_select(self, *args, **kwargs):
+            w = getattr(self, "_poc_sel", None)
+            if w is not None:
+                return w.select_experts(*args, **kwargs)
+            return cls._poc_orig_select(self, *args, **kwargs)
+
+        cls.select_experts = _poc_select
+    override._inner_call = functools.partial(
+        cls.__dict__["_poc_orig_select"], router)
+    router._poc_sel = override
 
 
 class PoCNativeState:
@@ -417,21 +528,31 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     """Wrap each decoder layer (Householder) AND the token embedding (PoC-embed
     injection) BEFORE compilation, sharing one mask. Returns the state to drive
     them. Idempotent: skipped if already wrapped."""
-    if any(isinstance(layer, PoCLayerWrapper) for layer in layers):
-        return getattr(model, "_poc_native_state")
+    if getattr(model, "_poc_native_state", None) is not None:
+        return model._poc_native_state
     # Push the broadcast MoE routing window into gpu_random once per worker, before any
     # gate is wrapped / graph is captured (consensus-affecting; see CacheConfig).
     set_route_window(route_window)
     state = PoCNativeState(len(layers), hidden_size, max_tokens, device, dtype)
+    # Patch forward IN PLACE (never replace the module): 0.25 compiles the model
+    # ahead of time and resolves parameters by qualified name, so re-parenting a
+    # layer under a wrapper breaks the compiled graph's parameter map.
     for i, layer in enumerate(layers):
-        layers[i] = PoCLayerWrapper(layer, state.vectors[i], state.mask)
+        _install_poc_patch(
+            layer, PoCLayerWrapper(layer, state.vectors[i], state.mask))
     if embed_owner is not None and hasattr(embed_owner, "embed_tokens"):
-        embed_owner.embed_tokens = PoCEmbeddingWrapper(
-            embed_owner.embed_tokens, state.embeds, state.mask,
+        # Patch forward IN PLACE, never replace the module: wrapping renames
+        # parameters (embed_tokens.weight -> embed_tokens.inner.weight) and
+        # 0.25's ahead-of-time compiled graph looks them up by name.
+        _emb = embed_owner.embed_tokens
+        _wrap = PoCEmbeddingWrapper(
+            _emb, state.embeds, state.mask,
             state.embed_base, state.embed_prev_k, state.embed_step, hidden_size)
-    # SNAP = SAMPLING: wrap the final norm so PoC's snap rides the captured forward.
+        _install_poc_patch(_emb, _wrap)
+    # SNAP = SAMPLING: patch the final norm in place, same reason as above.
     if embed_owner is not None and hasattr(embed_owner, "norm"):
-        embed_owner.norm = PoCSnapWrapper(embed_owner.norm, state)
+        _nrm = embed_owner.norm
+        _install_poc_patch(_nrm, PoCSnapWrapper(_nrm, state))
     # Seeded-routing is MANDATORY for MoE — part of the PoC algorithm, not a toggle.
     # Natural MoE top-k reads the noise-prone hidden, so cross-HW/backend drift flips
     # the k-th expert and inflates the honest floor; seeding the experts from
@@ -443,21 +564,34 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
         moe = next(
             (m for m in inner_layer.modules()
              if hasattr(m, "gate") and hasattr(m, "experts")
-             and hasattr(getattr(m, "experts"), "top_k")
              and not isinstance(m.gate, PoCRouterWrapper)),
             None)
         if moe is None:
             continue
-        n_exp = int(moe.experts.global_num_experts)
-        top_k = int(moe.experts.top_k)
+        n_exp, top_k = _experts_meta(moe.experts)
         # Address-stable per-layer seed base [max_tokens] -> the wrapper folds the
         # shared route_step buffer into it and runs the Fisher-Yates selection
         # in-graph (see PoCRouterWrapper). cudagraph-safe (static shape).
         route_base = torch.zeros(state.max_tokens, dtype=torch.int64, device=device)
         state._route_base.append(route_base)
         state.router_meta.append((n_exp, top_k))
-        moe.gate = PoCRouterWrapper(moe.gate, route_base, state.route_step,
-                                    n_exp, top_k, state.mask)
+        _gate = moe.gate
+        _install_poc_patch(_gate, PoCRouterWrapper(
+            _gate, route_base, state.route_step, n_exp, top_k, state.mask))
+        # The gate-logit forcing above is the single routing seam, as in
+        # 0.20. The selection override is NOT installed: replacing the
+        # engine's expert weights with the ladder softmax collapses the
+        # honest/fraud gap — AWQ fraud validates at ~75% mismatches instead
+        # of ~11-13%, and any numeric input difference (quant, cross-GPU)
+        # saturates at the same ceiling. Measured on 1xB300, MiniMax-M2.7
+        # vs its AWQ checkpoint; disabling restores the 0.20-level gap.
 
     model._poc_native_state = state
+    logger.info(
+        "PoC native attach: %d layers, embed=%s, snap=%s, %d MoE routers "
+        "seeded%s", len(layers), embed_owner is not None,
+        embed_owner is not None and hasattr(embed_owner, "norm"),
+        len(state.router_meta),
+        (" (n_exp=%d top_k=%d)" % state.router_meta[0])
+        if state.router_meta else "")
     return state

@@ -211,7 +211,7 @@ class CacheConfig:
     """Fraction of each scheduler step's token budget PoC may consume; chat gets
     the rest. 1.0 = PoC greedy, 0.0 = chat only. Prevents PoC starving chat."""
 
-    poc_route_window: int = Field(default=16, ge=0)
+    poc_route_window: int = Field(default=256, ge=0)
     """MoE seeded-routing window: each decode step restricts every PoC token's
     expert pick to a shared, step-rotating window of this many experts, while the
     window slides so the trajectory still sweeps all experts. 0 or >= n_experts =

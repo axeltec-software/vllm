@@ -32,18 +32,17 @@ logger = init_logger(__name__)
 # broadcast engine config (--poc-route-window -> CacheConfig.poc_route_window), pushed
 # here once per worker by set_route_window() at model attach (native.attach_native_poc),
 # BEFORE graph capture -> one value across all TP workers, no env-propagation gap.
-# Default 16 == the legacy baked value, so an un-set config is byte-identical.
-_ROUTE_WINDOW = 16
+# Default 256 == production spec (full scatter on MiniMax's 256 experts; the
+# fairness decision of 2026-08-08): window >= n_experts uses the legacy
+# _forced_logits full-scatter branch.
+_ROUTE_WINDOW = 0  # retired: the contiguous-run pick has no window
 
 
 def set_route_window(n: int) -> None:
-    """Push the MoE seeded-routing window from the broadcast engine config into the
-    module global, once per worker before graph capture. Logged so a per-worker
-    mismatch (a config value that didn't reach a worker) shows: grep "PoC route window"."""
-    global _ROUTE_WINDOW
-    _ROUTE_WINDOW = int(n)
-    logger.info("PoC route window = %d (--poc-route-window); CONSENSUS-AFFECTING, "
-                "must match on all nodes/workers.", _ROUTE_WINDOW)
+    """Deprecated no-op: the windowed pick is retired (contiguous-run
+    formula). Kept so existing config plumbing does not break."""
+    if int(n) not in (0, 256):
+        logger.warning("poc_route_window=%d ignored: windowed pick retired", n)
 
 
 def pinned_to_device(vals, dtype, device):
@@ -440,59 +439,25 @@ def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
                    device: torch.device) -> torch.Tensor:
     """THE seeded expert selection — single source of truth for seeded routing.
 
-    Draws top_k DISTINCT experts straight from ``seed`` ([B,1] int64) by a partial
-    Fisher-Yates shuffle: pure integer (no topk, no scores, no ties) -> identical on
-    any hardware / eager / graph, and robust for ANY n_experts. Returns [B,n_experts]
-    forced logits (chosen experts hold descending values, the rest a low floor); the
-    natural MoE top-k over these picks exactly the seeded experts + gate weights."""
+    Contiguous seeded run: ``start = seed % n_experts``, experts
+    ``start .. start+top_k-1`` (mod n). Distinct by construction for ANY
+    n_experts, one arithmetic op, trivial to reimplement bit-exactly in the
+    chain-side validator. Uniform per-expert coverage across seeds keeps the
+    prover holding EVERY expert; unpredictability of the set is not a goal
+    (seeds are public) — consensus security lives in the seeded embeds,
+    per-layer reflections and the chained snap. Returns [B, n_experts]
+    forced logits: the chosen run holds descending ladder values top_k..1,
+    the rest a low floor."""
     b = seed.shape[0]
-    perm = torch.arange(n_experts, device=device, dtype=torch.int64).unsqueeze(0).repeat(b, 1)
-    for i in range(top_k):                                # k swaps -> k distinct experts in perm[:, :k]
-        j = i + _batched_murmur3_32(torch.full((b, 1), i, dtype=torch.int32, device=device),
-                                    seed) % (n_experts - i)          # [B,1] swap target in [i, n)
-        gi = perm[:, i:i + 1].clone()
-        perm[:, i:i + 1] = perm.gather(1, j)
-        perm.scatter_(1, j, gi)
-    logits = torch.full((b, n_experts), -1.0e4, device=device, dtype=torch.float32)
-    logits.scatter_(1, perm[:, :top_k],
-                    torch.arange(top_k, 0, -1, device=device, dtype=torch.float32).unsqueeze(0).expand(b, -1))
-    return logits
-
-
-def _forced_logits_windowed(seed: torch.Tensor, steps: torch.Tensor, n_experts: int,
-                            top_k: int, window: int, device: torch.device) -> torch.Tensor:
-    """Seeded expert selection restricted to a step-rotating WINDOW of ``window`` experts.
-
-    The window offset depends on the decode STEP (shared across the batch, NOT per-nonce),
-    so a decode batch activates only ~window distinct experts per step -> the MoE grouped
-    GEMM batches them (measured ~7x faster than the full-scatter pick). The offset slides by
-    ``stride`` each step so over the trajectory the window sweeps every expert (coverage /
-    fraud-bound preserved). Each token still seed-picks top_k WITHIN the window (trajectories
-    stay distinct). Pure integer -> eager==graph, bit-identical cross-HW. seed/steps [B,1]."""
-    b = seed.shape[0]
-    W = max(window, top_k)
-    stride = max(1, n_experts // 256)                    # sweep ~all experts over a 256-step trajectory
-    offset = (steps * stride) % n_experts                # [B,1] window start (batch-shared at a given step)
-    perm = torch.arange(W, device=device, dtype=torch.int64).unsqueeze(0).repeat(b, 1)
-    for i in range(top_k):                               # partial Fisher-Yates over [0, W)
-        j = i + _batched_murmur3_32(torch.full((b, 1), i, dtype=torch.int32, device=device),
-                                    seed) % (W - i)
-        gi = perm[:, i:i + 1].clone()
-        perm[:, i:i + 1] = perm.gather(1, j)
-        perm.scatter_(1, j, gi)
-    chosen = (offset + perm[:, :top_k]) % n_experts      # window-local -> global expert ids (distinct)
-    logits = torch.full((b, n_experts), -1.0e4, device=device, dtype=torch.float32)
+    start = torch.remainder(seed.view(-1, 1), n_experts)             # [B,1]
+    offs = torch.arange(top_k, device=device, dtype=torch.int64)     # [k]
+    chosen = torch.remainder(start + offs.unsqueeze(0), n_experts)   # [B,k]
+    logits = torch.full((b, n_experts), -1.0e4, device=device,
+                        dtype=torch.float32)
     logits.scatter_(1, chosen,
-                    torch.arange(top_k, 0, -1, device=device, dtype=torch.float32).unsqueeze(0).expand(b, -1))
+                    torch.arange(top_k, 0, -1, device=device,
+                                 dtype=torch.float32).unsqueeze(0).expand(b, -1))
     return logits
-
-
-def seeded_expert_logits(seed_str: str, n_experts: int, top_k: int,
-                         device: torch.device) -> torch.Tensor:
-    """Single-row forced logits from a seed string (tests / offline validators).
-    Same selection as the live path — both go through the shared _forced_logits."""
-    seed = torch.tensor([[_seed_from_string(seed_str)]], dtype=torch.int64, device=device)
-    return _forced_logits(seed, n_experts, top_k, device)[0]
 
 
 def route_base_seed(block_hash: str, nonce: int, layer: int) -> str:
@@ -507,14 +472,11 @@ def expert_logits_from_base(base_ints: torch.Tensor, steps: torch.Tensor,
                             n_experts: int, top_k: int,
                             device: torch.device) -> torch.Tensor:
     """Per-row forced router logits: fold the decode ``step`` into the cached base seed
-    ON GPU, then the shared _forced_logits selection. ``base_ints``/``steps`` are [B]
+    ON GPU, then the shared _forced_logits pick. ``base_ints``/``steps`` are [B]
     int64; returns [B, n_experts]. All integer (bit-exact cross-HW), no host loop, no
     device->host sync. Equivalent per (row, layer) to seeded_experts()."""
     seed = _batched_murmur3_32(steps.view(-1, 1).to(torch.int32),
                                base_ints.view(-1, 1))               # [B,1] = fold step into base
-    if _ROUTE_WINDOW and _ROUTE_WINDOW < n_experts:
-        return _forced_logits_windowed(seed, steps.view(-1, 1), n_experts, top_k,
-                                       _ROUTE_WINDOW, device)
     return _forced_logits(seed, n_experts, top_k, device)
 
 

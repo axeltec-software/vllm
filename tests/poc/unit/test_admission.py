@@ -28,12 +28,17 @@ def _req(poc=False, computed=0, prompt=64, seq_len=64, max_tokens=16):
     )
 
 
-def _sched(running=(), waiting=(), max_batch=8, share=0.5):
+def _sched(running=(), waiting=(), max_batch=8, share=0.5,
+           num_gpu_blocks=0, block_size=16, max_num_seqs=256,
+           poc_seq_len=64, poc_max_tokens=16):
     return SimpleNamespace(
         running=list(running),
         waiting=list(waiting),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         cache_config=SimpleNamespace(
-            poc_max_batch_size=max_batch, poc_share=share
+            poc_max_batch_size=max_batch, poc_share=share,
+            num_gpu_blocks=num_gpu_blocks, block_size=block_size,
+            poc_seq_len=poc_seq_len, poc_max_tokens=poc_max_tokens,
         ),
     )
 
@@ -136,3 +141,84 @@ def test_share_extremes(share, budget, expect):
     assert a.over_budget(poc_req, expect + 1) is True
     if expect:
         assert a.over_budget(poc_req, expect) is False
+
+
+# ------------------------------------------------- KV-derived batch cap
+# Regression: AUTO used to copy max_num_seqs (a scheduler knob with no memory
+# awareness). On 1xB300 that admitted 704 nonces x 512 tokens against a
+# 302672-token pool -> livelock, GPU 0%, 12-minute hang. The cap must come from
+# what the KV pool physically holds.
+from vllm.poc.mixed_decode import poc_kv_capacity, resolve_poc_max_batch_size
+
+B300_BLOCKS, B300_BLOCK = 18917, 16          # 302672 tokens
+B300_SEQ, B300_MAXTOK = 512, 0
+
+
+def test_kv_capacity_matches_pool_arithmetic():
+    assert poc_kv_capacity(B300_BLOCKS, B300_BLOCK, B300_SEQ, B300_MAXTOK) == 591
+
+
+def test_kv_capacity_counts_the_decode_budget_too():
+    # a nonce holds prefill + its whole trajectory
+    assert poc_kv_capacity(100, 16, 128, 128) == 6      # 1600 // 256
+    assert poc_kv_capacity(100, 16, 128, 0) == 12       # 1600 // 128
+
+
+def test_kv_capacity_unknown_pool_is_zero():
+    assert poc_kv_capacity(0, 16, 512, 0) == 0
+    assert poc_kv_capacity(None, 16, 512, 0) == 0
+    assert poc_kv_capacity(100, 0, 512, 0) == 0
+
+
+def test_auto_cap_is_clamped_by_kv_not_max_num_seqs():
+    """The B300 hang, as a unit test."""
+    kv = poc_kv_capacity(B300_BLOCKS, B300_BLOCK, B300_SEQ, B300_MAXTOK)
+    assert resolve_poc_max_batch_size(0, 704, kv) == 591
+    assert resolve_poc_max_batch_size(0, 704, kv) * B300_SEQ <= B300_BLOCKS * B300_BLOCK
+
+
+def test_auto_cap_uses_concurrency_when_it_is_the_tighter_bound():
+    assert resolve_poc_max_batch_size(0, 64, 591) == 64
+
+
+def test_auto_cap_falls_back_when_pool_unknown():
+    assert resolve_poc_max_batch_size(0, 704, 0) == 704
+
+
+def test_explicit_cap_is_honored_verbatim():
+    assert resolve_poc_max_batch_size(128, 704, 591) == 128
+
+
+def test_auto_cap_via_admission_fits_the_pool():
+    """End-to-end through PoCAdmission: AUTO (0) must never admit more nonces
+    than the KV pool holds, whatever max_num_seqs says."""
+    a = PoCAdmission(
+        _sched(running=[_req(poc=True, computed=5)], max_batch=0,
+               num_gpu_blocks=B300_BLOCKS, block_size=B300_BLOCK,
+               max_num_seqs=704, poc_seq_len=B300_SEQ,
+               poc_max_tokens=B300_MAXTOK),
+        1024,
+    )
+    per_nonce = B300_SEQ + B300_MAXTOK
+    assert a._max_batch * per_nonce <= B300_BLOCKS * B300_BLOCK
+    assert a._max_batch < 704                # not the naive scheduler knob
+
+
+def test_decode_manager_pool_never_empty_under_auto():
+    """Regression: after the cap became lazily-resolved, get_decode_manager
+    sized its slot pool from the RAW config value (0 under AUTO) -> empty pool
+    -> every allocate failed -> decode state never existed -> prefill emitted a
+    pure-path artifact and the chain never ran (empty k_points_steps)."""
+    from vllm.poc.mixed_decode import get_decode_manager
+
+    runner = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            poc_max_batch_size=0, poc_seq_len=64, poc_max_tokens=8,
+            num_gpu_blocks=0, block_size=16),
+        vllm_config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=256)),
+    )
+    mgr = get_decode_manager(runner)
+    st = mgr.allocate("poc-x", nonce=1, seq_len=64, max_tokens=8)
+    assert st is not None, "AUTO cap must yield a usable slot pool"
+    assert len(mgr._free_slots) > 0 or st is not None

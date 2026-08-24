@@ -38,7 +38,10 @@ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.poc.admission import PoCAdmission
+from vllm.poc.dispatch import poc_module
+
+PoCAdmission = poc_module("vllm.poc.admission",
+                          "gonka_poc.mixed.admission").PoCAdmission
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -451,7 +454,8 @@ class Scheduler(SchedulerInterface):
             request = self.running[req_index]
 
             if (
-                request.num_output_placeholders > 0
+                request.poc_params is None
+                and request.num_output_placeholders > 0
                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
                 # Since output placeholders are also included in the computed tokens
                 # count, we subtract (num_output_placeholders - 1) to remove any draft

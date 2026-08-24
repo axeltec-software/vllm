@@ -294,7 +294,8 @@ def build_app(
 
     # PoC routes: registered directly, not via include_router — FastAPI's
     # _IncludedRouter crashes prometheus route-name lookup (0.20 fix kept).
-    from vllm.poc.routes import router as poc_router
+    from vllm.poc.dispatch import poc_module
+    poc_router = poc_module("vllm.poc.routes", "gonka_poc.poc.routes").router
 
     for _poc_route in poc_router.routes:
         app.add_api_route(_poc_route.path, _poc_route.endpoint,

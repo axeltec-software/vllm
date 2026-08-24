@@ -11,7 +11,7 @@ reap(){ for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); d
 reap; trap reap EXIT
 
 VLLM_USE_V2_MODEL_RUNNER=0 nohup .venv/bin/vllm serve "$M" --host 127.0.0.1 \
-  --port "$PORT" --no-enable-prefix-caching --no-async-scheduling \
+  --port "$PORT" --no-enable-prefix-caching \
   --gpu-memory-utilization 0.85 --max-model-len 1024 > "$LOG" 2>&1 &
 SRV=$!
 for i in $(seq 1 120); do

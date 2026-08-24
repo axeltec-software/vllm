@@ -100,7 +100,7 @@ def slice_sampling_metadata(sm, rows, device):
     def remap_dict(d):
         return None if d is None else {remap[k]: v for k, v in d.items() if k in keep}
 
-    return dataclasses.replace(
+    sliced = dataclasses.replace(
         sm,
         temperature=take_t(sm.temperature),
         top_p=take_t(sm.top_p),
@@ -115,8 +115,12 @@ def slice_sampling_metadata(sm, rows, device):
         spec_token_ids=take_list(sm.spec_token_ids),
         allowed_token_ids_mask=take_t(sm.allowed_token_ids_mask),
         bad_words_token_ids=remap_dict(sm.bad_words_token_ids),
-        enforced_next_token_ids=take_t(sm.enforced_next_token_ids),
     )
+    # enforced_next_token_ids: 0.20-only field (inference-validation feature,
+    # not decode-PoC). Slice it when the base engine carries it.
+    if hasattr(sm, "enforced_next_token_ids"):
+        sliced.enforced_next_token_ids = take_t(sm.enforced_next_token_ids)
+    return sliced
 
 def decode_only_mixing_gate(
     *,
@@ -177,12 +181,36 @@ def poc_share_budget(poc_share: float, token_budget: int) -> int:
     return int(poc_share * token_budget)
 
 
-def resolve_poc_max_batch_size(configured: int, max_num_seqs: int) -> int:
-    """The per-step PoC nonce cap. `configured` == 0 means AUTO -> use the engine's
-    own concurrency limit (max_num_seqs), so PoC fills the batch like inference does
-    instead of being pinned to a fixed constant that throttles it on bigger machines.
-    Any explicit >0 value is honored verbatim. Pure (unit-testable)."""
-    return max_num_seqs if configured == 0 else configured
+def poc_kv_capacity(num_gpu_blocks, block_size, seq_len: int,
+                    max_tokens: int) -> int:
+    """How many PoC nonces the KV pool can physically hold.
+
+    A nonce reserves its whole footprint (seq_len prefill + max_tokens decode)
+    for the entire trajectory, so admitting more than the pool fits livelocks:
+    every row needs its full allocation to progress, and preempting one to feed
+    another just cycles. Returns 0 when the pool size is not yet known (the
+    engine computes num_gpu_blocks from free memory AFTER config init), which
+    callers read as "no KV-derived bound available". Pure (unit-testable)."""
+    if not num_gpu_blocks or not block_size:
+        return 0
+    per_nonce = max(1, seq_len + max_tokens)
+    return int(num_gpu_blocks) * int(block_size) // per_nonce
+
+
+def resolve_poc_max_batch_size(configured: int, max_num_seqs: int,
+                               kv_capacity: int = 0) -> int:
+    """The per-step PoC nonce cap.
+
+    `configured` > 0 is honored verbatim. AUTO (0) takes the engine's own
+    concurrency limit, clamped by what the KV pool actually holds: max_num_seqs
+    is a scheduler knob with no memory awareness, and chat survives
+    oversubscription only because its requests grow token-by-token and can be
+    preempted — PoC's fixed upfront footprint cannot. Pure (unit-testable)."""
+    if configured:
+        return configured
+    if kv_capacity > 0:
+        return min(max_num_seqs, kv_capacity)
+    return max_num_seqs
 
 
 def poc_alloc_footprint(poc_params, num_new_tokens: int) -> int:
@@ -273,10 +301,22 @@ class PoCMixedDecodeManager:
 
 
 def get_decode_manager(runner) -> "PoCMixedDecodeManager":
-    """Lazily get/create the per-runner mixed-decode manager."""
+    """Lazily get/create the per-runner mixed-decode manager.
+
+    Pool size resolves like the scheduler's admission cap: the config value is
+    0 (AUTO) until resolved, so sizing from the raw field would create an EMPTY
+    pool — every allocate fails, decode state never exists, and the prefill
+    step emits a pure-path artifact instead of starting the chain."""
     mgr = getattr(runner, "_poc_mixed_decode_mgr", None)
     if mgr is None:
-        mgr = PoCMixedDecodeManager(runner.cache_config.poc_max_batch_size)
+        cc = runner.cache_config
+        sc = runner.vllm_config.scheduler_config
+        cap = resolve_poc_max_batch_size(
+            cc.poc_max_batch_size, sc.max_num_seqs,
+            poc_kv_capacity(
+                getattr(cc, "num_gpu_blocks", 0), getattr(cc, "block_size", 0),
+                cc.poc_seq_len, cc.poc_max_tokens))
+        mgr = PoCMixedDecodeManager(cap)
         runner._poc_mixed_decode_mgr = mgr
     return mgr
 
@@ -330,6 +370,8 @@ def build_unified_mixed_batch_inputs(
     chat_positions: torch.Tensor,
     poc_req_ids: set,
     num_total_tokens: int,
+    batch_view: tuple | None = None,
+    req_views: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict]]:
     """Build unified inputs for mixed batch (chat + PoC in same forward).
 
@@ -354,8 +396,14 @@ def build_unified_mixed_batch_inputs(
     from vllm.poc.gpu_random import generate_inputs
 
     hidden_size = runner.model_config.get_hidden_size()
-    num_reqs = runner.input_batch.num_reqs
-    req_ids = runner.input_batch.req_ids
+    # batch_view: (num_reqs, req_ids) — plain metadata handed in by the caller
+    # so this works on either runner (V1 exposes runner.input_batch; V2 keeps
+    # the batch local to execute_model). No tensor copies.
+    if batch_view is not None:
+        num_reqs, req_ids = batch_view
+    else:
+        num_reqs = runner.input_batch.num_reqs
+        req_ids = runner.input_batch.req_ids
 
     tokens_per_req = [scheduler_output.num_scheduled_tokens[req_id]
                       for req_id in req_ids]
@@ -390,7 +438,10 @@ def build_unified_mixed_batch_inputs(
             continue
 
         if req_id in poc_req_ids:
-            req_state = runner.requests[req_id]
+            # req_views: runner-agnostic per-request view (V1 keeps objects,
+            # V2 columnar tensors); fall back to the V1 store when absent.
+            req_state = (req_views[req_id] if req_views is not None
+                         else runner.requests[req_id])
             poc_params = req_state.poc_params
             seq_len = poc_params.seq_len
             mgr = getattr(runner, "_poc_mixed_decode_mgr", None)
