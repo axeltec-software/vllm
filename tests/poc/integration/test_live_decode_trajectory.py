@@ -123,3 +123,23 @@ def test_golden_trajectory_minimax_architecture():
 
 def test_golden_trajectory_deepseek_grouped_architecture():
     _assert_golden(GOLDEN_DS_GROUPED_DUMMY, GOLDEN_DS_GROUPED_DUMMY["model"])
+
+
+def test_large_nonce_batch_keeps_rows_separate():
+    """Positions/mask for decode rows are written as ONE batched index_copy_/
+    index_fill_ over the PoC offsets. If that offset mapping is wrong, rows
+    smear: nonces take each other's positions and trajectories collapse onto
+    one another, while every artifact still looks well-formed. Run a batch
+    well past a couple of rows and demand every nonce stay its own.
+    """
+    nonces = list(range(101, 117))          # 16 concurrent rows
+    arts = _round(nonces)
+
+    assert set(arts) == set(nonces), "missing nonces in a large batch"
+    for n in nonces:
+        assert arts[n]["k_points_steps"], f"nonce {n} produced no trajectory"
+
+    trajectories = {n: tuple(arts[n]["k_points_steps"]) for n in nonces}
+    assert len(set(trajectories.values())) == len(nonces), (
+        "distinct nonces produced identical trajectories — decode rows are "
+        "sharing positions/mask offsets")

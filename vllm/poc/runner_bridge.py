@@ -18,7 +18,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.poc.mixed_decode import poc_cfg
+
 from vllm.logger import init_logger
+from vllm.poc.gpu_random import pinned_to_device
 from vllm.poc import mixed_decode
 
 if TYPE_CHECKING:
@@ -67,7 +70,7 @@ class PoCRunnerBridge:
         self.native = attach_native_poc(
             model, layers, inner, runner.max_num_tokens,
             runner.model_config.get_hidden_size(), runner.device, runner.dtype,
-            route_window=cfg.poc_route_window,
+            route_window=poc_cfg(cfg, "poc_route_window"),
         )
         # mixed_decode reads the state off the runner (0.20 contract).
         runner._poc_native = self.native
@@ -195,8 +198,7 @@ class PoCRunnerBridge:
         chat_rows = self._chat_rows()
         if not chat_rows:
             return None
-        idx = torch.tensor(chat_rows, device=sample_hidden_states.device,
-                           dtype=torch.long)
+        idx = pinned_to_device(chat_rows, torch.long, sample_hidden_states.device)
         return self.runner.model.compute_logits(sample_hidden_states[idx])
 
     def sample_chat_rows(self, logits, sampling_metadata):
@@ -216,7 +218,7 @@ class PoCRunnerBridge:
         chat_sm = mixed_decode.slice_sampling_metadata(
             sampling_metadata, chat_rows, runner.device)
         chat_out = runner.sampler(logits=logits, sampling_metadata=chat_sm)
-        idx = torch.tensor(chat_rows, device=runner.device, dtype=torch.long)
+        idx = pinned_to_device(chat_rows, torch.long, runner.device)
         full = torch.zeros(
             (n_full, chat_out.sampled_token_ids.shape[1]),
             dtype=chat_out.sampled_token_ids.dtype, device=runner.device)

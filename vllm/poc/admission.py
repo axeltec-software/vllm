@@ -18,6 +18,7 @@ Policy (ported from the 0.20 in-tree branch, ``vllm/poc/mixed_decode.py``):
 
 from typing import TYPE_CHECKING
 
+from vllm.poc.mixed_decode import poc_cfg
 from vllm.poc.mixed_decode import (
     POC_DEFER_LIMIT,
     decode_only_mixing_gate,
@@ -40,9 +41,29 @@ class PoCAdmission:
 
     def __init__(self, scheduler, token_budget: int) -> None:
         queues = (scheduler.running, scheduler.waiting)
-        self.active = any(
-            r.poc_params is not None for q in queues for r in q
-        )
+        # ONE pass for all four flags. As four separate any() calls, the ones whose
+        # answer is "no" walk the whole of running+waiting every step — and on a
+        # PoC-only node both chat questions are exactly that, so the queues were
+        # scanned twice per step for nothing.
+        poc_present = chat_present = False
+        poc_will_prefill = chat_will_prefill = False
+        for q in queues:
+            for r in q:
+                if r.poc_params is not None:
+                    poc_present = True
+                    if r.num_computed_tokens == 0:
+                        poc_will_prefill = True
+                else:
+                    chat_present = True
+                    if r.num_computed_tokens < r.num_prompt_tokens:
+                        chat_will_prefill = True
+                if (poc_present and chat_present
+                        and poc_will_prefill and chat_will_prefill):
+                    break
+            else:
+                continue
+            break
+        self.active = poc_present
         if not self.active:
             return
 
@@ -50,29 +71,20 @@ class PoCAdmission:
         # Resolve here, not at config init: num_gpu_blocks is only known once
         # the engine has profiled free memory and built the KV pool.
         self._max_batch = resolve_poc_max_batch_size(
-            cache_config.poc_max_batch_size,
+            poc_cfg(cache_config, "poc_max_batch_size"),
             scheduler.scheduler_config.max_num_seqs,
             poc_kv_capacity(
                 getattr(cache_config, "num_gpu_blocks", 0),
                 getattr(cache_config, "block_size", 0),
-                cache_config.poc_seq_len,
-                cache_config.poc_max_tokens,
+                poc_cfg(cache_config, "poc_seq_len"),
+                poc_cfg(cache_config, "poc_max_tokens"),
             ),
         )
-        self._token_budget = poc_share_budget(cache_config.poc_share, token_budget)
+        self._token_budget = poc_share_budget(
+            poc_cfg(cache_config, "poc_share"), token_budget, chat_present)
         self._scheduled = 0
         self._tokens = 0
 
-        poc_will_prefill = any(
-            r.poc_params is not None and r.num_computed_tokens == 0
-            for q in queues
-            for r in q
-        )
-        chat_will_prefill = any(
-            r.poc_params is None and r.num_computed_tokens < r.num_prompt_tokens
-            for q in queues
-            for r in q
-        )
         # Vestigial in the 0.20 branch (hardcoded False): PoC never demands an
         # exclusive pure-decode step, so chat+PoC decode freely share a forward.
         poc_decode_pending = False

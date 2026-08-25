@@ -683,6 +683,8 @@ class EngineArgs:
     attention_backend: AttentionBackendEnum | None = AttentionConfig.backend
 
     calculate_kv_scales: bool = CacheConfig.calculate_kv_scales
+    poc_share: float = CacheConfig.poc_share
+    poc_route_window: int = CacheConfig.poc_route_window
     kv_cache_dtype_skip_layers: list[str] = get_field(
         CacheConfig, "kv_cache_dtype_skip_layers"
     )
@@ -1174,6 +1176,10 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
+        )
+        cache_group.add_argument("--poc-share", **cache_kwargs["poc_share"])
+        cache_group.add_argument(
+            "--poc-route-window", **cache_kwargs["poc_route_window"]
         )
         cache_group.add_argument(
             "--kv-cache-dtype-skip-layers", **cache_kwargs["kv_cache_dtype_skip_layers"]
@@ -1885,6 +1891,8 @@ class EngineArgs:
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
+            poc_share=self.poc_share,
+            poc_route_window=self.poc_route_window,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,

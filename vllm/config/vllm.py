@@ -1724,6 +1724,14 @@ class VllmConfig:
                 max_cudagraph_capture_size = min(
                     self.scheduler_config.max_num_seqs * decode_query_len * 2, 512
                 )
+                from vllm.poc.mixed_decode import poc_cudagraph_capture_size
+
+                max_cudagraph_capture_size = poc_cudagraph_capture_size(
+                    max_cudagraph_capture_size,
+                    self.cache_config.poc_max_batch_size,
+                    self.scheduler_config.max_num_seqs,
+                    decode_query_len,
+                )
             max_num_tokens = self.scheduler_config.max_num_batched_tokens
             max_cudagraph_capture_size = min(max_num_tokens, max_cudagraph_capture_size)
 

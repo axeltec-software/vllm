@@ -207,9 +207,12 @@ class CacheConfig:
     vector per step, each a seeded ``k_dim``-coordinate pick of the SPHERE_DIM
     unit vector. Emission only — forward, chain and verdict are unchanged."""
 
-    poc_share: float = Field(default=0.5, ge=0.0, le=1.0)
+    poc_share: float = Field(default=1.0, ge=0.0, le=1.0)
     """Fraction of each scheduler step's token budget PoC may consume; chat gets
-    the rest. 1.0 = PoC greedy, 0.0 = chat only. Prevents PoC starving chat."""
+    the rest. 1.0 (default) = PoC greedy, 0.0 = chat only. Lower it only to hold
+    a slice back for chat on a node that serves both: the reservation costs PoC
+    steps (at 0.5 a nonce batch prefills in twice as many), and it is skipped
+    outright when no chat request is queued or running."""
 
     poc_route_window: int = Field(default=256, ge=0)
     """MoE seeded-routing window: each decode step restricts every PoC token's

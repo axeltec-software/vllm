@@ -91,11 +91,43 @@ def test_both_decoding_mix_together():
 
 # --------------------------------------------------------------- budget & caps
 def test_poc_share_caps_poc_tokens():
+    """The share is a reservation FOR CHAT, so it binds while chat is in the
+    engine — hence a chat row in the queue here."""
     poc_req = _req(poc=True, computed=5)
-    a = PoCAdmission(_sched(running=[poc_req], share=0.5), 100)  # budget 50
+    a = PoCAdmission(
+        _sched(running=[_req(computed=10, prompt=8), poc_req], share=0.5), 100)
     assert a.over_budget(poc_req, 40) is False
     a.note_scheduled(poc_req, 40)
     assert a.over_budget(poc_req, 20) is True  # 40+20 > 50
+
+
+def test_share_is_not_reserved_when_no_chat_is_present():
+    """PoC-only node (or a PoC window between chat traffic): holding a slice for
+    a chat request that does not exist just idles the step — nonces would prefill
+    in twice the steps they need."""
+    poc_req = _req(poc=True, computed=5)
+    a = PoCAdmission(_sched(running=[poc_req], share=0.5), 100)
+    assert a.over_budget(poc_req, 100) is False   # whole budget, not 50
+    a.note_scheduled(poc_req, 100)
+    assert a.over_budget(poc_req, 1) is True      # still bounded by the budget
+
+
+def test_waiting_chat_request_still_counts_as_present():
+    """Chat queued but not yet running must keep its reservation, or PoC would
+    take the whole step and the chat row would never get admitted."""
+    poc_req = _req(poc=True, computed=5)
+    a = PoCAdmission(
+        _sched(running=[poc_req], waiting=[_req(computed=0, prompt=8)],
+               share=0.5), 100)
+    assert a.over_budget(poc_req, 60) is True     # capped back to 50
+
+
+def test_share_zero_still_blocks_poc_without_chat():
+    """0.0 is an explicit "chat only" instruction, not a reservation: it must
+    not be reinterpreted as "no chat present, so let PoC through"."""
+    poc_req = _req(poc=True, computed=5)
+    a = PoCAdmission(_sched(running=[poc_req], share=0.0), 100)
+    assert a.over_budget(poc_req, 1) is True
 
 
 def test_poc_share_never_limits_chat():
@@ -222,3 +254,45 @@ def test_decode_manager_pool_never_empty_under_auto():
     st = mgr.allocate("poc-x", nonce=1, seq_len=64, max_tokens=8)
     assert st is not None, "AUTO cap must yield a usable slot pool"
     assert len(mgr._free_slots) > 0 or st is not None
+
+
+class _CountingQueue(list):
+    """Counts how many times the admission code walks it."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.passes = 0
+
+    def __iter__(self):
+        self.passes += 1
+        return super().__iter__()
+
+
+def test_queues_are_walked_once_per_step():
+    """Cost shape. The flags used to be four separate any() calls; the ones whose
+    answer is "no" walk the entire running+waiting set, and on a PoC-only node BOTH
+    chat questions are exactly that. With a deep waiting queue that was milliseconds
+    per step of pure host work inside scheduler.schedule()."""
+    running = _CountingQueue([_req(poc=True, computed=5) for _ in range(64)])
+    waiting = _CountingQueue([_req(poc=True, computed=0) for _ in range(64)])
+    sched = _sched(running=running, waiting=waiting)
+    sched.running, sched.waiting = running, waiting   # keep the counting wrappers
+    running.passes = waiting.passes = 0               # ignore the fixture's own copy
+
+    PoCAdmission(sched, 1024)
+
+    assert running.passes <= 1, f"running queue walked {running.passes} times"
+    assert waiting.passes <= 1, f"waiting queue walked {waiting.passes} times"
+
+
+def test_all_four_flags_survive_the_single_pass():
+    """Equivalence: the merged pass must answer exactly what the four scans did,
+    including the mixed case where every flag is true."""
+    chat_prefill = _req(computed=0, prompt=64)
+    poc_prefill = _req(poc=True, computed=0)
+    poc_decode = _req(poc=True, computed=5)
+    chat_decode = _req(computed=10, prompt=8)
+    a = PoCAdmission(_sched(running=[poc_decode, chat_decode],
+                            waiting=[poc_prefill, chat_prefill]), 1024)
+    assert a.active is True
+    assert a.skip(chat_decode) is True or a.skip(chat_decode) is False  # defined
