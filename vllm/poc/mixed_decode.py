@@ -508,7 +508,10 @@ def build_unified_mixed_batch_inputs(
                     st.base_seeds = decode_base_seeds(
                         poc_params.block_hash, poc_params.public_key,
                         [poc_params.nonce], runner.device)
-                decode_embed_jobs.append((st, decode_step, offset, poc_params.nonce))
+                decode_embed_jobs.append(
+                    (st, decode_step, offset,
+                     (poc_params.block_hash, poc_params.public_key,
+                      poc_params.nonce)))
                 # Positions/mask for decode rows are written in ONE batched
                 # index_copy_/index_fill_ after the loop: a per-row scalar
                 # assignment is a separate H2D copy (~25 us/row/step at batch
@@ -585,6 +588,12 @@ def build_unified_mixed_batch_inputs(
     # NEW round reuses the same nonces, and the stale prev_k from the previous
     # round's last step would silently continue that chain (caught by the
     # cross-round determinism test).
+    # The key carries EVERY field the cached value depends on:
+    # base_seeds = decode_base_seeds(block_hash, public_key, nonce). Keying on the
+    # nonce alone let a second round over the same nonce range with a different
+    # block_hash reuse the first round's seeds — step 0 (the prefill snap) still
+    # matched and every step after it chained from the wrong base, which reads as
+    # "state not reset when block_hash changes".
     chain_key = ((tuple(j[3] for j in decode_embed_jobs),
                   tuple(j[1] for j in decode_embed_jobs))
                  if decode_embed_jobs else ())
@@ -724,7 +733,9 @@ def process_poc_outputs_from_hidden(
         _chain = getattr(runner, "_poc_chain", None)
         if _chain is None:
             _chain = runner._poc_chain = {}
-        _metas_key = (tuple(m['poc_params'].nonce for m in decode_metas),
+        _metas_key = (tuple((m['poc_params'].block_hash,
+                             m['poc_params'].public_key, m['poc_params'].nonce)
+                            for m in decode_metas),
                       tuple(m['decode_step'] for m in decode_metas))
         _any_reference = False
         # Post-forward sphere-snap. The final-norm wrapper snapped every row IN-GRAPH

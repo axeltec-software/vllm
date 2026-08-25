@@ -134,9 +134,11 @@ def test_extract_publishes_exactly_the_next_prev_k():
 
     _, prev = _expected_chain(states, nonces)
     assert torch.equal(runner._poc_chain["prev"], prev)
-    # keyed on rows AND the step they will be on next: a new round reusing the
-    # same nonces restarts at step 1 and must not inherit this vector
-    assert runner._poc_chain["prev_key"] == (tuple(nonces), (2,) * len(nonces))
+    # keyed on the rows' full identity (block_hash, public_key, nonce) AND the step
+    # they will be on next: neither a new round over the same nonces nor a restart
+    # may inherit this vector
+    assert runner._poc_chain["prev_key"] == (
+        tuple((BH, PK, n) for n in nonces), (2,) * len(nonces))
 
 
 # ------------------------------------------------------------------ cost shape
@@ -260,3 +262,79 @@ def test_row_index_uploads_are_not_blocking(fn):
     assert "pinned_to_device" in src, f"{fn.__name__} builds its index eagerly"
     assert "device=device" not in src.replace("pinned_to_device", ""), \
         f"{fn.__name__} still has a blocking device= tensor construction"
+
+
+# --------------------------------------------------------------- identity of the key
+# REGRESSION (reported from a 4x H100 / 1x B300 validation run): the chain cache was
+# keyed on the nonce tuple alone, but the cached value is
+# decode_base_seeds(block_hash, public_key, nonce). A validator alternating rounds
+# over the SAME nonce range (h01 -> h02 -> h01 -> h02) therefore reused the previous
+# round's seeds: step 0 (the prefill snap) still matched, every later step chained
+# from the wrong base, and honest separability collapsed (7.2% -> 93.4%).
+# Every field the value depends on must appear in the key — these tests vary each
+# one independently, which is what the original tests failed to do.
+def _params_id(nonce, block_hash=BH, public_key=PK):
+    return SimpleNamespace(nonce=nonce, seq_len=64, max_tokens=64, debug=False,
+                           block_hash=block_hash, public_key=public_key, k_dim=12,
+                           per_nonce_reflection=False)
+
+
+def _build_id(runner, states, nonces, computed, block_hash=BH, public_key=PK):
+    req_ids = [f"poc-{n}" for n in nonces]
+    sched = SimpleNamespace(num_scheduled_tokens={r: 1 for r in req_ids})
+    views = {f"poc-{n}": SimpleNamespace(
+        poc_params=_params_id(n, block_hash, public_key),
+        num_computed_tokens=computed) for n in nonces}
+    return rt.build_unified_mixed_batch_inputs(
+        runner, sched, None, None, torch.zeros(len(nonces), dtype=torch.long),
+        set(req_ids), len(nonces), (len(nonces), req_ids), views)
+
+
+def _states_for(nonces, block_hash=BH, public_key=PK):
+    out = {}
+    for n in nonces:
+        st = _state(n)
+        st.base_seeds = decode_base_seeds(block_hash, public_key, [n], CPU)
+        out[f"poc-{n}"] = st
+    return out
+
+
+@pytest.mark.parametrize("field", ["block_hash", "public_key"])
+def test_chain_cache_is_not_shared_across_rounds_that_differ_only_in(field):
+    """Same nonces, same steps, different identity -> different seeds. This is the
+    reported regression: alternating block hashes over one nonce range."""
+    nonces = [1, 2, 3, 4]
+    alt = {"block_hash": ("aa" * 32, PK), "public_key": (BH, "bb" * 32)}[field]
+
+    native = _Native()
+    s1 = _states_for(nonces)
+    runner = _runner(s1, native)
+    _build_id(runner, s1, nonces, computed=64)
+    seeds_round1 = native.chain["base"].clone()
+
+    s2 = _states_for(nonces, *alt)                     # second round, same nonces
+    runner._poc_mixed_decode_mgr = SimpleNamespace(get=s2.get)
+    _build_id(runner, s2, nonces, computed=64, block_hash=alt[0], public_key=alt[1])
+    seeds_round2 = native.chain["base"]
+
+    want = torch.cat([s2[f"poc-{n}"].base_seeds for n in nonces])
+    assert torch.equal(seeds_round2, want), \
+        f"round 2 did not use its own seeds after {field} changed"
+    assert not torch.equal(seeds_round1, seeds_round2), \
+        f"round 2 reused round 1's seeds — the key ignores {field}"
+
+
+def test_alternating_rounds_never_cross_contaminate():
+    """The exact reported shape: h01 -> h02 -> h01 -> h02 in one process. The fourth
+    was the one that broke; run six and check every single one."""
+    nonces = [7, 8, 9]
+    h01, h02 = "01" * 32, "02" * 32
+    native = _Native()
+    runner = _runner({}, native)
+    for i, h in enumerate([h01, h02, h01, h02, h01, h02]):
+        sts = _states_for(nonces, h)
+        runner._poc_mixed_decode_mgr = SimpleNamespace(get=sts.get)
+        _build_id(runner, sts, nonces, computed=64, block_hash=h)
+        want = torch.cat([sts[f"poc-{n}"].base_seeds for n in nonces])
+        assert torch.equal(native.chain["base"], want), \
+            f"round {i+1} (hash {h[:4]}) got another round's seeds"
